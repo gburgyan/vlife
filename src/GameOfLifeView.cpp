@@ -27,13 +27,19 @@ GameOfLifeView::~GameOfLifeView() {
         timer->stop();
     }
     delete timer;
+    delete scene;
+    delete view;
+    delete runStopButton;
+    delete stepButton;
+    delete speedSlider;
+    delete zoomSlider;
 }
 
 void GameOfLifeView::setupUI() {
-    QWidget* centralWidget = new QWidget(this);
+    auto* centralWidget = new QWidget(this);
     setCentralWidget(centralWidget);
     
-    QVBoxLayout* mainLayout = new QVBoxLayout(centralWidget);
+    auto* mainLayout = new QVBoxLayout(centralWidget);
     
     // Graphics view for the board
     scene = new QGraphicsScene(this);
@@ -43,17 +49,17 @@ void GameOfLifeView::setupUI() {
     view->viewport()->installEventFilter(this);
     
     // Control panel
-    QHBoxLayout* controlLayout = new QHBoxLayout();
+    auto* controlLayout = new QHBoxLayout();
     
     runStopButton = new QPushButton("Run", this);
     stepButton = new QPushButton("Step", this);
-    
-    QLabel* speedLabel = new QLabel("Speed:", this);
+
+    auto speedLabel = new QLabel("Speed:", this);
     speedSlider = new QSlider(Qt::Horizontal, this);
     speedSlider->setRange(1, 100);
     speedSlider->setValue(50);
-    
-    QLabel* zoomLabel = new QLabel("Zoom:", this);
+
+    auto zoomLabel = new QLabel("Zoom:", this);
     zoomSlider = new QSlider(Qt::Horizontal, this);
     zoomSlider->setRange(1, 20);
     zoomSlider->setValue(5);
@@ -157,7 +163,7 @@ void GameOfLifeView::resizeEvent(QResizeEvent* event) {
 // Custom event filter to handle mouse clicks
 bool GameOfLifeView::eventFilter(QObject* obj, QEvent* event) {
     if (obj == view->viewport() && event->type() == QEvent::MouseButtonPress) {
-        QMouseEvent* mouseEvent = static_cast<QMouseEvent*>(event);
+        auto* mouseEvent = dynamic_cast<QMouseEvent*>(event);
         
         // Convert screen coordinates to scene coordinates
         QPointF scenePos = view->mapToScene(mouseEvent->pos());
