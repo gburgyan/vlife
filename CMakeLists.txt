@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 project(ConwayGameOfLife)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
@@ -38,8 +38,8 @@ find_package(Qt5 COMPONENTS Core Widgets REQUIRED)
 # Backend library
 add_library(
         GameOfLifeLib
-        src/GameOfLife.cpp
-        src/GameOfLife.h
+        src/SimpleGameOfLife.cpp
+        src/SimpleGameOfLife.h
 )
 
 # Frontend application

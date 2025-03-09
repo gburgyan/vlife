@@ -2,17 +2,17 @@
 
 #pragma once
 
-#include <QMainWindow>
-#include <QWidget>
-#include <QGraphicsView>
 #include <QGraphicsScene>
-#include <QPushButton>
-#include <QTimer>
-#include <QSlider>
-#include <QVBoxLayout>
+#include <QGraphicsView>
 #include <QHBoxLayout>
 #include <QLabel>
-#include "GameOfLife.h"
+#include <QMainWindow>
+#include <QPushButton>
+#include <QSlider>
+#include <QTimer>
+#include <QVBoxLayout>
+#include <QWidget>
+#include "SimpleGameOfLife.h"
 
 class GameOfLifeView : public QMainWindow {
     Q_OBJECT
@@ -29,7 +29,7 @@ private slots:
     void updateSimulation();
 
 private:
-    GameOfLife gameOfLife;
+    SimpleGameOfLife gameOfLife;
     QGraphicsScene* scene;
     QGraphicsView* view;
     QPushButton* runStopButton;
