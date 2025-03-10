@@ -110,22 +110,10 @@ void Tile::runGenerationChanges() {
 
             uint64_t cellSpan = *cellsPtr;
 
-            for (int j = 0; j < 8; j++) {
-                int changeBits = changeWord & 0xC000;
-                changeWord <<= 2;
-                if (changeBits == 0) {
-                    continue;
-                }
-                int cells = (cellSpan >> ((7-j)*8)) & 0x11;
-                bool leftAlive = cells & 0x10;
-                bool rightAlive = cells & 0x01;
-                switch (changeBits) {
-                    case 0x3:
-                        // Both cells are changing
+            uint64_t changeMask = _pdep_u32(changeWord>>8, 0x11111111) | _pdep_u32(changeWord & 0xFF, 0x11111111);
+            cellSpan ^= changeMask;
 
-
-                }
-            }
+            *cellsPtr = cellSpan;
 
             cellsPtr++;
         }
