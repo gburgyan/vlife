@@ -71,11 +71,65 @@ void Tile::runGenerationPrepare() {
 }
 
 void Tile::runGenerationChanges() {
-    for (int i = 0; i < TILE_CHANGE_64S; i++) {
-        int change = changes[i];
-        if (int changeByte = change & 0xFF00000000000000 >> 56; changeByte != 0x00) {
+    uint64_t verticalChangeAdd[TILE_64S_WIDTH];
+    uint64_t verticalChangeSubtract[TILE_64S_WIDTH];
+    uint64_t lineChangeAdd[TILE_64S_WIDTH];
+    uint64_t lineChangeSubtract[TILE_64S_WIDTH];
 
+    uint64_t topChangeLine[TILE_64S_WIDTH];
+    uint64_t bottomChangeLine[TILE_64S_WIDTH];
+    uint64_t leftChangeLine[TILE_64S_HEIGHT];
+    uint64_t rightChangeLine[TILE_64S_HEIGHT];
+
+    int topLeftChange = 0;
+    int topRightChange = 0;
+    int bottomLeftChange = 0;
+    int bottomRightChange = 0;
+
+    uint64_t* changesPtr = changes;
+    uint64_t* cellsPtr = cells;
+    uint64_t work;
+    int changeWordsLeft = 0;
+
+    for (int row = 0; row < TILE_HEIGHT; row++) {
+        for (int colPos = 0; colPos < TILE_64S; colPos++) {
+            if (changeWordsLeft == 0) {
+                // Each of the 64-bit cell blocks has 16 4-bit cells.
+                work = *changesPtr++;
+                changeWordsLeft = 4;
+            }
+
+            int changeWord = work & 0xFFFF000000000000;
+            work <<= 16;
+            changeWordsLeft--;
+
+            if (changeWord == 0) {
+                cellsPtr++;
+                continue;
+            }
+
+            uint64_t cellSpan = *cellsPtr;
+
+            for (int j = 0; j < 8; j++) {
+                int changeBits = changeWord & 0xC000;
+                changeWord <<= 2;
+                if (changeBits == 0) {
+                    continue;
+                }
+                int cells = (cellSpan >> ((7-j)*8)) & 0x11;
+                bool leftAlive = cells & 0x10;
+                bool rightAlive = cells & 0x01;
+                switch (changeBits) {
+                    case 0x3:
+                        // Both cells are changing
+
+
+                }
+            }
+
+            cellsPtr++;
         }
     }
+
 }
 

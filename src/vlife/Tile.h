@@ -10,6 +10,8 @@
 #define TILE_BYTES TILE_CELLS / 2
 #define TILE_64S TILE_BYTES / 8
 #define TILE_CHANGE_64S TILE_CELLS / 64
+#define TILE_64S_WIDTH TILE_WIDTH / 64
+#define TILE_64S_HEIGHT TILE_HEIGHT / 64
 
 class Tile {
     VLife* board;
@@ -21,8 +23,8 @@ class Tile {
     Tile *up;
     Tile *down;
 
-    int64_t cells[TILE_64S];
-    int64_t changes[TILE_CHANGE_64S];
+    uint64_t cells[TILE_64S];
+    uint64_t changes[TILE_CHANGE_64S];
 
     std::mutex tileMutex;
 
