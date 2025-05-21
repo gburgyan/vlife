@@ -76,10 +76,6 @@ void Tile::runGenerationChanges() {
     uint64_t lineChangeAdd[TILE_64S_WIDTH];
     uint64_t lineChangeSubtract[TILE_64S_WIDTH];
 
-    uint64_t topChangeLine[TILE_64S_WIDTH];
-    uint64_t bottomChangeLine[TILE_64S_WIDTH];
-    uint64_t leftChangeLine[TILE_64S_HEIGHT];
-    uint64_t rightChangeLine[TILE_64S_HEIGHT];
 
     int topLeftChange = 0;
     int topRightChange = 0;
@@ -92,6 +88,17 @@ void Tile::runGenerationChanges() {
     int changeWordsLeft = 0;
 
     for (int row = 0; row < TILE_HEIGHT; row++) {
+        // zero out verticalChangeAdd, verticalChangeSubtract, lineChangeAdd, lineChangeSubtract
+        uint64_t rowVerticalChangeAdd[TILE_64S_WIDTH];
+        uint64_t rowVerticalChangeSubtract[TILE_64S_WIDTH];
+        uint64_t rowLineChangeAdd[TILE_64S_WIDTH];
+        uint64_t rowLineChangeSubtract[TILE_64S_WIDTH];
+
+        int rowVerticalLeftChange = 0;
+        int rowVerticalRightChange = 0;
+        int rowLeftChange = 0;
+        int rowRightChange = 0;
+
         for (int colPos = 0; colPos < TILE_64S; colPos++) {
             if (changeWordsLeft == 0) {
                 // Each of the 64-bit cell blocks has 16 4-bit cells.
@@ -99,7 +106,7 @@ void Tile::runGenerationChanges() {
                 changeWordsLeft = 4;
             }
 
-            int changeWord = work & 0xFFFF000000000000;
+            int changeWord = (work & 0xFFFF000000000000) >> 48;
             work <<= 16;
             changeWordsLeft--;
 
@@ -110,8 +117,47 @@ void Tile::runGenerationChanges() {
 
             uint64_t cellSpan = *cellsPtr;
 
-            uint64_t changeMask = _pdep_u32(changeWord>>8, 0x11111111) | _pdep_u32(changeWord & 0xFF, 0x11111111);
-            cellSpan ^= changeMask;
+			if (changeWord & 0x8000) {
+                if (cellSpan & 0x1000000000000000) {
+                    // dying cell
+                    rowLeftChange--;
+                    rowVerticalChangeSubtract[colPos] += 0x2200000000000000;
+                }
+                else {
+                    // new cell
+                    rowLeftChange++;
+                    rowVerticalChangeAdd[colPos] += 0x2200000000000000;
+                }
+                cellSpan ^= 0x1000000000000000;
+            }
+
+            for (int i = 1; i < 15; i++) {
+                if (changeWord & (1 << i)) {
+                    if (cellSpan & (1 << i)) {
+                        // dying cell
+                        rowVerticalChangeSubtract[colPos] += 0x0000000000000222 << (i * 4);
+                    }
+                    else {
+                        // new cell
+                        rowVerticalChangeAdd[colPos] += 0x0000000000000222 << (i * 4);
+                    }
+                    cellSpan ^= 1 << i*4;
+                }
+            }
+
+			if (changeWord & 0x001) {
+                if (cellSpan & 0x0000000000000001) {
+                    // dying cell
+                    rowRightChange--;
+                    rowVerticalChangeSubtract[colPos] += 0x0000000000000022;
+                }
+                else {
+                    // new cell
+                    rowRightChange++;
+                    rowVerticalChangeAdd[colPos] += 0x0000000000000022;
+                }
+                cellSpan ^= 0x0000000000000001;
+            }
 
             *cellsPtr = cellSpan;
 
