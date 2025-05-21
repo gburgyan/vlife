@@ -50,6 +50,7 @@ public:
 
 private:
     void populateRuleLUT();
+    void populateUpdateLUT();
 
     // Structure to represent tile coordinates as a key
     struct TileCoord {
@@ -71,4 +72,5 @@ private:
 
 public:
     std::byte ruleLUT[256];
+    std::int16_t updateLUT[1024];
 };

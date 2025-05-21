@@ -197,7 +197,25 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
 }
 
 void VLife::populateRuleLUT() {
-    int minBorn = 3;
+    // The rule lut is a 256-byte array, where each byte represents the rule for a specific cell configuration.
+    // The first 4 bits represent the left cell, and the last 4 bits represent the right cell.
+    // The bits are arranged as follows:
+    //   0bANNN
+    //
+    //   A = alive (1) or dead (0)
+    //   N = number of alive neighbors (0-7)
+    //
+    // Since two cells are represented in a single byte, the liveness of one cell can be included in the neighbor
+    // of the other cell *implicitly*. A cell can have a total of eight neighbors, and normally the three bits
+    // representing the number of alive neighbors would not be enough to represent the state of the cell. This
+    // is fixed by using the left cell's state as a neighbor of the right cell and vice versa. This means that
+    // the left cell's state is included in the right cell's neighbor count and the right cell's state is included
+    // in the left cell's neighbor count.
+    //
+    // The result of the lut is two bits, reflecting the change in state of the left and right cells after
+    // running this generation.
+
+    int minBorn = 3; // 0bLLLLRRRR
     int maxBorn = 3;
     int minSurvive = 2;
     int maxSurvive = 3;
@@ -256,3 +274,5 @@ void VLife::populateRuleLUT() {
         ruleLUT[i] = static_cast<std::byte>(result);
     }
 }
+
+void VLife::populateUpdateLUT() {}
