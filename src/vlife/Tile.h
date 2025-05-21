@@ -26,6 +26,7 @@ class Tile {
 
     uint64_t cells[TILE_64S];
     uint64_t changes[TILE_CHANGE_64S];
+    uint32_t liveCount; // Tracks the number of live cells in this tile
 
     std::mutex tileMutex;
 
@@ -43,6 +44,7 @@ public:
     // Cell access methods
     bool getCell(uint32_t localX, uint32_t localY) const;
     void setCell(uint32_t localX, uint32_t localY, bool alive);
+    void updateNeighborCount(int localX, int localY, bool increment);
 
     // Getters for tile coordinates
     int32_t getTileX() const { return tileX; }
@@ -53,7 +55,11 @@ public:
     Tile *getRightTile() const { return right; }
     Tile *getUpTile() const { return up; }
     Tile *getDownTile() const { return down; }
+    
+    // Getter for the number of live cells
+    uint32_t getLiveCount() const { return liveCount; }
 
-    // Friend declaration to allow VLife to access private members
+    // Friend declarations to allow access to private members
     friend class VLife;
+    friend class VLifeTest;
 };

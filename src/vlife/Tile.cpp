@@ -7,7 +7,7 @@
 #include <mutex>
 
 Tile::Tile(VLife *board, int32_t tileX, int32_t tileY) :
-    board(board), tileX(tileX), tileY(tileY), left(nullptr), right(nullptr), up(nullptr), down(nullptr) {
+    board(board), tileX(tileX), tileY(tileY), left(nullptr), right(nullptr), up(nullptr), down(nullptr), liveCount(0) {
     // Initialize all cells to zero (dead)
     std::memset(cells, 0, sizeof(cells));
     std::memset(changes, 0, sizeof(changes));
@@ -47,20 +47,114 @@ bool Tile::getCell(uint32_t localX, uint32_t localY) const {
     uint32_t bitPos = ((localY * TILE_WIDTH + localX) % 16) * 4;
 
     // High bit of each nibble indicates alive cell
-    return (cells[cellIdx] & (1ULL << bitPos)) != 0;
+    return (cells[cellIdx] & (1ULL << (bitPos+3))) != 0;
 }
 
 void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
     // Calculate cell index and bit position
     uint32_t cellIdx = (localY * TILE_WIDTH + localX) / 16;
     uint32_t bitPos = ((localY * TILE_WIDTH + localX) % 16) * 4;
-
+    
+    // Get current state of the cell
+    bool currentlyAlive = (cells[cellIdx] & (1ULL << (bitPos+3))) != 0;
+    
+    // If state isn't changing, do nothing
+    if (currentlyAlive == alive) {
+        return;
+    }
+    
     // Set or clear the bit based on the alive state
     if (alive) {
-        cells[cellIdx] |= (1ULL << bitPos);
+        cells[cellIdx] |= (1ULL << (bitPos+3));
+        liveCount++; // Increment live count when a cell becomes alive
     } else {
-        cells[cellIdx] &= ~(1ULL << bitPos);
+        cells[cellIdx] &= ~(1ULL << (bitPos+3));
+        liveCount--; // Decrement live count when a cell becomes dead
     }
+    
+    // Calculate the positions of the 8 neighbors
+    int dx[] = {-1, 0, 1, -1, 1, -1, 0, 1};
+    int dy[] = {-1, -1, -1, 0, 0, 1, 1, 1};
+    
+    for (int i = 0; i < 8; i++) {
+        int nx = static_cast<int>(localX) + dx[i];
+        int ny = static_cast<int>(localY) + dy[i];
+        
+        // Handle neighbors that are in this tile
+        if (nx >= 0 && nx < TILE_WIDTH && ny >= 0 && ny < TILE_HEIGHT) {
+            updateNeighborCount(nx, ny, alive);
+        } 
+        // Handle neighbors that are in adjacent tiles
+        else {
+            // Determine which adjacent tile and local coordinates
+            int tileOffsetX = 0;
+            int tileOffsetY = 0;
+            int adjLocalX = nx;
+            int adjLocalY = ny;
+            
+            if (nx < 0) {
+                tileOffsetX = -1;
+                adjLocalX = TILE_WIDTH - 1;
+            } else if (nx >= TILE_WIDTH) {
+                tileOffsetX = 1;
+                adjLocalX = 0;
+            }
+            
+            if (ny < 0) {
+                tileOffsetY = -1;
+                adjLocalY = TILE_HEIGHT - 1;
+            } else if (ny >= TILE_HEIGHT) {
+                tileOffsetY = 1;
+                adjLocalY = 0;
+            }
+            
+            // Get the adjacent tile
+            Tile* adjTile = nullptr;
+            if (tileOffsetX == -1 && tileOffsetY == 0) {
+                adjTile = left;
+            } else if (tileOffsetX == 1 && tileOffsetY == 0) {
+                adjTile = right;
+            } else if (tileOffsetX == 0 && tileOffsetY == -1) {
+                adjTile = up;
+            } else if (tileOffsetX == 0 && tileOffsetY == 1) {
+                adjTile = down;
+            } else {
+                // Corner cases - need to find or create the diagonal tile
+                adjTile = board->getTile(tileX + tileOffsetX, tileY + tileOffsetY);
+            }
+            
+            if (adjTile) {
+                adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
+            }
+        }
+    }
+}
+
+// Helper method to update the neighbor count of a cell
+void Tile::updateNeighborCount(int localX, int localY, bool increment) {
+    uint32_t cellIdx = (localY * TILE_WIDTH + localX) / 16;
+    uint32_t bitPos = ((localY * TILE_WIDTH + localX) % 16) * 4;
+    
+    // Extract the current neighbor count (bits 0-2)
+    uint64_t mask = 0x7ULL << bitPos; // Mask for the neighbor count bits
+    uint64_t currentCount = (cells[cellIdx] & mask) >> bitPos;
+    
+    // Increment or decrement the count
+    if (increment) {
+        // Don't exceed maximum of 7
+        if (currentCount < 7) {
+            currentCount++;
+        }
+    } else {
+        // Don't go below 0
+        if (currentCount > 0) {
+            currentCount--;
+        }
+    }
+    
+    // Update the neighbor count (clear bits and then set to new value)
+    cells[cellIdx] &= ~mask;
+    cells[cellIdx] |= (currentCount << bitPos);
 }
 
 void Tile::runGenerationPrepare() {

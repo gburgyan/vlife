@@ -16,8 +16,8 @@ class Tile;
 #define TILE_HEIGHT_2 5 // 2^5 = 32
 
 // Tile dimensions in base 10
-#define TILE_WIDTH 1 << TILE_WIDTH_2 // 32
-#define TILE_HEIGHT 1 << TILE_HEIGHT_2 // 32
+#define TILE_WIDTH (1 << TILE_WIDTH_2) // 32
+#define TILE_HEIGHT (1 << TILE_HEIGHT_2) // 32
 
 class VLife : public GameOfLife {
 

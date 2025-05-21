@@ -60,6 +60,12 @@ cd build
 3. **VLife Components** (`src/vlife/`):
    - `VLife.h`, `VLife.cpp`: Optimized implementation using tiles
    - `Tile.h`, `Tile.cpp`: Implementation of the tile-based approach
+   - **Cell Representation**: 
+     - Each cell nibble (4 bits) represents two cells
+     - The high bit (bit 3) indicates the liveness of that cell
+     - The lower three bits (bits 0-2) store the number of living neighbors, excluding the paired cell
+     - Cell's true neighbor count can be inferred by adding the stored neighbor count and the state of its paired cell
+     - Cells are processed using lookup tables for efficient generation updates
 
 4. **UI Components** (`src/GameOfLifeView.h`, `src/GameOfLifeView.cpp`):
    - Qt-based UI with controls for the simulation
