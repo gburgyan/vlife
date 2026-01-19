@@ -28,6 +28,12 @@ class Tile {
     uint64_t changes[TILE_CHANGE_64S]{};
     uint32_t liveCount; // Tracks the number of live cells in this tile
 
+    // Activity tracking for hierarchical skip optimization
+    // Each bit in activityMask corresponds to one 64-bit word in cells[]
+    // A word is "active" if it has any non-zero content (live cells or neighbor counts)
+    // This allows skipping dead regions during generation scan
+    uint64_t activityMask{};
+
     std::mutex tileMutex;
 
 public:
@@ -72,6 +78,25 @@ public:
     
     // Getter for the number of live cells
     uint32_t getLiveCount() const { return liveCount; }
+
+    // Activity mask methods for hierarchical skip optimization
+    inline void markWordActive(uint32_t wordIdx) {
+        activityMask |= (1ULL << wordIdx);
+    }
+
+    // Check if the tile has any potential activity (live cells or neighbor counts)
+    // Used for tile-level skip optimization
+    inline bool hasActivity() const {
+        return activityMask != 0;
+    }
+
+    // Get the number of active word groups (for profiling/debugging)
+    inline int getActiveWordCount() const {
+        return __builtin_popcountll(activityMask);
+    }
+
+    // Rebuild the activity mask by scanning all words
+    void rebuildActivityMask();
 
     // Friend declarations to allow access to private members
     friend class VLife;

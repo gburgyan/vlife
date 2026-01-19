@@ -151,8 +151,14 @@ void VLife::runGeneration() {
     }
 
     // First pass: prepare all tiles for the generation (in spatial order)
+    // Tile-level skip optimization: skip tiles with no activity
     for (Tile* tile : spatialOrder) {
-        tile->runGenerationPrepare();
+        // Only process tiles that have potential activity
+        // A tile with activityMask == 0 has no live cells and no neighbor counts,
+        // so it cannot produce any changes
+        if (tile->hasActivity()) {
+            tile->runGenerationPrepare();
+        }
     }
 
     // Second pass: apply the changes (in spatial order)

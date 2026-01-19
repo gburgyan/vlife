@@ -17,7 +17,7 @@
 #endif
 
 Tile::Tile(VLife *board, int32_t tileX, int32_t tileY) :
-    board(board), tileX(tileX), tileY(tileY), left(nullptr), right(nullptr), up(nullptr), down(nullptr), liveCount(0) {
+    board(board), tileX(tileX), tileY(tileY), left(nullptr), right(nullptr), up(nullptr), down(nullptr), liveCount(0), activityMask(0) {
     // Initialize all cells to zero (dead)
     std::memset(cells, 0, sizeof(cells));
     std::memset(changes, 0, sizeof(changes));
@@ -64,15 +64,15 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
     // Calculate cell index and bit position
     uint32_t cellIdx = (localY * TILE_WIDTH + localX) / 16;
     uint32_t bitPos = ((localY * TILE_WIDTH + localX) % 16) * 4;
-    
+
     // Get current state of the cell
     bool currentlyAlive = (cells[cellIdx] & (1ULL << (bitPos+3))) != 0;
-    
+
     // If state isn't changing, do nothing
     if (currentlyAlive == alive) {
         return;
     }
-    
+
     // Set or clear the bit based on the alive state
     if (alive) {
         cells[cellIdx] |= (1ULL << (bitPos+3));
@@ -81,6 +81,9 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
         cells[cellIdx] &= ~(1ULL << (bitPos+3));
         liveCount--; // Decrement live count when a cell becomes dead
     }
+
+    // Mark this word as active in the activity mask
+    markWordActive(cellIdx);
     
     // Calculate the positions of the 8 neighbors
     // Note: dx[3]=(-1,0)=left neighbor, dx[4]=(1,0)=right neighbor
@@ -155,11 +158,11 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
 void Tile::updateNeighborCount(int localX, int localY, bool increment) {
     uint32_t cellIdx = (localY * TILE_WIDTH + localX) / 16;
     uint32_t bitPos = ((localY * TILE_WIDTH + localX) % 16) * 4;
-    
+
     // Extract the current neighbor count (bits 0-2)
     uint64_t mask = 0x7ULL << bitPos; // Mask for the neighbor count bits
     uint64_t currentCount = (cells[cellIdx] & mask) >> bitPos;
-    
+
     // Increment or decrement the count
     if (increment) {
         // Don't exceed maximum of 7
@@ -172,17 +175,22 @@ void Tile::updateNeighborCount(int localX, int localY, bool increment) {
             currentCount--;
         }
     }
-    
+
     // Update the neighbor count (clear bits and then set to new value)
     cells[cellIdx] &= ~mask;
     cells[cellIdx] |= (currentCount << bitPos);
+
+    // Mark this word as active (neighbor count change means potential birth)
+    markWordActive(cellIdx);
 }
 
 void Tile::runGenerationPrepare() {
-    // Chear changes
-    for (int i = 0; i < TILE_CHANGE_64S; i++) {
-        changes[i] = 0;
-    }
+    // Clear changes array
+    std::memset(changes, 0, sizeof(changes));
+
+    // Rebuild activity mask while processing
+    // This allows us to skip dead regions efficiently
+    activityMask = 0;
 
     auto ruleLUT = board->ruleLUT;
 
@@ -192,47 +200,71 @@ void Tile::runGenerationPrepare() {
             PREFETCH(&cells[i + 4]);
         }
 
-        // Reset changeBuff at the start of each iteration
+        // Quick check: skip if all 4 words are zero (no live cells, no neighbor counts)
+        // This is the hierarchical skip optimization - skip dead regions
+        uint64_t combined = cells[i] | cells[i + 1] | cells[i + 2] | cells[i + 3];
+        if (combined == 0) {
+            continue;  // Skip this group entirely - no activity possible
+        }
+
+        // Update activity mask for non-zero words
+        if (cells[i] != 0) activityMask |= (1ULL << i);
+        if (cells[i + 1] != 0) activityMask |= (1ULL << (i + 1));
+        if (cells[i + 2] != 0) activityMask |= (1ULL << (i + 2));
+        if (cells[i + 3] != 0) activityMask |= (1ULL << (i + 3));
+
+        // Process word 0
         uint64_t changeBuff = 0;
         uint64_t slice = cells[i];
-        changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 62;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 60;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 58;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 56;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 54;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 52;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 50;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 48;
+        if (slice != 0) {
+            changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 62;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 60;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 58;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 56;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 54;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 52;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 50;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 48;
+        }
 
+        // Process word 1
         slice = cells[i + 1];
-        changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 46;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 44;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 42;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 40;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 38;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 36;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 34;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 32;
+        if (slice != 0) {
+            changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 46;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 44;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 42;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 40;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 38;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 36;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 34;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 32;
+        }
 
+        // Process word 2
         slice = cells[i + 2];
-        changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 30;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 28;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 26;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 24;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 22;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 20;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 18;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 16;
+        if (slice != 0) {
+            changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 30;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 28;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 26;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 24;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 22;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 20;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 18;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 16;
+        }
 
+        // Process word 3
         slice = cells[i + 3];
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 56) & 0xFF)]) << 14;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 12;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 10;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 8;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 6;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 4;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 2;
-        changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]);
+        if (slice != 0) {
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 56) & 0xFF)]) << 14;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 12;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 10;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 8;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 6;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 4;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 2;
+            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]);
+        }
 
         changes[i >> 2] = changeBuff;
     }
@@ -418,6 +450,9 @@ inline void Tile::applyDelta(int x, int y, int8_t delta) {
 
     // Update the neighbor count
     cells[cellIdx] = (cells[cellIdx] & ~mask) | (static_cast<uint64_t>(newCount) << bitPos);
+
+    // Mark this word as active (neighbor count change means potential birth)
+    activityMask |= (1ULL << cellIdx);
 }
 
 // Apply vertical deltas to 4 consecutive cells in a row (x-1, x, x+1, x+2)
@@ -442,6 +477,17 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
             if (right) {
                 right->applyDelta(0, y, delta);
             }
+        }
+    }
+}
+
+void Tile::rebuildActivityMask() {
+    // Rebuild the activity mask by scanning all 64-bit words
+    // A word is active if it contains any non-zero content
+    activityMask = 0;
+    for (int i = 0; i < TILE_64S; i++) {
+        if (cells[i] != 0) {
+            activityMask |= (1ULL << i);
         }
     }
 }
