@@ -12,6 +12,22 @@
             </PerProfileState>
           </value>
         </entry>
+        <entry key="Debug-Coverage">
+          <value>
+            <PerProfileState>
+              <option name="myQmlPath" value="/opt/homebrew/Cellar/qt@5/5.15.18/qml" />
+              <option name="myQtBinPath" value="/opt/homebrew/opt/qt@5/bin" />
+            </PerProfileState>
+          </value>
+        </entry>
+        <entry key="Release">
+          <value>
+            <PerProfileState>
+              <option name="myQmlPath" value="/opt/homebrew/Cellar/qt@5/5.15.18/qml" />
+              <option name="myQtBinPath" value="/opt/homebrew/opt/qt@5/bin" />
+            </PerProfileState>
+          </value>
+        </entry>
       </map>
     </option>
   </component>

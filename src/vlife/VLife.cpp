@@ -43,8 +43,11 @@ void ThreadPool::workerLoop() {
 
         task();
 
-        if (--pendingTasks == 0) {
-            tasksDone.notify_all();
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            if (--pendingTasks == 0) {
+                tasksDone.notify_all();
+            }
         }
     }
 }
