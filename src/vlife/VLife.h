@@ -6,10 +6,18 @@
 
 #include <memory>
 #include <unordered_map>
+#include <vector>
 #include "../GameOfLife.h"
 
 // Forward declaration
 class Tile;
+
+// Packed deltas for neighbor count updates when cell pairs change
+// Used by the LUT-based optimization in runGenerationChanges
+struct PackedDeltas {
+    int8_t sameRow[2];     // [0]=x-1 neighbor, [1]=x+2 neighbor (horizontal, same row)
+    int8_t verticalRow[4]; // [0]=x-1, [1]=x, [2]=x+1, [3]=x+2 (for rows above/below)
+};
 
 // Tile dimensions in base-2 multiples
 #define TILE_WIDTH_2 5 // 2^5 = 32
@@ -70,7 +78,18 @@ private:
     // Map to store tiles
     std::unordered_map<TileCoord, std::unique_ptr<Tile>, TileCoordHash> tiles;
 
+    // Spatial ordering for cache-friendly iteration
+    std::vector<Tile*> spatialOrder;
+    bool spatialOrderDirty = true;
+
+    // Rebuild the spatial order vector
+    void rebuildSpatialOrder();
+
+    // Evict tiles with no live cells
+    void evictDeadTiles();
+
 public:
     std::byte ruleLUT[256];
     std::int16_t updateLUT[1024];
+    PackedDeltas deltaLUT[16];  // LUT for neighbor count updates indexed by change/alive flags
 };

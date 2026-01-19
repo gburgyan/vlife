@@ -4,10 +4,12 @@
 
 #include "VLife.h"
 #include "Tile.h"
+#include <algorithm>
 
 VLife::VLife() {
     resetBoard();
     populateRuleLUT();
+    populateUpdateLUT();
 }
 
 VLife::~VLife() {
@@ -18,6 +20,8 @@ VLife::~VLife() {
 void VLife::resetBoard() {
     // Clear all existing tiles
     tiles.clear();
+    spatialOrder.clear();
+    spatialOrderDirty = true;
 }
 
 Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
@@ -33,6 +37,7 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
     auto newTile = std::make_unique<Tile>(this, tileX, tileY);
     Tile *tilePtr = newTile.get();
     tiles[coord] = std::move(newTile);
+    spatialOrderDirty = true;
 
     // Connect to neighboring tiles if they exist
 
@@ -140,15 +145,23 @@ void VLife::setCells(uint32_t offsetX, uint32_t offsetY, uint32_t width, uint32_
 }
 
 void VLife::runGeneration() {
-    // First pass: prepare all tiles for the generation
-    for (auto &tilePair: tiles) {
-        tilePair.second->runGenerationPrepare();
+    // Rebuild spatial order if needed
+    if (spatialOrderDirty) {
+        rebuildSpatialOrder();
     }
 
-    // Second pass: apply the changes
-    for (auto &tilePair: tiles) {
-        tilePair.second->runGenerationChanges();
+    // First pass: prepare all tiles for the generation (in spatial order)
+    for (Tile* tile : spatialOrder) {
+        tile->runGenerationPrepare();
     }
+
+    // Second pass: apply the changes (in spatial order)
+    for (Tile* tile : spatialOrder) {
+        tile->runGenerationChanges();
+    }
+
+    // Evict dead tiles to prevent memory growth
+    evictDeadTiles();
 }
 
 void VLife::runGenerations(uint32_t count) {
@@ -194,6 +207,42 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
 
     // Remove the tile from the map
     tiles.erase(it);
+    spatialOrderDirty = true;
+}
+
+void VLife::rebuildSpatialOrder() {
+    spatialOrder.clear();
+    spatialOrder.reserve(tiles.size());
+
+    for (auto& [coord, tile] : tiles) {
+        spatialOrder.push_back(tile.get());
+    }
+
+    // Sort tiles by row-major order (y first, then x) for cache-friendly iteration
+    std::sort(spatialOrder.begin(), spatialOrder.end(),
+        [](const Tile* a, const Tile* b) {
+            int64_t aKey = (static_cast<int64_t>(a->getTileY()) << 32) | (a->getTileX() & 0xFFFFFFFF);
+            int64_t bKey = (static_cast<int64_t>(b->getTileY()) << 32) | (b->getTileX() & 0xFFFFFFFF);
+            return aKey < bKey;
+        });
+
+    spatialOrderDirty = false;
+}
+
+void VLife::evictDeadTiles() {
+    // Collect dead tiles (tiles with no live cells)
+    std::vector<TileCoord> deadTiles;
+
+    for (auto& [coord, tile] : tiles) {
+        if (tile->getLiveCount() == 0) {
+            deadTiles.push_back(coord);
+        }
+    }
+
+    // Remove dead tiles
+    for (const auto& coord : deadTiles) {
+        removeTile(coord.x, coord.y);
+    }
 }
 
 void VLife::populateRuleLUT() {
@@ -221,10 +270,10 @@ void VLife::populateRuleLUT() {
     int maxSurvive = 3;
 
     for (int i = 0; i < 256; i++) {
-        int leftAlive = i & 0x10;
-        int leftNeighbors = i & 0xE0 >> 5;
-        int rightAlive = i & 0x01;
-        int rightNeighbors = i & 0x0E >> 1;
+        int leftAlive = (i >> 7) & 1;       // Bit 7: left cell alive
+        int leftNeighbors = (i >> 4) & 0x7; // Bits 6-4: left neighbor count
+        int rightAlive = (i >> 3) & 1;      // Bit 3: right cell alive
+        int rightNeighbors = i & 0x7;       // Bits 2-0: right neighbor count
 
         leftNeighbors += rightAlive;
         rightNeighbors += leftAlive;
@@ -275,4 +324,57 @@ void VLife::populateRuleLUT() {
     }
 }
 
-void VLife::populateUpdateLUT() {}
+void VLife::populateUpdateLUT() {
+    // Populate the deltaLUT for neighbor count updates.
+    // Index encoding (4 bits):
+    //   bits [3:2] = left cell state:  00=unchanged, 01=became alive, 10=died
+    //   bits [1:0] = right cell state: 00=unchanged, 01=became alive, 10=died
+    //
+    // For a cell pair at positions (2k, y) [right] and (2k+1, y) [left]:
+    //   - sameRow[0] (x-1): only affected by right cell
+    //   - sameRow[1] (x+2): only affected by left cell
+    //   - verticalRow[0] (x-1): only affected by right cell
+    //   - verticalRow[1] (x):   affected by both cells (shared neighbor)
+    //   - verticalRow[2] (x+1): affected by both cells (shared neighbor)
+    //   - verticalRow[3] (x+2): only affected by left cell
+
+    // Initialize all entries to zero
+    for (int i = 0; i < 16; i++) {
+        deltaLUT[i].sameRow[0] = 0;
+        deltaLUT[i].sameRow[1] = 0;
+        deltaLUT[i].verticalRow[0] = 0;
+        deltaLUT[i].verticalRow[1] = 0;
+        deltaLUT[i].verticalRow[2] = 0;
+        deltaLUT[i].verticalRow[3] = 0;
+    }
+
+    // Helper: convert state code to delta: 0=unchanged(0), 1=became alive(+1), 2=died(-1)
+    auto stateToDelta = [](int state) -> int8_t {
+        if (state == 1) return 1;   // became alive
+        if (state == 2) return -1;  // died
+        return 0;                   // unchanged
+    };
+
+    for (int leftState = 0; leftState < 3; leftState++) {
+        for (int rightState = 0; rightState < 3; rightState++) {
+            int idx = (leftState << 2) | rightState;
+            int8_t leftDelta = stateToDelta(leftState);
+            int8_t rightDelta = stateToDelta(rightState);
+
+            // sameRow[0] (x-1): only affected by right cell
+            deltaLUT[idx].sameRow[0] = rightDelta;
+            // sameRow[1] (x+2): only affected by left cell
+            deltaLUT[idx].sameRow[1] = leftDelta;
+
+            // verticalRow for rows above and below
+            // [0] (x-1): only right cell
+            deltaLUT[idx].verticalRow[0] = rightDelta;
+            // [1] (x): both cells (shared)
+            deltaLUT[idx].verticalRow[1] = static_cast<int8_t>(leftDelta + rightDelta);
+            // [2] (x+1): both cells (shared)
+            deltaLUT[idx].verticalRow[2] = static_cast<int8_t>(leftDelta + rightDelta);
+            // [3] (x+2): only left cell
+            deltaLUT[idx].verticalRow[3] = leftDelta;
+        }
+    }
+}

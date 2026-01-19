@@ -6,6 +6,16 @@
 #include <cstring>
 #include <mutex>
 
+// Cross-platform prefetch support
+#if defined(__x86_64__) || defined(_M_X64)
+    #include <xmmintrin.h>
+    #define PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T0)
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    #define PREFETCH(addr) __builtin_prefetch((addr), 0, 3)
+#else
+    #define PREFETCH(addr) ((void)0)
+#endif
+
 Tile::Tile(VLife *board, int32_t tileX, int32_t tileY) :
     board(board), tileX(tileX), tileY(tileY), left(nullptr), right(nullptr), up(nullptr), down(nullptr), liveCount(0) {
     // Initialize all cells to zero (dead)
@@ -73,17 +83,28 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
     }
     
     // Calculate the positions of the 8 neighbors
+    // Note: dx[3]=(-1,0)=left neighbor, dx[4]=(1,0)=right neighbor
     int dx[] = {-1, 0, 1, -1, 1, -1, 0, 1};
     int dy[] = {-1, -1, -1, 0, 0, 1, 1, 1};
-    
+
+    // Determine which neighbor is the paired cell (shares same byte)
+    // For even x: paired cell is at x+1 (right neighbor, i=4)
+    // For odd x: paired cell is at x-1 (left neighbor, i=3)
+    int pairedNeighborIdx = (localX & 1) ? 3 : 4;
+
     for (int i = 0; i < 8; i++) {
+        // Skip the paired cell - its neighbor count is handled implicitly
+        if (i == pairedNeighborIdx) {
+            continue;
+        }
+
         int nx = static_cast<int>(localX) + dx[i];
         int ny = static_cast<int>(localY) + dy[i];
-        
+
         // Handle neighbors that are in this tile
         if (nx >= 0 && nx < TILE_WIDTH && ny >= 0 && ny < TILE_HEIGHT) {
             updateNeighborCount(nx, ny, alive);
-        } 
+        }
         // Handle neighbors that are in adjacent tiles
         else {
             // Determine which adjacent tile and local coordinates
@@ -91,7 +112,7 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
             int tileOffsetY = 0;
             int adjLocalX = nx;
             int adjLocalY = ny;
-            
+
             if (nx < 0) {
                 tileOffsetX = -1;
                 adjLocalX = TILE_WIDTH - 1;
@@ -99,7 +120,7 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
                 tileOffsetX = 1;
                 adjLocalX = 0;
             }
-            
+
             if (ny < 0) {
                 tileOffsetY = -1;
                 adjLocalY = TILE_HEIGHT - 1;
@@ -107,7 +128,7 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
                 tileOffsetY = 1;
                 adjLocalY = 0;
             }
-            
+
             // Get the adjacent tile
             Tile* adjTile = nullptr;
             if (tileOffsetX == -1 && tileOffsetY == 0) {
@@ -122,7 +143,7 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
                 // Corner cases - need to find or create the diagonal tile
                 adjTile = board->getTile(tileX + tileOffsetX, tileY + tileOffsetY);
             }
-            
+
             if (adjTile) {
                 adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             }
@@ -165,10 +186,14 @@ void Tile::runGenerationPrepare() {
 
     auto ruleLUT = board->ruleLUT;
 
-    uint64_t changeBuff = 0;
     for (int i = 0; i < TILE_64S; i += 4) {
-        // _mm_prefetch((const char*)&cells[i+4], _MM_HINT_T0);
+        // Prefetch next iteration's data
+        if (i + 4 < TILE_64S) {
+            PREFETCH(&cells[i + 4]);
+        }
 
+        // Reset changeBuff at the start of each iteration
+        uint64_t changeBuff = 0;
         uint64_t slice = cells[i];
         changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 62;
         changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 60;
@@ -214,94 +239,256 @@ void Tile::runGenerationPrepare() {
 }
 
 void Tile::runGenerationChanges() {
-    uint64_t verticalChangeAdd[TILE_64S_WIDTH];
-    uint64_t verticalChangeSubtract[TILE_64S_WIDTH];
-    uint64_t lineChangeAdd[TILE_64S_WIDTH];
-    uint64_t lineChangeSubtract[TILE_64S_WIDTH];
+    // Process the changes array to find cells that need to toggle.
+    // Uses LUT-based optimization to handle cell pairs together.
+    //
+    // For each cell pair that has changes:
+    //   1. Toggle the alive bits
+    //   2. Update liveCount
+    //   3. Look up deltas in deltaLUT based on change states
+    //   4. Apply deltas to all affected neighbors
 
+    const PackedDeltas* deltaLUT = board->deltaLUT;
 
-    int topLeftChange = 0;
-    int topRightChange = 0;
-    int bottomLeftChange = 0;
-    int bottomRightChange = 0;
+    for (int changeIdx = 0; changeIdx < TILE_CHANGE_64S; changeIdx++) {
+        uint64_t changeBits = changes[changeIdx];
 
-    uint64_t *changesPtr = changes;
-    uint64_t *cellsPtr = cells;
-    uint64_t work;
-    int changeWordsLeft = 0;
+        if (changeBits == 0) {
+            continue;
+        }
 
-    for (int row = 0; row < TILE_HEIGHT; row++) {
-        // zero out verticalChangeAdd, verticalChangeSubtract, lineChangeAdd, lineChangeSubtract
-        uint64_t rowVerticalChangeAdd[TILE_64S_WIDTH];
-        uint64_t rowVerticalChangeSubtract[TILE_64S_WIDTH];
-        uint64_t rowLineChangeAdd[TILE_64S_WIDTH];
-        uint64_t rowLineChangeSubtract[TILE_64S_WIDTH];
+        // Process 64 change bits (32 cell pairs, 2 bits per pair)
+        for (int bitPair = 0; bitPair < 32; bitPair++) {
+            // Extract 2 change bits for this cell pair (bit 1 = left changed, bit 0 = right changed)
+            int shiftAmount = 62 - (bitPair * 2);
+            int pairChangeBits = (changeBits >> shiftAmount) & 0x3;
 
-        int rowVerticalLeftChange = 0;
-        int rowVerticalRightChange = 0;
-        int rowLeftChange = 0;
-        int rowRightChange = 0;
-
-        for (int colPos = 0; colPos < TILE_64S; colPos++) {
-            if (changeWordsLeft == 0) {
-                // Each of the 64-bit cell blocks has 16 4-bit cells.
-                work = *changesPtr++;
-                changeWordsLeft = 4;
-            }
-
-            int changeWord = (work & 0xFFFF000000000000) >> 48;
-            work <<= 16;
-            changeWordsLeft--;
-
-            if (changeWord == 0) {
-                cellsPtr++;
+            if (pairChangeBits == 0) {
                 continue;
             }
 
-            uint64_t cellSpan = *cellsPtr;
+            // Calculate which cell word and bit position
+            int wordsFromStart = bitPair / 8;  // 8 cell pairs per 64-bit word
+            int pairInWord = bitPair % 8;
 
-            if (changeWord & 0x8000) {
-                if (cellSpan & 0x1000000000000000) {
-                    // dying cell
-                    rowLeftChange--;
-                    rowVerticalChangeSubtract[colPos] += 0x2200000000000000;
+            int currentCellIdx = (changeIdx * 4) + wordsFromStart;
+            int leftCellBitPos = (7 - pairInWord) * 8 + 7;   // Left cell alive bit
+            int rightCellBitPos = (7 - pairInWord) * 8 + 3;  // Right cell alive bit
+
+            // Calculate base cell index (right cell, even x)
+            int baseCellInTile = currentCellIdx * 16 + (7 - pairInWord) * 2;
+            int baseX = baseCellInTile % TILE_WIDTH;  // Right cell x (even)
+            int localY = baseCellInTile / TILE_WIDTH;
+
+            // Determine states for LUT index:
+            // bits [3:2] = left cell: 00=unchanged, 01=became alive, 10=died
+            // bits [1:0] = right cell: 00=unchanged, 01=became alive, 10=died
+            int leftState = 0;
+            int rightState = 0;
+
+            // Process left cell (odd x = baseX + 1)
+            if (pairChangeBits & 0x2) {
+                bool wasAlive = (cells[currentCellIdx] & (1ULL << leftCellBitPos)) != 0;
+                bool becameAlive = !wasAlive;
+
+                // Toggle the alive bit
+                cells[currentCellIdx] ^= (1ULL << leftCellBitPos);
+
+                // Update live count
+                if (becameAlive) {
+                    liveCount++;
+                    leftState = 1;  // became alive
                 } else {
-                    // new cell
-                    rowLeftChange++;
-                    rowVerticalChangeAdd[colPos] += 0x2200000000000000;
-                }
-                cellSpan ^= 0x1000000000000000;
-            }
-
-            for (int i = 1; i < 15; i++) {
-                if (changeWord & (1 << i)) {
-                    if (cellSpan & (1 << i)) {
-                        // dying cell
-                        rowVerticalChangeSubtract[colPos] += 0x0000000000000222 << (i * 4);
-                    } else {
-                        // new cell
-                        rowVerticalChangeAdd[colPos] += 0x0000000000000222 << (i * 4);
-                    }
-                    cellSpan ^= 1 << i * 4;
+                    liveCount--;
+                    leftState = 2;  // died
                 }
             }
 
-            if (changeWord & 0x001) {
-                if (cellSpan & 0x0000000000000001) {
-                    // dying cell
-                    rowRightChange--;
-                    rowVerticalChangeSubtract[colPos] += 0x0000000000000022;
+            // Process right cell (even x = baseX)
+            if (pairChangeBits & 0x1) {
+                bool wasAlive = (cells[currentCellIdx] & (1ULL << rightCellBitPos)) != 0;
+                bool becameAlive = !wasAlive;
+
+                // Toggle the alive bit
+                cells[currentCellIdx] ^= (1ULL << rightCellBitPos);
+
+                // Update live count
+                if (becameAlive) {
+                    liveCount++;
+                    rightState = 1;  // became alive
                 } else {
-                    // new cell
-                    rowRightChange++;
-                    rowVerticalChangeAdd[colPos] += 0x0000000000000022;
+                    liveCount--;
+                    rightState = 2;  // died
                 }
-                cellSpan ^= 0x0000000000000001;
             }
 
-            *cellsPtr = cellSpan;
-
-            cellsPtr++;
+            // Build LUT index and apply deltas
+            int lutIndex = (leftState << 2) | rightState;
+            applyDeltasForCellPair(baseX, localY, deltaLUT[lutIndex]);
         }
+    }
+}
+
+void Tile::updateNeighborsForChangedCell(int localX, int localY, bool becameAlive) {
+    // Update all 8 neighbors of a cell that changed state
+    // This is similar to the neighbor update logic in setCell
+    // Note: dx[3]=(-1,0)=left neighbor, dx[4]=(1,0)=right neighbor
+
+    int dx[] = {-1, 0, 1, -1, 1, -1, 0, 1};
+    int dy[] = {-1, -1, -1, 0, 0, 1, 1, 1};
+
+    // Determine which neighbor is the paired cell (shares same byte)
+    // For even x: paired cell is at x+1 (right neighbor, i=4)
+    // For odd x: paired cell is at x-1 (left neighbor, i=3)
+    int pairedNeighborIdx = (localX & 1) ? 3 : 4;
+
+    for (int i = 0; i < 8; i++) {
+        // Skip the paired cell - its neighbor count is handled implicitly
+        if (i == pairedNeighborIdx) {
+            continue;
+        }
+
+        int nx = localX + dx[i];
+        int ny = localY + dy[i];
+
+        // Handle neighbors within this tile
+        if (nx >= 0 && nx < TILE_WIDTH && ny >= 0 && ny < TILE_HEIGHT) {
+            updateNeighborCount(nx, ny, becameAlive);
+        }
+        // Handle neighbors in adjacent tiles
+        else {
+            int tileOffsetX = 0;
+            int tileOffsetY = 0;
+            int adjLocalX = nx;
+            int adjLocalY = ny;
+
+            if (nx < 0) {
+                tileOffsetX = -1;
+                adjLocalX = TILE_WIDTH - 1;
+            } else if (nx >= TILE_WIDTH) {
+                tileOffsetX = 1;
+                adjLocalX = 0;
+            }
+
+            if (ny < 0) {
+                tileOffsetY = -1;
+                adjLocalY = TILE_HEIGHT - 1;
+            } else if (ny >= TILE_HEIGHT) {
+                tileOffsetY = 1;
+                adjLocalY = 0;
+            }
+
+            // Get the adjacent tile
+            Tile* adjTile = nullptr;
+            if (tileOffsetX == -1 && tileOffsetY == 0) {
+                adjTile = left;
+            } else if (tileOffsetX == 1 && tileOffsetY == 0) {
+                adjTile = right;
+            } else if (tileOffsetX == 0 && tileOffsetY == -1) {
+                adjTile = up;
+            } else if (tileOffsetX == 0 && tileOffsetY == 1) {
+                adjTile = down;
+            } else {
+                // Diagonal tile - need to get or create it
+                adjTile = board->getTile(tileX + tileOffsetX, tileY + tileOffsetY);
+            }
+
+            if (adjTile) {
+                adjTile->updateNeighborCount(adjLocalX, adjLocalY, becameAlive);
+            }
+        }
+    }
+}
+
+// Apply a single delta to a cell's neighbor count
+inline void Tile::applyDelta(int x, int y, int8_t delta) {
+    if (delta == 0) return;
+
+    uint32_t cellIdx = (y * TILE_WIDTH + x) / 16;
+    uint32_t bitPos = ((y * TILE_WIDTH + x) % 16) * 4;
+
+    // Extract the current neighbor count (bits 0-2)
+    uint64_t mask = 0x7ULL << bitPos;
+    uint64_t currentCount = (cells[cellIdx] & mask) >> bitPos;
+
+    // Apply delta with bounds checking
+    int newCount = static_cast<int>(currentCount) + delta;
+    if (newCount < 0) newCount = 0;
+    if (newCount > 7) newCount = 7;
+
+    // Update the neighbor count
+    cells[cellIdx] = (cells[cellIdx] & ~mask) | (static_cast<uint64_t>(newCount) << bitPos);
+}
+
+// Apply vertical deltas to 4 consecutive cells in a row (x-1, x, x+1, x+2)
+void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
+    // Apply deltas to 4 cells: (baseX-1, y), (baseX, y), (baseX+1, y), (baseX+2, y)
+    for (int i = 0; i < 4; i++) {
+        int x = baseX - 1 + i;
+        int8_t delta = deltas[i];
+
+        if (delta == 0) continue;
+
+        // Check bounds and handle accordingly
+        if (x >= 0 && x < TILE_WIDTH) {
+            applyDelta(x, y, delta);
+        } else if (x < 0) {
+            // Left tile boundary
+            if (left) {
+                left->applyDelta(TILE_WIDTH - 1, y, delta);
+            }
+        } else {
+            // Right tile boundary
+            if (right) {
+                right->applyDelta(0, y, delta);
+            }
+        }
+    }
+}
+
+// Apply deltas for a cell pair using LUT
+void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& deltas) {
+    // baseX is the x coordinate of the right cell (even x)
+    // The left cell is at baseX+1 (odd x)
+
+    // Apply same-row horizontal neighbors: x-1 and x+2
+    // sameRow[0] is for x-1 (only affected by right cell)
+    // sameRow[1] is for x+2 (only affected by left cell)
+
+    int leftNeighborX = baseX - 1;
+    int rightNeighborX = baseX + 2;
+
+    // Handle x-1 neighbor (same row)
+    if (deltas.sameRow[0] != 0) {
+        if (leftNeighborX >= 0) {
+            applyDelta(leftNeighborX, localY, deltas.sameRow[0]);
+        } else if (left) {
+            left->applyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
+        }
+    }
+
+    // Handle x+2 neighbor (same row)
+    if (deltas.sameRow[1] != 0) {
+        if (rightNeighborX < TILE_WIDTH) {
+            applyDelta(rightNeighborX, localY, deltas.sameRow[1]);
+        } else if (right) {
+            right->applyDelta(0, localY, deltas.sameRow[1]);
+        }
+    }
+
+    // Apply vertical deltas for row above (y-1)
+    if (localY > 0) {
+        applyVerticalDeltas(baseX, localY - 1, deltas.verticalRow);
+    } else if (up) {
+        // Handle top tile boundary
+        up->applyVerticalDeltas(baseX, TILE_HEIGHT - 1, deltas.verticalRow);
+    }
+
+    // Apply vertical deltas for row below (y+1)
+    if (localY < TILE_HEIGHT - 1) {
+        applyVerticalDeltas(baseX, localY + 1, deltas.verticalRow);
+    } else if (down) {
+        // Handle bottom tile boundary
+        down->applyVerticalDeltas(baseX, 0, deltas.verticalRow);
     }
 }

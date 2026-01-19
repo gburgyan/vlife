@@ -15,21 +15,29 @@ protected:
     std::unique_ptr<VLife> vlife;
     
     // Helper function to get neighbor count from cell representation
+    // The stored neighbor count excludes the paired cell, so we add the paired cell's alive state
     uint32_t getNeighborCount(Tile* tile, uint32_t x, uint32_t y) {
         uint32_t cellIdx = (y * TILE_WIDTH + x) / 16;
-        bool rightCell = x & 1;
         uint32_t bitPos = ((y * TILE_WIDTH + x) % 16) * 4;
 
-        uint32_t oppositeCellLive;
-        if (rightCell) {
-            oppositeCellLive = tile->cells[cellIdx] & (1ULL << 7);
+        // Get the paired cell's alive state
+        // For odd x (left cell in pair), paired cell's alive bit is at bitPos - 1
+        // For even x (right cell in pair), paired cell's alive bit is at bitPos + 7
+        uint32_t pairedCellAlive;
+        if (x & 1) {
+            // Odd x = "left" cell, paired with "right" cell at bitPos-4, alive bit at bitPos-1
+            pairedCellAlive = (tile->cells[cellIdx] >> (bitPos - 1)) & 1;
         } else {
-            oppositeCellLive = tile->cells[cellIdx] & (1ULL << 3);
+            // Even x = "right" cell, paired with "left" cell at bitPos+4, alive bit at bitPos+7
+            pairedCellAlive = (tile->cells[cellIdx] >> (bitPos + 7)) & 1;
         }
 
-        // Extract the neighbor count (bits 0-2)
-        uint64_t mask = 0x7ULL << bitPos; // Mask for the neighbor count bits
-        return ((tile->cells[cellIdx] & mask) >> bitPos) + oppositeCellLive;
+        // Extract the stored neighbor count (bits 0-2 of the nibble)
+        uint64_t mask = 0x7ULL << bitPos;
+        uint32_t storedCount = (tile->cells[cellIdx] & mask) >> bitPos;
+
+        // True neighbor count = stored count + paired cell's alive state
+        return storedCount + pairedCellAlive;
     }
 };
 
@@ -393,17 +401,175 @@ TEST_F(VLifeTest, LiveCountWithSetCells) {
     EXPECT_EQ(tile->getLiveCount(), 0);
 }
 
-// Note: runGeneration tests are commented out because the implementation is incomplete
-/*
-// Test simple RunGeneration with a single cell
+// Test simple RunGeneration with a single cell (isolated cell dies)
 TEST_F(VLifeTest, SimpleRunGeneration) {
     // Set a single cell to alive
     vlife->setCell(5, 5, GameOfLife::CellState::ALIVE);
-    
+
     // An isolated cell should die in the next generation
     vlife->runGeneration();
-    
+
     // Verify the cell is dead
     EXPECT_EQ(vlife->getCell(5, 5), GameOfLife::CellState::DEAD);
 }
-*/
+
+// Test that a 2x2 block is stable (still life)
+TEST_F(VLifeTest, BlockStability) {
+    // Create a 2x2 block
+    vlife->setCell(10, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(11, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(10, 11, GameOfLife::CellState::ALIVE);
+    vlife->setCell(11, 11, GameOfLife::CellState::ALIVE);
+
+    // Run a generation
+    vlife->runGeneration();
+
+    // Block should remain unchanged
+    EXPECT_EQ(vlife->getCell(10, 10), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(11, 10), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(10, 11), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(11, 11), GameOfLife::CellState::ALIVE);
+
+    // Surrounding cells should remain dead
+    EXPECT_EQ(vlife->getCell(9, 9), GameOfLife::CellState::DEAD);
+    EXPECT_EQ(vlife->getCell(12, 12), GameOfLife::CellState::DEAD);
+}
+
+// Test blinker oscillation (period 2 oscillator)
+TEST_F(VLifeTest, BlinkerOscillation) {
+    // Create a horizontal blinker
+    vlife->setCell(10, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(11, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(12, 10, GameOfLife::CellState::ALIVE);
+
+    // Run one generation - should become vertical
+    vlife->runGeneration();
+
+    // Verify vertical orientation
+    EXPECT_EQ(vlife->getCell(10, 10), GameOfLife::CellState::DEAD);
+    EXPECT_EQ(vlife->getCell(11, 9), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(11, 10), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(11, 11), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(12, 10), GameOfLife::CellState::DEAD);
+
+    // Run another generation - should return to horizontal
+    vlife->runGeneration();
+
+    // Verify horizontal orientation
+    EXPECT_EQ(vlife->getCell(10, 10), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(11, 10), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(12, 10), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(11, 9), GameOfLife::CellState::DEAD);
+    EXPECT_EQ(vlife->getCell(11, 11), GameOfLife::CellState::DEAD);
+}
+
+// Test glider movement
+TEST_F(VLifeTest, GliderMovement) {
+    // Create a glider (moves down-right)
+    //  .X.
+    //  ..X
+    //  XXX
+    vlife->setCell(11, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(12, 11, GameOfLife::CellState::ALIVE);
+    vlife->setCell(10, 12, GameOfLife::CellState::ALIVE);
+    vlife->setCell(11, 12, GameOfLife::CellState::ALIVE);
+    vlife->setCell(12, 12, GameOfLife::CellState::ALIVE);
+
+    // Run 4 generations (one full glider cycle, moves 1 cell diagonally)
+    vlife->runGenerations(4);
+
+    // Glider should have moved down and right by 1
+    EXPECT_EQ(vlife->getCell(12, 11), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(13, 12), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(11, 13), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(12, 13), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(13, 13), GameOfLife::CellState::ALIVE);
+
+    // Original positions should be dead
+    EXPECT_EQ(vlife->getCell(11, 10), GameOfLife::CellState::DEAD);
+    EXPECT_EQ(vlife->getCell(10, 12), GameOfLife::CellState::DEAD);
+}
+
+// Test cell death by underpopulation
+TEST_F(VLifeTest, CellDeathByUnderpopulation) {
+    // A cell with only 1 neighbor should die
+    vlife->setCell(10, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(11, 10, GameOfLife::CellState::ALIVE);
+
+    vlife->runGeneration();
+
+    // Both cells should die
+    EXPECT_EQ(vlife->getCell(10, 10), GameOfLife::CellState::DEAD);
+    EXPECT_EQ(vlife->getCell(11, 10), GameOfLife::CellState::DEAD);
+}
+
+// Test cell death by overpopulation
+TEST_F(VLifeTest, CellDeathByOverpopulation) {
+    // Create a configuration where center cell has 4+ neighbors (will die)
+    //  .X.
+    //  XXX
+    //  .X.
+    vlife->setCell(11, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(10, 11, GameOfLife::CellState::ALIVE);
+    vlife->setCell(11, 11, GameOfLife::CellState::ALIVE);
+    vlife->setCell(12, 11, GameOfLife::CellState::ALIVE);
+    vlife->setCell(11, 12, GameOfLife::CellState::ALIVE);
+
+    vlife->runGeneration();
+
+    // Center cell (11, 11) should die due to overpopulation (4 neighbors)
+    EXPECT_EQ(vlife->getCell(11, 11), GameOfLife::CellState::DEAD);
+}
+
+// Test cell birth
+TEST_F(VLifeTest, CellBirth) {
+    // A dead cell with exactly 3 neighbors should become alive
+    //  XX
+    //  X.
+    vlife->setCell(10, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(11, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(10, 11, GameOfLife::CellState::ALIVE);
+
+    vlife->runGeneration();
+
+    // Cell at (11, 11) should be born (has exactly 3 neighbors)
+    EXPECT_EQ(vlife->getCell(11, 11), GameOfLife::CellState::ALIVE);
+}
+
+// Test generation at tile boundary
+TEST_F(VLifeTest, GenerationAtTileBoundary) {
+    // Place a blinker at the edge of a tile
+    uint32_t edgeX = TILE_WIDTH - 2;
+
+    // Horizontal blinker spanning edge
+    vlife->setCell(edgeX, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(edgeX + 1, 10, GameOfLife::CellState::ALIVE);  // At tile boundary
+    vlife->setCell(edgeX + 2, 10, GameOfLife::CellState::ALIVE);  // In next tile
+
+    // Run a generation
+    vlife->runGeneration();
+
+    // Should become vertical blinker
+    EXPECT_EQ(vlife->getCell(edgeX, 10), GameOfLife::CellState::DEAD);
+    EXPECT_EQ(vlife->getCell(edgeX + 1, 9), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(edgeX + 1, 10), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(edgeX + 1, 11), GameOfLife::CellState::ALIVE);
+    EXPECT_EQ(vlife->getCell(edgeX + 2, 10), GameOfLife::CellState::DEAD);
+}
+
+// Test that liveCount is updated correctly during generation
+TEST_F(VLifeTest, LiveCountAfterGeneration) {
+    // Create a blinker (3 live cells)
+    vlife->setCell(10, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(11, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(12, 10, GameOfLife::CellState::ALIVE);
+
+    Tile* tile = vlife->getTile(0, 0);
+    EXPECT_EQ(tile->getLiveCount(), 3);
+
+    // Run a generation
+    vlife->runGeneration();
+
+    // Still 3 live cells, just in different positions
+    EXPECT_EQ(tile->getLiveCount(), 3);
+}

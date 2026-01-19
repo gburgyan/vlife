@@ -109,5 +109,33 @@ add_custom_target(run_tests
     DEPENDS GameOfLifeTests
 )
 
+# Benchmark executable
+add_executable(
+        VLifeBenchmark
+        tests/benchmark/VLifeBenchmark.cpp
+)
+
+target_link_libraries(
+        VLifeBenchmark
+        PRIVATE
+        GameOfLifeLib
+)
+
+target_include_directories(VLifeBenchmark PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# Add a custom target to run benchmarks
+add_custom_target(run_benchmark
+    COMMAND VLifeBenchmark
+    DEPENDS VLifeBenchmark
+)
+
+add_custom_target(run_benchmark_quick
+    COMMAND VLifeBenchmark --quick
+    DEPENDS VLifeBenchmark
+)
+
 # Add test-related messages
 message(STATUS "Tests configured. Build 'run_tests' target to execute tests.")
+message(STATUS "Benchmark configured. Build 'run_benchmark' or 'run_benchmark_quick' targets.")
