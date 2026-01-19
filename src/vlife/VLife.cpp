@@ -24,6 +24,9 @@ void VLife::resetBoard() {
     // Clear all existing tiles
     tiles.clear();
     spatialOrder.clear();
+    for (int i = 0; i < 4; i++) {
+        colorGroups[i].clear();
+    }
     spatialOrderDirty = true;
 }
 
@@ -53,6 +56,11 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
     Tile *tilePtr = newTile.get();
     tiles[coord] = std::move(newTile);
     spatialOrderDirty = true;
+
+    // Add to color group for parallel processing (O(1) insertion)
+    int colorIdx = computeColorIndex(tileX, tileY);
+    tilePtr->setColorGroupIndex(colorGroups[colorIdx].size());
+    colorGroups[colorIdx].push_back(tilePtr);
 
     // Connect to neighboring tiles if they exist (already under exclusive lock)
     // We link all 8 neighbors (orthogonal and diagonal) here.
@@ -208,7 +216,7 @@ void VLife::runGeneration() {
     }
 
     // Fall back to sequential for small tile counts or when parallel is disabled
-    if (!parallelEnabled || spatialOrder.size() < 64) {
+    if (!parallelEnabled || spatialOrder.size() < 10) {
         runGenerationSequential();
         evictDeadTiles();
         return;
@@ -274,6 +282,19 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
 
     Tile *tile = it->second.get();
 
+    // Remove from color group using swap-and-pop (O(1) removal)
+    int colorIdx = computeColorIndex(tileX, tileY);
+    size_t tileIndex = tile->getColorGroupIndex();
+    auto& group = colorGroups[colorIdx];
+
+    if (tileIndex < group.size() - 1) {
+        // Swap with last element
+        Tile* lastTile = group.back();
+        group[tileIndex] = lastTile;
+        lastTile->setColorGroupIndex(tileIndex);
+    }
+    group.pop_back();
+
     // Unlink from neighbors
     if (tile->left) {
         tile->left->right = nullptr;
@@ -324,22 +345,6 @@ void VLife::rebuildSpatialOrder() {
         });
 
     spatialOrderDirty = false;
-
-    // Rebuild color groups for parallel processing
-    rebuildColorGroups();
-}
-
-void VLife::rebuildColorGroups() {
-    for (int i = 0; i < 4; i++) {
-        colorGroups[i].clear();
-        colorGroups[i].reserve(spatialOrder.size() / 4 + 1);
-    }
-
-    for (Tile* tile : spatialOrder) {
-        // Color index based on (tileX % 2) + (tileY % 2) * 2
-        int colorIdx = (tile->getTileX() & 1) + ((tile->getTileY() & 1) << 1);
-        colorGroups[colorIdx].push_back(tile);
-    }
 }
 
 void VLife::evictDeadTiles() {

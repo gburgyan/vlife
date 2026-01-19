@@ -44,7 +44,10 @@ class Tile {
 
     // Cooldown counter for tile eviction - prevents flapping
     // Tiles must remain inactive for TILE_COOLDOWN_GENERATIONS before being evicted
-    uint8_t cooldownCounter{TILE_COOLDOWN_GENERATIONS};
+    size_t cooldownCounter{TILE_COOLDOWN_GENERATIONS};
+
+    // Index of this tile within its color group vector (for O(1) swap-and-pop removal)
+    size_t colorGroupIndex{0};
 
     std::mutex tileMutex;
 
@@ -133,6 +136,10 @@ public:
         }
         return --cooldownCounter == 0;  // Evict when counter reaches 0
     }
+
+    // Color group index accessors for O(1) swap-and-pop removal
+    void setColorGroupIndex(size_t idx) { colorGroupIndex = idx; }
+    size_t getColorGroupIndex() const { return colorGroupIndex; }
 
     // Friend declarations to allow access to private members
     friend class VLife;

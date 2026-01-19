@@ -110,8 +110,12 @@ private:
     // Rebuild the spatial order vector
     void rebuildSpatialOrder();
 
-    // Rebuild color groups for parallel processing
-    void rebuildColorGroups();
+    // Compute color index for a tile based on its coordinates
+    // Color 0: (even X, even Y), Color 1: (odd X, even Y)
+    // Color 2: (even X, odd Y),  Color 3: (odd X, odd Y)
+    static int computeColorIndex(int32_t tileX, int32_t tileY) {
+        return (tileX & 1) + ((tileY & 1) << 1);
+    }
 
     // Sequential implementation (fallback for small tile counts)
     void runGenerationSequential();
