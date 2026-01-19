@@ -12,7 +12,7 @@
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
-#include "SimpleGameOfLife.h"
+#include "vlife/VLife.h"
 
 class GameOfLifeView : public QMainWindow {
     Q_OBJECT
@@ -29,7 +29,7 @@ private slots:
     void updateSimulation();
 
 private:
-    SimpleGameOfLife gameOfLife;
+    VLife gameOfLife;
     QGraphicsScene* scene;
     QGraphicsView* view;
     QPushButton* runStopButton;

@@ -573,3 +573,168 @@ TEST_F(VLifeTest, LiveCountAfterGeneration) {
     // Still 3 live cells, just in different positions
     EXPECT_EQ(tile->getLiveCount(), 3);
 }
+
+// Helper function to count total live cells in the board
+static int countLiveCells(VLife& board, int startX, int startY, int width, int height) {
+    int count = 0;
+    for (int y = startY; y < startY + height; y++) {
+        for (int x = startX; x < startX + width; x++) {
+            if (board.getCell(x, y) == GameOfLife::CellState::ALIVE) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+// Helper function to setup a glider at the specified position
+static void setupGlider(VLife& board, int offsetX, int offsetY) {
+    //  .X.
+    //  ..X
+    //  XXX
+    board.setCell(offsetX + 1, offsetY + 0, GameOfLife::CellState::ALIVE);
+    board.setCell(offsetX + 2, offsetY + 1, GameOfLife::CellState::ALIVE);
+    board.setCell(offsetX + 0, offsetY + 2, GameOfLife::CellState::ALIVE);
+    board.setCell(offsetX + 1, offsetY + 2, GameOfLife::CellState::ALIVE);
+    board.setCell(offsetX + 2, offsetY + 2, GameOfLife::CellState::ALIVE);
+}
+
+// Test glider crossing right tile boundary
+// This tests the race condition where tiles (0,0) and (2,0) both update tile (1,0)
+TEST_F(VLifeTest, GliderCrossingRightBoundary) {
+    // Place glider near right edge of tile (0,0), so it will cross into tile (1,0)
+    // TILE_WIDTH is 32, so place glider at x = 28 (4 cells from edge)
+    int startX = TILE_WIDTH - 4;
+    int startY = 10;
+
+    setupGlider(*vlife, startX, startY);
+
+    // Verify initial state: exactly 5 live cells
+    EXPECT_EQ(countLiveCells(*vlife, startX - 5, startY - 5, 20, 20), 5);
+
+    // Run 20 generations - glider should cross the tile boundary
+    // A glider moves 1 cell diagonally every 4 generations
+    // So after 20 generations, it should have moved 5 cells right and down
+    for (int gen = 0; gen < 20; gen++) {
+        vlife->runGeneration();
+
+        // After each generation, glider should still have exactly 5 live cells
+        int liveCells = countLiveCells(*vlife, 0, 0, TILE_WIDTH * 2, TILE_HEIGHT * 2);
+        EXPECT_EQ(liveCells, 5) << "Generation " << (gen + 1) << ": expected 5 live cells, got " << liveCells;
+
+        if (liveCells != 5) {
+            // Early exit on failure to avoid noisy output
+            break;
+        }
+    }
+}
+
+// Test glider crossing bottom tile boundary
+TEST_F(VLifeTest, GliderCrossingBottomBoundary) {
+    // Place glider near bottom edge of tile (0,0), so it will cross into tile (0,1)
+    int startX = 10;
+    int startY = TILE_HEIGHT - 4;
+
+    setupGlider(*vlife, startX, startY);
+
+    // Verify initial state: exactly 5 live cells
+    EXPECT_EQ(countLiveCells(*vlife, startX - 5, startY - 5, 20, 20), 5);
+
+    // Run 20 generations
+    for (int gen = 0; gen < 20; gen++) {
+        vlife->runGeneration();
+
+        int liveCells = countLiveCells(*vlife, 0, 0, TILE_WIDTH * 2, TILE_HEIGHT * 2);
+        EXPECT_EQ(liveCells, 5) << "Generation " << (gen + 1) << ": expected 5 live cells, got " << liveCells;
+
+        if (liveCells != 5) break;
+    }
+}
+
+// Test glider crossing diagonal corner boundary (hardest case)
+// The glider will cross from tile (0,0) to tile (1,1) diagonally
+TEST_F(VLifeTest, GliderCrossingCornerBoundary) {
+    // Place glider near bottom-right corner of tile (0,0)
+    int startX = TILE_WIDTH - 4;
+    int startY = TILE_HEIGHT - 4;
+
+    setupGlider(*vlife, startX, startY);
+
+    // Verify initial state
+    EXPECT_EQ(countLiveCells(*vlife, startX - 5, startY - 5, 20, 20), 5);
+
+    // Run 20 generations
+    for (int gen = 0; gen < 20; gen++) {
+        vlife->runGeneration();
+
+        int liveCells = countLiveCells(*vlife, 0, 0, TILE_WIDTH * 2, TILE_HEIGHT * 2);
+        EXPECT_EQ(liveCells, 5) << "Generation " << (gen + 1) << ": expected 5 live cells, got " << liveCells;
+
+        if (liveCells != 5) break;
+    }
+}
+
+// Test multiple gliders crossing different boundaries simultaneously
+// This is most likely to trigger the race condition because multiple tiles
+// in the same color group will be updating shared neighbor tiles
+TEST_F(VLifeTest, MultipleGlidersCrossingSimultaneously) {
+    // Place gliders near boundaries that will cause maximum contention:
+    // - Glider at (TILE_WIDTH-4, 10) crosses right from tile (0,0) to (1,0)
+    // - Glider at (TILE_WIDTH*2-4, 10) crosses right from tile (1,0) to (2,0)
+    // Tiles (0,0) and (2,0) are both color 0 and will be processed in parallel
+
+    setupGlider(*vlife, TILE_WIDTH - 4, 10);      // Crosses from tile 0,0 to 1,0
+    setupGlider(*vlife, TILE_WIDTH * 2 - 4, 10);  // Crosses from tile 1,0 to 2,0
+
+    // Also add gliders at different y positions to increase contention
+    setupGlider(*vlife, TILE_WIDTH - 4, TILE_HEIGHT + 10);      // Crosses from tile 0,1 to 1,1
+    setupGlider(*vlife, TILE_WIDTH * 2 - 4, TILE_HEIGHT + 10);  // Crosses from tile 1,1 to 2,1
+
+    // Verify initial state: 4 gliders * 5 cells = 20 live cells
+    EXPECT_EQ(countLiveCells(*vlife, 0, 0, TILE_WIDTH * 4, TILE_HEIGHT * 3), 20);
+
+    // Run 30 generations
+    for (int gen = 0; gen < 30; gen++) {
+        vlife->runGeneration();
+
+        int liveCells = countLiveCells(*vlife, 0, 0, TILE_WIDTH * 4, TILE_HEIGHT * 3);
+        EXPECT_EQ(liveCells, 20) << "Generation " << (gen + 1) << ": expected 20 live cells, got " << liveCells;
+
+        if (liveCells != 20) break;
+    }
+}
+
+// Test that the bug is specifically related to parallel processing
+// by comparing sequential vs parallel results
+TEST_F(VLifeTest, ParallelVsSequentialConsistency) {
+    // Setup two identical boards
+    auto vlifeParallel = std::make_unique<VLife>();
+    auto vlifeSequential = std::make_unique<VLife>();
+
+    // Place gliders near boundaries
+    setupGlider(*vlifeParallel, TILE_WIDTH - 4, 10);
+    setupGlider(*vlifeSequential, TILE_WIDTH - 4, 10);
+
+    setupGlider(*vlifeParallel, TILE_WIDTH * 2 - 4, 10);
+    setupGlider(*vlifeSequential, TILE_WIDTH * 2 - 4, 10);
+
+    // Enable parallel for one, disable for other
+    vlifeParallel->setParallelEnabled(true);
+    vlifeSequential->setParallelEnabled(false);
+
+    // Run 30 generations on each
+    for (int gen = 0; gen < 30; gen++) {
+        vlifeParallel->runGeneration();
+        vlifeSequential->runGeneration();
+
+        // Compare results - they should be identical
+        int parallelCells = countLiveCells(*vlifeParallel, 0, 0, TILE_WIDTH * 4, TILE_HEIGHT * 2);
+        int sequentialCells = countLiveCells(*vlifeSequential, 0, 0, TILE_WIDTH * 4, TILE_HEIGHT * 2);
+
+        EXPECT_EQ(parallelCells, sequentialCells)
+            << "Generation " << (gen + 1) << ": parallel has " << parallelCells
+            << " cells, sequential has " << sequentialCells;
+
+        if (parallelCells != sequentialCells) break;
+    }
+}

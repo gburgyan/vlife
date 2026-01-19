@@ -38,6 +38,9 @@ list(APPEND CMAKE_PREFIX_PATH
 # Find Qt packages
 find_package(Qt5 COMPONENTS Core Widgets REQUIRED)
 
+# Find threading library
+find_package(Threads REQUIRED)
+
 # Find GTest
 find_package(GTest QUIET)
 if(NOT GTEST_FOUND)
@@ -62,6 +65,9 @@ add_library(
         src/vlife/Tile.cpp
         src/vlife/Tile.h
 )
+
+# Link threading library to GameOfLifeLib
+target_link_libraries(GameOfLifeLib PUBLIC Threads::Threads)
 
 # Frontend application
 add_executable(
@@ -91,6 +97,7 @@ add_executable(
         GameOfLifeTests
         tests/main.cpp
         tests/vlife/VLifeTest.cpp
+        tests/vlife/TileEdgeTest.cpp
 )
 
 target_link_libraries(

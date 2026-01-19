@@ -134,24 +134,40 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
                 adjLocalY = 0;
             }
 
-            // Get the adjacent tile
+            // Get the adjacent tile, creating it on demand if necessary
+            // This ensures neighbor counts are correctly propagated even when
+            // cells are set before all tiles exist
             Tile* adjTile = nullptr;
             if (tileOffsetX == -1 && tileOffsetY == 0) {
                 adjTile = left;
+                if (!adjTile) {
+                    adjTile = board->getTile(tileX - 1, tileY);
+                    left = adjTile;
+                }
             } else if (tileOffsetX == 1 && tileOffsetY == 0) {
                 adjTile = right;
+                if (!adjTile) {
+                    adjTile = board->getTile(tileX + 1, tileY);
+                    right = adjTile;
+                }
             } else if (tileOffsetX == 0 && tileOffsetY == -1) {
                 adjTile = up;
+                if (!adjTile) {
+                    adjTile = board->getTile(tileX, tileY - 1);
+                    up = adjTile;
+                }
             } else if (tileOffsetX == 0 && tileOffsetY == 1) {
                 adjTile = down;
+                if (!adjTile) {
+                    adjTile = board->getTile(tileX, tileY + 1);
+                    down = adjTile;
+                }
             } else {
                 // Corner cases - need to find or create the diagonal tile
                 adjTile = board->getTile(tileX + tileOffsetX, tileY + tileOffsetY);
             }
 
-            if (adjTile) {
-                adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
-            }
+            adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
         }
     }
 }
@@ -167,15 +183,9 @@ void Tile::updateNeighborCount(int localX, int localY, bool increment) {
 
     // Increment or decrement the count
     if (increment) {
-        // Don't exceed maximum of 7
-        if (currentCount < 7) {
-            currentCount++;
-        }
+        currentCount++;
     } else {
-        // Don't go below 0
-        if (currentCount > 0) {
-            currentCount--;
-        }
+        currentCount--;
     }
 
     // Update the neighbor count (clear bits and then set to new value)
@@ -462,13 +472,11 @@ inline void Tile::applyDelta(int x, int y, int8_t delta) {
     uint64_t mask = 0x7ULL << bitPos;
     uint64_t currentCount = (cells[cellIdx] & mask) >> bitPos;
 
-    // Apply delta with bounds checking
-    int newCount = static_cast<int>(currentCount) + delta;
-    if (newCount < 0) newCount = 0;
-    if (newCount > 7) newCount = 7;
+    // Apply delta
+    int newCount = currentCount + delta;
 
-    // Update the neighbor count
-    cells[cellIdx] = (cells[cellIdx] & ~mask) | (static_cast<uint64_t>(newCount) << bitPos);
+    // Update the neighbor count (mask to 3 bits to prevent corruption from negative values)
+    cells[cellIdx] = (cells[cellIdx] & ~mask) | (static_cast<uint64_t>(newCount & 0x7) << bitPos);
 
     // Mark this word as active (neighbor count change means potential birth)
     activityMask |= (1ULL << cellIdx);
@@ -504,12 +512,10 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
             uint64_t mask = 0x7ULL << bitPos;
             int count = (word & mask) >> bitPos;
 
-            // Apply delta with bounds checking (same logic as applyDelta)
+            // Apply delta (mask to 3 bits to prevent corruption from negative values)
             count += delta;
-            if (count < 0) count = 0;
-            if (count > 7) count = 7;
 
-            word = (word & ~mask) | (static_cast<uint64_t>(count) << bitPos);
+            word = (word & ~mask) | (static_cast<uint64_t>(count & 0x7) << bitPos);
         }
 
         cells[cellIdx] = word;
@@ -526,18 +532,100 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
             if (x >= 0 && x < TILE_WIDTH) {
                 applyDelta(x, y, delta);
             } else if (x < 0) {
-                // Left tile boundary
-                if (left) {
-                    left->applyDelta(TILE_WIDTH - 1, y, delta);
+                // Left tile boundary - create tile if needed, use atomic for safety
+                Tile* leftTile = ensureNeighborTile(-1, 0);
+                if (leftTile) {
+                    leftTile->atomicApplyDelta(TILE_WIDTH - 1, y, delta);
                 }
             } else {
-                // Right tile boundary
-                if (right) {
-                    right->applyDelta(0, y, delta);
+                // Right tile boundary - create tile if needed, use atomic for safety
+                Tile* rightTile = ensureNeighborTile(1, 0);
+                if (rightTile) {
+                    rightTile->atomicApplyDelta(0, y, delta);
                 }
             }
         }
     }
+}
+
+// Atomically apply a single delta to a cell's neighbor count
+// Uses compare-and-swap to safely update when multiple threads access the same tile
+void Tile::atomicApplyDelta(int x, int y, int8_t delta) {
+    if (delta == 0) return;
+
+    uint32_t cellIdx = (y * TILE_WIDTH + x) / 16;
+    uint32_t bitPos = ((y * TILE_WIDTH + x) % 16) * 4;
+
+    uint64_t mask = 0x7ULL << bitPos;
+
+    // Compare-and-swap loop for thread-safe update
+    uint64_t oldVal, newVal;
+    do {
+        oldVal = __atomic_load_n(&cells[cellIdx], __ATOMIC_RELAXED);
+
+        // Extract current neighbor count (bits 0-2)
+        int count = (oldVal & mask) >> bitPos;
+
+        // Apply delta (mask to 3 bits to prevent corruption from negative values)
+        count += delta;
+
+        // Compute new value
+        newVal = (oldVal & ~mask) | (static_cast<uint64_t>(count & 0x7) << bitPos);
+
+    } while (!__atomic_compare_exchange_n(&cells[cellIdx], &oldVal, newVal,
+                                           false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+
+    // Atomically update activity mask
+    __atomic_fetch_or(&activityMask, 1ULL << cellIdx, __ATOMIC_RELAXED);
+}
+
+// Atomically apply vertical deltas to 4 consecutive cells in a row
+void Tile::atomicApplyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
+    // Apply deltas to 4 cells: (baseX-1, y), (baseX, y), (baseX+1, y), (baseX+2, y)
+    int leftX = baseX - 1;
+
+    // For cross-tile calls, we need to handle boundaries and use atomic operations
+    // for cells that are in this tile, and call atomicApplyDelta on neighbor tiles
+    for (int i = 0; i < 4; i++) {
+        int x = leftX + i;
+        int8_t delta = deltas[i];
+
+        if (delta == 0) continue;
+
+        if (x >= 0 && x < TILE_WIDTH) {
+            // Cell is in this tile - use atomic update
+            atomicApplyDelta(x, y, delta);
+        } else if (x < 0) {
+            // Left tile boundary - create tile if needed
+            Tile* leftTile = ensureNeighborTile(-1, 0);
+            if (leftTile) {
+                leftTile->atomicApplyDelta(TILE_WIDTH - 1, y, delta);
+            }
+        } else {
+            // Right tile boundary - create tile if needed
+            Tile* rightTile = ensureNeighborTile(1, 0);
+            if (rightTile) {
+                rightTile->atomicApplyDelta(0, y, delta);
+            }
+        }
+    }
+}
+
+// Helper to ensure a neighbor tile exists and return it
+// Creates the tile on demand if it doesn't exist
+Tile* Tile::ensureNeighborTile(int dx, int dy) {
+    Tile** neighbor;
+    if (dx == -1 && dy == 0) neighbor = &left;
+    else if (dx == 1 && dy == 0) neighbor = &right;
+    else if (dx == 0 && dy == -1) neighbor = &up;
+    else if (dx == 0 && dy == 1) neighbor = &down;
+    else return nullptr;
+
+    if (*neighbor == nullptr) {
+        // Create the tile on demand - this will also link it as our neighbor
+        *neighbor = board->getTile(tileX + dx, tileY + dy);
+    }
+    return *neighbor;
 }
 
 // Apply deltas for a cell pair using LUT
@@ -556,8 +644,12 @@ void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& del
     if (deltas.sameRow[0] != 0) {
         if (leftNeighborX >= 0) {
             applyDelta(leftNeighborX, localY, deltas.sameRow[0]);
-        } else if (left) {
-            left->applyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
+        } else {
+            // Cross-tile: create tile if needed and use atomic for thread safety
+            Tile* leftTile = ensureNeighborTile(-1, 0);
+            if (leftTile) {
+                leftTile->atomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
+            }
         }
     }
 
@@ -565,25 +657,35 @@ void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& del
     if (deltas.sameRow[1] != 0) {
         if (rightNeighborX < TILE_WIDTH) {
             applyDelta(rightNeighborX, localY, deltas.sameRow[1]);
-        } else if (right) {
-            right->applyDelta(0, localY, deltas.sameRow[1]);
+        } else {
+            // Cross-tile: create tile if needed and use atomic for thread safety
+            Tile* rightTile = ensureNeighborTile(1, 0);
+            if (rightTile) {
+                rightTile->atomicApplyDelta(0, localY, deltas.sameRow[1]);
+            }
         }
     }
 
     // Apply vertical deltas for row above (y-1)
     if (localY > 0) {
         applyVerticalDeltas(baseX, localY - 1, deltas.verticalRow);
-    } else if (up) {
-        // Handle top tile boundary
-        up->applyVerticalDeltas(baseX, TILE_HEIGHT - 1, deltas.verticalRow);
+    } else {
+        // Cross-tile: create tile if needed and use atomic for thread safety
+        Tile* upTile = ensureNeighborTile(0, -1);
+        if (upTile) {
+            upTile->atomicApplyVerticalDeltas(baseX, TILE_HEIGHT - 1, deltas.verticalRow);
+        }
     }
 
     // Apply vertical deltas for row below (y+1)
     if (localY < TILE_HEIGHT - 1) {
         applyVerticalDeltas(baseX, localY + 1, deltas.verticalRow);
-    } else if (down) {
-        // Handle bottom tile boundary
-        down->applyVerticalDeltas(baseX, 0, deltas.verticalRow);
+    } else {
+        // Cross-tile: create tile if needed and use atomic for thread safety
+        Tile* downTile = ensureNeighborTile(0, 1);
+        if (downTile) {
+            downTile->atomicApplyVerticalDeltas(baseX, 0, deltas.verticalRow);
+        }
     }
 }
 

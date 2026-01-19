@@ -6,6 +6,65 @@
 #include "Tile.h"
 #include <algorithm>
 
+// ThreadPool implementation
+ThreadPool::ThreadPool(size_t numThreads) {
+    workers.reserve(numThreads);
+    for (size_t i = 0; i < numThreads; ++i) {
+        workers.emplace_back([this] { workerLoop(); });
+    }
+}
+
+ThreadPool::~ThreadPool() {
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        stop = true;
+    }
+    taskAvailable.notify_all();
+    for (auto& worker : workers) {
+        worker.join();
+    }
+}
+
+void ThreadPool::workerLoop() {
+    while (true) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            taskAvailable.wait(lock, [this] { return stop || !taskQueue.empty(); });
+
+            if (stop && taskQueue.empty()) {
+                return;
+            }
+
+            task = std::move(taskQueue.front());
+            taskQueue.pop();
+        }
+
+        task();
+
+        if (--pendingTasks == 0) {
+            tasksDone.notify_all();
+        }
+    }
+}
+
+void ThreadPool::runBatch(const std::vector<std::function<void()>>& tasks) {
+    if (tasks.empty()) return;
+
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        pendingTasks = tasks.size();
+        for (const auto& task : tasks) {
+            taskQueue.push(task);
+        }
+    }
+    taskAvailable.notify_all();
+
+    // Wait for all tasks to complete
+    std::unique_lock<std::mutex> lock(queueMutex);
+    tasksDone.wait(lock, [this] { return pendingTasks == 0; });
+}
+
 VLife::VLife() {
     resetBoard();
     populateRuleLUT();
@@ -27,7 +86,19 @@ void VLife::resetBoard() {
 Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
     TileCoord coord{tileX, tileY};
 
-    // Check if the tile already exists
+    // Fast path: shared lock for read (multiple readers allowed)
+    {
+        std::shared_lock<std::shared_mutex> readLock(tilesMutex);
+        auto it = tiles.find(coord);
+        if (it != tiles.end()) {
+            return it->second.get();
+        }
+    }
+
+    // Slow path: exclusive lock for creation
+    std::unique_lock<std::shared_mutex> writeLock(tilesMutex);
+
+    // Re-check after acquiring exclusive lock (another thread may have created it)
     auto it = tiles.find(coord);
     if (it != tiles.end()) {
         return it->second.get();
@@ -39,30 +110,30 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
     tiles[coord] = std::move(newTile);
     spatialOrderDirty = true;
 
-    // Connect to neighboring tiles if they exist
+    // Connect to neighboring tiles if they exist (already under exclusive lock)
 
     // Check left (-1, 0)
-    auto leftTile = getTileIfExists(tileX - 1, tileY);
-    if (leftTile) {
-        tilePtr->setNeighbor(leftTile, -1, 0);
+    auto leftIt = tiles.find(TileCoord{tileX - 1, tileY});
+    if (leftIt != tiles.end()) {
+        tilePtr->setNeighbor(leftIt->second.get(), -1, 0);
     }
 
     // Check right (1, 0)
-    auto rightTile = getTileIfExists(tileX + 1, tileY);
-    if (rightTile) {
-        tilePtr->setNeighbor(rightTile, 1, 0);
+    auto rightIt = tiles.find(TileCoord{tileX + 1, tileY});
+    if (rightIt != tiles.end()) {
+        tilePtr->setNeighbor(rightIt->second.get(), 1, 0);
     }
 
     // Check up (0, -1)
-    auto upTile = getTileIfExists(tileX, tileY - 1);
-    if (upTile) {
-        tilePtr->setNeighbor(upTile, 0, -1);
+    auto upIt = tiles.find(TileCoord{tileX, tileY - 1});
+    if (upIt != tiles.end()) {
+        tilePtr->setNeighbor(upIt->second.get(), 0, -1);
     }
 
     // Check down (0, 1)
-    auto downTile = getTileIfExists(tileX, tileY + 1);
-    if (downTile) {
-        tilePtr->setNeighbor(downTile, 0, 1);
+    auto downIt = tiles.find(TileCoord{tileX, tileY + 1});
+    if (downIt != tiles.end()) {
+        tilePtr->setNeighbor(downIt->second.get(), 0, 1);
     }
 
     return tilePtr;
@@ -70,6 +141,8 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
 
 // Helper method to get a tile only if it already exists
 Tile *VLife::getTileIfExists(int32_t tileX, int32_t tileY) {
+    std::shared_lock<std::shared_mutex> readLock(tilesMutex);
+
     TileCoord coord{tileX, tileY};
     auto it = tiles.find(coord);
     if (it != tiles.end()) {
@@ -144,12 +217,7 @@ void VLife::setCells(uint32_t offsetX, uint32_t offsetY, uint32_t width, uint32_
     }
 }
 
-void VLife::runGeneration() {
-    // Rebuild spatial order if needed
-    if (spatialOrderDirty) {
-        rebuildSpatialOrder();
-    }
-
+void VLife::runGenerationSequential() {
     // First pass: prepare all tiles for the generation (in spatial order)
     // Tile-level skip optimization: skip tiles with no activity
     for (Tile* tile : spatialOrder) {
@@ -164,6 +232,83 @@ void VLife::runGeneration() {
     // Second pass: apply the changes (in spatial order)
     for (Tile* tile : spatialOrder) {
         tile->runGenerationChanges();
+    }
+}
+
+void VLife::runGeneration() {
+    // Rebuild spatial order if needed
+    if (spatialOrderDirty) {
+        rebuildSpatialOrder();
+    }
+
+    // Fall back to sequential for small tile counts or when parallel is disabled
+    // Higher threshold due to synchronization overhead
+    if (!parallelEnabled || spatialOrder.size() < 64) {
+        runGenerationSequential();
+        evictDeadTiles();
+        return;
+    }
+
+    // Lazy initialize thread pool
+    if (!threadPool) {
+        unsigned int numThreads = std::thread::hardware_concurrency();
+        if (numThreads == 0) numThreads = 4;  // Fallback if detection fails
+        threadPool = std::make_unique<ThreadPool>(numThreads);
+    }
+
+    unsigned int numThreads = std::thread::hardware_concurrency();
+    if (numThreads == 0) numThreads = 4;
+
+    // PHASE 1: Fully parallel (no dependencies between tiles)
+    // Each tile only writes to its own changes[] array
+    // Batch tiles together to reduce task overhead
+    std::vector<std::function<void()>> tasks;
+
+    // Collect active tiles
+    std::vector<Tile*> activeTiles;
+    activeTiles.reserve(spatialOrder.size());
+    for (Tile* tile : spatialOrder) {
+        if (tile->hasActivity()) {
+            activeTiles.push_back(tile);
+        }
+    }
+
+    // Create batched tasks for Phase 1
+    size_t batchSize = std::max(size_t(1), activeTiles.size() / numThreads);
+    tasks.reserve(numThreads + 1);
+
+    for (size_t i = 0; i < activeTiles.size(); i += batchSize) {
+        size_t end = std::min(i + batchSize, activeTiles.size());
+        tasks.push_back([&activeTiles, i, end] {
+            for (size_t j = i; j < end; j++) {
+                activeTiles[j]->runGenerationPrepare();
+            }
+        });
+    }
+    threadPool->runBatch(tasks);
+    tasks.clear();
+
+    // PHASE 2: 4-color parallel (each color group is independent)
+    // Tiles of the same color are at least 2 steps apart in both X and Y,
+    // meaning they share NO neighbors (orthogonal or diagonal).
+    // Process each color sequentially, but tiles within a color in parallel.
+    for (int color = 0; color < 4; color++) {
+        auto& group = colorGroups[color];
+        if (group.empty()) continue;
+
+        // Batch tiles within the color group
+        batchSize = std::max(size_t(1), group.size() / numThreads);
+
+        for (size_t i = 0; i < group.size(); i += batchSize) {
+            size_t end = std::min(i + batchSize, group.size());
+            tasks.push_back([&group, i, end] {
+                for (size_t j = i; j < end; j++) {
+                    group[j]->runGenerationChanges();
+                }
+            });
+        }
+        threadPool->runBatch(tasks);
+        tasks.clear();
     }
 
     // Evict dead tiles to prevent memory growth
@@ -233,15 +378,39 @@ void VLife::rebuildSpatialOrder() {
         });
 
     spatialOrderDirty = false;
+
+    // Rebuild color groups for parallel processing
+    rebuildColorGroups();
+}
+
+void VLife::rebuildColorGroups() {
+    for (int i = 0; i < 4; i++) {
+        colorGroups[i].clear();
+        colorGroups[i].reserve(spatialOrder.size() / 4 + 1);
+    }
+
+    for (Tile* tile : spatialOrder) {
+        // Color index based on (tileX % 2) + (tileY % 2) * 2
+        int colorIdx = (tile->getTileX() & 1) + ((tile->getTileY() & 1) << 1);
+        colorGroups[colorIdx].push_back(tile);
+    }
 }
 
 void VLife::evictDeadTiles() {
-    // Collect dead tiles (tiles with no live cells)
+    // Collect dead tiles (tiles with no live cells AND no activity)
+    // A tile with activity (non-zero neighbor counts) might produce births
+    // in the next generation, so we must keep it
     std::vector<TileCoord> deadTiles;
 
     for (auto& [coord, tile] : tiles) {
         if (tile->getLiveCount() == 0) {
-            deadTiles.push_back(coord);
+            // Rebuild activity mask to reflect current state
+            // (markWordActive only sets bits, never clears them)
+            tile->rebuildActivityMask();
+
+            if (!tile->hasActivity()) {
+                deadTiles.push_back(coord);
+            }
         }
     }
 

@@ -63,6 +63,16 @@ public:
     // Apply deltas for a cell pair using LUT (optimized version)
     void applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& deltas);
 
+    // Atomic versions for cross-tile updates (thread-safe for parallel processing)
+    // These use compare-and-swap to safely update neighbor counts when
+    // multiple tiles of the same color are processed in parallel
+    void atomicApplyDelta(int x, int y, int8_t delta);
+    void atomicApplyVerticalDeltas(int baseX, int y, const int8_t* deltas);
+
+    // Helper to ensure a neighbor tile exists, creating it on demand if needed
+    // Returns the neighbor tile pointer (never null after call)
+    Tile* ensureNeighborTile(int dx, int dy);
+
     // Getters for tile coordinates
     int32_t getTileX() const { return tileX; }
     int32_t getTileY() const { return tileY; }
@@ -98,4 +108,5 @@ public:
     // Friend declarations to allow access to private members
     friend class VLife;
     friend class VLifeTest;
+    friend class TileEdgeTest;
 };

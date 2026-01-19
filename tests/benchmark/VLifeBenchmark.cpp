@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <thread>
 
 #include "../../src/vlife/VLife.h"
 #include "BenchmarkPatterns.h"
@@ -243,6 +244,53 @@ int main(int argc, char* argv[]) {
 
         auto result = VLifeBenchmark::runBenchmark(board, warmup, measured);
         printResult("Acorn (methuselah)", result, warmup, measured);
+    }
+
+    // Benchmark 7: Parallel vs Sequential Comparison (Large Random Soup)
+    // Use larger pattern to exceed the 64 tile threshold for parallel processing
+    {
+        std::cout << "\n--- Parallel vs Sequential Comparison ---\n";
+
+        // 512x512 = 16x16 tiles = 256 tiles, well above the 64 tile threshold
+        int size = quickMode ? 512 : 1024;
+        int warmup = quickMode ? 10 : 25;
+        int measured = quickMode ? 50 : 100;
+
+        std::cout << "Pattern size: " << size << "x" << size << " (expected ~"
+                  << (size/32)*(size/32) << " tiles)\n";
+
+        // Sequential benchmark
+        VLife seqBoard;
+        BenchmarkPatterns::setupRandomSoup(seqBoard, size, size, 0.3);
+        seqBoard.setParallelEnabled(false);
+
+        auto seqResult = VLifeBenchmark::runBenchmark(seqBoard, warmup, measured);
+        std::cout << "\nSequential:\n";
+        std::cout << std::fixed << std::setprecision(1);
+        std::cout << "  Result: " << seqResult.generationsPerSecond << " gen/sec ("
+                  << seqResult.avgMicrosPerGeneration << " us/gen)\n";
+        std::cout << "  Tiles: peak=" << seqResult.peakTileCount << "\n";
+
+        // Parallel benchmark
+        VLife parBoard;
+        BenchmarkPatterns::setupRandomSoup(parBoard, size, size, 0.3);
+        parBoard.setParallelEnabled(true);
+
+        auto parResult = VLifeBenchmark::runBenchmark(parBoard, warmup, measured);
+        std::cout << "\nParallel:\n";
+        std::cout << "  Result: " << parResult.generationsPerSecond << " gen/sec ("
+                  << parResult.avgMicrosPerGeneration << " us/gen)\n";
+        std::cout << "  Tiles: peak=" << parResult.peakTileCount << "\n";
+
+        // Calculate speedup
+        double speedup = parResult.generationsPerSecond / seqResult.generationsPerSecond;
+        std::cout << "\nSpeedup: " << std::setprecision(2) << speedup << "x\n";
+
+        // Hardware thread count
+        unsigned int hwThreads = std::thread::hardware_concurrency();
+        std::cout << "Hardware threads: " << hwThreads << "\n";
+        std::cout << "Parallel efficiency: " << std::setprecision(1)
+                  << (speedup / hwThreads * 100) << "%\n";
     }
 
     std::cout << "\n=======================\n";

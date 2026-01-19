@@ -11,10 +11,10 @@ GameOfLifeView::GameOfLifeView(QWidget *parent) :
     setupUI();
 
     // Initialize the board with some pattern (e.g., a glider)
-    std::vector<SimpleGameOfLife::CellState> glider = {
-            SimpleGameOfLife::CellState::DEAD,  SimpleGameOfLife::CellState::ALIVE, SimpleGameOfLife::CellState::DEAD,
-            SimpleGameOfLife::CellState::DEAD,  SimpleGameOfLife::CellState::DEAD,  SimpleGameOfLife::CellState::ALIVE,
-            SimpleGameOfLife::CellState::ALIVE, SimpleGameOfLife::CellState::ALIVE, SimpleGameOfLife::CellState::ALIVE};
+    std::vector<GameOfLife::CellState> glider = {
+            GameOfLife::CellState::DEAD,  GameOfLife::CellState::ALIVE, GameOfLife::CellState::DEAD,
+            GameOfLife::CellState::DEAD,  GameOfLife::CellState::DEAD,  GameOfLife::CellState::ALIVE,
+            GameOfLife::CellState::ALIVE, GameOfLife::CellState::ALIVE, GameOfLife::CellState::ALIVE};
     gameOfLife.setCells(10, 10, 3, 3, glider);
 
     renderBoard();
@@ -96,7 +96,7 @@ void GameOfLifeView::renderBoard() {
     // Draw cells
     for (uint32_t y = 0; y < viewportHeight; ++y) {
         for (uint32_t x = 0; x < viewportWidth; ++x) {
-            if (cells[y * viewportWidth + x] == SimpleGameOfLife::CellState::ALIVE) {
+            if (cells[y * viewportWidth + x] == GameOfLife::CellState::ALIVE) {
                 QGraphicsRectItem *cellItem = scene->addRect(x * cellSize, y * cellSize, cellSize, cellSize,
                                                              QPen(Qt::black), QBrush(Qt::black));
             } else {
@@ -168,10 +168,10 @@ bool GameOfLifeView::eventFilter(QObject *obj, QEvent *event) {
         uint32_t cellY = static_cast<uint32_t>(scenePos.y() / cellSize) + viewportY;
 
         // Toggle cell state
-        SimpleGameOfLife::CellState currentState = gameOfLife.getCell(cellX, cellY);
+        GameOfLife::CellState currentState = gameOfLife.getCell(cellX, cellY);
         gameOfLife.setCell(cellX, cellY,
-                           currentState == SimpleGameOfLife::CellState::ALIVE ? SimpleGameOfLife::CellState::DEAD
-                                                                              : SimpleGameOfLife::CellState::ALIVE);
+                           currentState == GameOfLife::CellState::ALIVE ? GameOfLife::CellState::DEAD
+                                                                              : GameOfLife::CellState::ALIVE);
 
         // Redraw the board
         renderBoard();
