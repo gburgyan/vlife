@@ -450,17 +450,6 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
     }
 }
 
-void Tile::rebuildActivityMask() {
-    // Rebuild the activity mask by scanning all 64-bit words
-    // A word is active if it contains any non-zero content
-    activityMask = 0;
-    for (int i = 0; i < TILE_64S; i++) {
-        if (cells[i] != 0) {
-            activityMask |= (1ULL << i);
-        }
-    }
-}
-
 // Apply deltas for a cell pair using LUT
 void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& deltas) {
     // baseX is the x coordinate of the right cell (even x)
@@ -505,5 +494,16 @@ void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& del
     } else if (down) {
         // Handle bottom tile boundary
         down->applyVerticalDeltas(baseX, 0, deltas.verticalRow);
+    }
+}
+
+void Tile::rebuildActivityMask() {
+    // Rebuild the activity mask by scanning all 64-bit words
+    // A word is active if it contains any non-zero content
+    activityMask = 0;
+    for (int i = 0; i < TILE_64S; i++) {
+        if (cells[i] != 0) {
+            activityMask |= (1ULL << i);
+        }
     }
 }
