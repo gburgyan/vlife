@@ -52,9 +52,6 @@ public:
     void setCell(uint32_t localX, uint32_t localY, bool alive);
     void updateNeighborCount(int localX, int localY, bool increment);
 
-    // Helper for runGenerationChanges - updates all 8 neighbors when a cell toggles
-    void updateNeighborsForChangedCell(int localX, int localY, bool becameAlive);
-
     // LUT-based optimization helpers for runGenerationChanges
     // Apply a single delta to a cell's neighbor count (inline for performance)
     inline void applyDelta(int x, int y, int8_t delta);

@@ -361,77 +361,6 @@ void Tile::runGenerationChanges() {
     }
 }
 
-void Tile::updateNeighborsForChangedCell(int localX, int localY, bool becameAlive) {
-    // Update all 8 neighbors of a cell that changed state
-    // This is similar to the neighbor update logic in setCell
-    // Note: dx[3]=(-1,0)=left neighbor, dx[4]=(1,0)=right neighbor
-
-    int dx[] = {-1, 0, 1, -1, 1, -1, 0, 1};
-    int dy[] = {-1, -1, -1, 0, 0, 1, 1, 1};
-
-    // Determine which neighbor is the paired cell (shares same byte)
-    // For even x: paired cell is at x+1 (right neighbor, i=4)
-    // For odd x: paired cell is at x-1 (left neighbor, i=3)
-    int pairedNeighborIdx = (localX & 1) ? 3 : 4;
-
-    for (int i = 0; i < 8; i++) {
-        // Skip the paired cell - its neighbor count is handled implicitly
-        if (i == pairedNeighborIdx) {
-            continue;
-        }
-
-        int nx = localX + dx[i];
-        int ny = localY + dy[i];
-
-        // Handle neighbors within this tile
-        if (nx >= 0 && nx < TILE_WIDTH && ny >= 0 && ny < TILE_HEIGHT) {
-            updateNeighborCount(nx, ny, becameAlive);
-        }
-        // Handle neighbors in adjacent tiles
-        else {
-            int tileOffsetX = 0;
-            int tileOffsetY = 0;
-            int adjLocalX = nx;
-            int adjLocalY = ny;
-
-            if (nx < 0) {
-                tileOffsetX = -1;
-                adjLocalX = TILE_WIDTH - 1;
-            } else if (nx >= TILE_WIDTH) {
-                tileOffsetX = 1;
-                adjLocalX = 0;
-            }
-
-            if (ny < 0) {
-                tileOffsetY = -1;
-                adjLocalY = TILE_HEIGHT - 1;
-            } else if (ny >= TILE_HEIGHT) {
-                tileOffsetY = 1;
-                adjLocalY = 0;
-            }
-
-            // Get the adjacent tile
-            Tile* adjTile = nullptr;
-            if (tileOffsetX == -1 && tileOffsetY == 0) {
-                adjTile = left;
-            } else if (tileOffsetX == 1 && tileOffsetY == 0) {
-                adjTile = right;
-            } else if (tileOffsetX == 0 && tileOffsetY == -1) {
-                adjTile = up;
-            } else if (tileOffsetX == 0 && tileOffsetY == 1) {
-                adjTile = down;
-            } else {
-                // Diagonal tile - need to get or create it
-                adjTile = board->getTile(tileX + tileOffsetX, tileY + tileOffsetY);
-            }
-
-            if (adjTile) {
-                adjTile->updateNeighborCount(adjLocalX, adjLocalY, becameAlive);
-            }
-        }
-    }
-}
-
 // Apply a single delta to a cell's neighbor count
 inline void Tile::applyDelta(int x, int y, int8_t delta) {
     if (delta == 0) return;
@@ -458,24 +387,64 @@ inline void Tile::applyDelta(int x, int y, int8_t delta) {
 // Apply vertical deltas to 4 consecutive cells in a row (x-1, x, x+1, x+2)
 void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
     // Apply deltas to 4 cells: (baseX-1, y), (baseX, y), (baseX+1, y), (baseX+2, y)
-    for (int i = 0; i < 4; i++) {
-        int x = baseX - 1 + i;
-        int8_t delta = deltas[i];
+    int leftX = baseX - 1;
+    int rightX = baseX + 2;
 
-        if (delta == 0) continue;
+    // Fast path: all 4 cells in same 64-bit word, not crossing tile boundaries
+    // Row layout: cells 0-15 in word 0, cells 16-31 in word 1
+    // Interior cases (75% of cell pairs):
+    //   Word 0: leftX >= 0 && rightX < 16  (baseX in {2,4,6,8,10,12})
+    //   Word 1: leftX >= 16 && rightX < 32 (baseX in {18,20,22,24,26,28})
+    bool inWord0 = (leftX >= 0 && rightX < 16);
+    bool inWord1 = (leftX >= 16 && rightX < TILE_WIDTH);
 
-        // Check bounds and handle accordingly
-        if (x >= 0 && x < TILE_WIDTH) {
-            applyDelta(x, y, delta);
-        } else if (x < 0) {
-            // Left tile boundary
-            if (left) {
-                left->applyDelta(TILE_WIDTH - 1, y, delta);
-            }
-        } else {
-            // Right tile boundary
-            if (right) {
-                right->applyDelta(0, y, delta);
+    if (inWord0 || inWord1) {
+        // Bulk operation: load once, update 4 nibbles, store once
+        uint32_t cellIdx = (y * TILE_WIDTH + leftX) / 16;
+        uint32_t baseBitPos = (leftX % 16) * 4;
+
+        uint64_t word = cells[cellIdx];
+
+        // Extract, add, clamp, and repack 4 nibbles
+        for (int i = 0; i < 4; i++) {
+            int8_t delta = deltas[i];
+            if (delta == 0) continue;
+
+            uint32_t bitPos = baseBitPos + i * 4;
+            uint64_t mask = 0x7ULL << bitPos;
+            int count = (word & mask) >> bitPos;
+
+            // Apply delta with bounds checking (same logic as applyDelta)
+            count += delta;
+            if (count < 0) count = 0;
+            if (count > 7) count = 7;
+
+            word = (word & ~mask) | (static_cast<uint64_t>(count) << bitPos);
+        }
+
+        cells[cellIdx] = word;
+        activityMask |= (1ULL << cellIdx);
+    } else {
+        // Slow path: handle boundaries individually
+        for (int i = 0; i < 4; i++) {
+            int x = leftX + i;
+            int8_t delta = deltas[i];
+
+            if (delta == 0) continue;
+
+            // Check bounds and handle accordingly
+            if (x >= 0 && x < TILE_WIDTH) {
+                applyDelta(x, y, delta);
+            } else if (x < 0) {
+                // Left tile boundary
+                if (left) {
+                    left->applyDelta(TILE_WIDTH - 1, y, delta);
+                }
+            } else {
+                // Right tile boundary
+                if (right) {
+                    right->applyDelta(0, y, delta);
+                }
             }
         }
     }
