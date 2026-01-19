@@ -6,12 +6,14 @@
 #include <cstring>
 #include <mutex>
 
-// Cross-platform prefetch support
+// Cross-platform prefetch and SIMD support
 #if defined(__x86_64__) || defined(_M_X64)
     #include <xmmintrin.h>
     #define PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T0)
 #elif defined(__aarch64__) || defined(_M_ARM64)
+    #include <arm_neon.h>
     #define PREFETCH(addr) __builtin_prefetch((addr), 0, 3)
+    #define USE_NEON_SIMD 1
 #else
     #define PREFETCH(addr) ((void)0)
 #endif
@@ -194,6 +196,93 @@ void Tile::runGenerationPrepare() {
 
     auto ruleLUT = board->ruleLUT;
 
+#ifdef USE_NEON_SIMD
+    // Optimized ARM64 implementation with improved prefetch and word-level skipping
+    // Uses scalar LUT lookups (cache-efficient) with direct result accumulation
+    const uint8_t* __restrict ruleLUT_u8 = reinterpret_cast<const uint8_t*>(ruleLUT);
+
+    for (int i = 0; i < TILE_64S; i += 4) {
+        // Prefetch 2 iterations ahead for better memory pipeline utilization
+        if (i + 8 < TILE_64S) {
+            PREFETCH(&cells[i + 8]);
+        }
+
+        // Quick check: skip if all 4 words are zero
+        uint64_t combined = cells[i] | cells[i + 1] | cells[i + 2] | cells[i + 3];
+        if (__builtin_expect(combined == 0, 0)) {
+            continue;
+        }
+
+        // Update activity mask for non-zero words
+        if (cells[i] != 0) activityMask |= (1ULL << i);
+        if (cells[i + 1] != 0) activityMask |= (1ULL << (i + 1));
+        if (cells[i + 2] != 0) activityMask |= (1ULL << (i + 2));
+        if (cells[i + 3] != 0) activityMask |= (1ULL << (i + 3));
+
+        uint64_t changeBuff = 0;
+
+        // Process word 0 - only if non-zero
+        uint64_t slice = cells[i];
+        if (slice != 0) {
+            // Pack 8 LUT results directly into 16 bits (bits 63:48)
+            uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
+                          (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
+                          (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
+                          ruleLUT_u8[(slice >> 32) & 0xFF];
+            uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
+                          (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
+                          (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
+                          ruleLUT_u8[slice & 0xFF];
+            changeBuff |= (static_cast<uint64_t>(p0) << 56) | (static_cast<uint64_t>(p1) << 48);
+        }
+
+        // Process word 1
+        slice = cells[i + 1];
+        if (slice != 0) {
+            uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
+                          (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
+                          (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
+                          ruleLUT_u8[(slice >> 32) & 0xFF];
+            uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
+                          (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
+                          (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
+                          ruleLUT_u8[slice & 0xFF];
+            changeBuff |= (static_cast<uint64_t>(p0) << 40) | (static_cast<uint64_t>(p1) << 32);
+        }
+
+        // Process word 2
+        slice = cells[i + 2];
+        if (slice != 0) {
+            uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
+                          (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
+                          (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
+                          ruleLUT_u8[(slice >> 32) & 0xFF];
+            uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
+                          (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
+                          (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
+                          ruleLUT_u8[slice & 0xFF];
+            changeBuff |= (static_cast<uint64_t>(p0) << 24) | (static_cast<uint64_t>(p1) << 16);
+        }
+
+        // Process word 3
+        slice = cells[i + 3];
+        if (slice != 0) {
+            uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
+                          (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
+                          (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
+                          ruleLUT_u8[(slice >> 32) & 0xFF];
+            uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
+                          (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
+                          (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
+                          ruleLUT_u8[slice & 0xFF];
+            changeBuff |= (static_cast<uint64_t>(p0) << 8) | static_cast<uint64_t>(p1);
+        }
+
+        changes[i >> 2] = changeBuff;
+    }
+
+#else
+    // Scalar fallback for non-ARM platforms
     for (int i = 0; i < TILE_64S; i += 4) {
         // Prefetch next iteration's data
         if (i + 4 < TILE_64S) {
@@ -268,6 +357,7 @@ void Tile::runGenerationPrepare() {
 
         changes[i >> 2] = changeBuff;
     }
+#endif
 }
 
 void Tile::runGenerationChanges() {
