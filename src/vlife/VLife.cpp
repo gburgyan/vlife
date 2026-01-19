@@ -428,10 +428,6 @@ void VLife::evictDeadTiles() {
 
     for (auto& [coord, tile] : tiles) {
         if (tile->getLiveCount() == 0) {
-            // Rebuild activity mask to reflect current state
-            // (markWordActive only sets bits, never clears them)
-            tile->rebuildActivityMask();
-
             if (!tile->hasActivity()) {
                 // Tile is completely inactive - decrement cooldown
                 if (tile->decrementCooldown()) {

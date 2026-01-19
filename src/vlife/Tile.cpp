@@ -512,8 +512,12 @@ inline void Tile::applyDelta(int x, int y, int8_t delta) {
     // Update the neighbor count (mask to 3 bits to prevent corruption from negative values)
     cells[cellIdx] = (cells[cellIdx] & ~mask) | (static_cast<uint64_t>(newCount & 0x7) << bitPos);
 
-    // Mark this word as active (neighbor count change means potential birth)
-    activityMask |= (1ULL << cellIdx);
+    // Update activity mask based on whether word is now zero
+    if (cells[cellIdx] != 0) {
+        activityMask |= (1ULL << cellIdx);
+    } else {
+        activityMask &= ~(1ULL << cellIdx);
+    }
 }
 
 // Apply vertical deltas to 4 consecutive cells in a row (x-1, x, x+1, x+2)
@@ -553,7 +557,12 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
         }
 
         cells[cellIdx] = word;
-        activityMask |= (1ULL << cellIdx);
+        // Update activity mask based on whether word is now zero
+        if (word != 0) {
+            activityMask |= (1ULL << cellIdx);
+        } else {
+            activityMask &= ~(1ULL << cellIdx);
+        }
     } else {
         // Slow path: handle boundaries individually
         for (int i = 0; i < 4; i++) {
