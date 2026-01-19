@@ -14,6 +14,10 @@
 #define TILE_64S_WIDTH TILE_WIDTH / 64
 #define TILE_64S_HEIGHT TILE_HEIGHT / 64
 
+// Number of generations a dead tile must remain inactive before being evicted
+// This prevents "flapping" (tiles being repeatedly created and destroyed)
+static constexpr uint8_t TILE_COOLDOWN_GENERATIONS = 4;
+
 class Tile {
     VLife *board;
     int32_t tileX;
@@ -23,6 +27,10 @@ class Tile {
     Tile *right;
     Tile *up;
     Tile *down;
+    Tile *upLeft;
+    Tile *upRight;
+    Tile *downLeft;
+    Tile *downRight;
 
     uint64_t cells[TILE_64S]{};
     uint64_t changes[TILE_CHANGE_64S]{};
@@ -33,6 +41,10 @@ class Tile {
     // A word is "active" if it has any non-zero content (live cells or neighbor counts)
     // This allows skipping dead regions during generation scan
     uint64_t activityMask{};
+
+    // Cooldown counter for tile eviction - prevents flapping
+    // Tiles must remain inactive for TILE_COOLDOWN_GENERATIONS before being evicted
+    uint8_t cooldownCounter{TILE_COOLDOWN_GENERATIONS};
 
     std::mutex tileMutex;
 
@@ -82,6 +94,10 @@ public:
     Tile *getRightTile() const { return right; }
     Tile *getUpTile() const { return up; }
     Tile *getDownTile() const { return down; }
+    Tile *getUpLeftTile() const { return upLeft; }
+    Tile *getUpRightTile() const { return upRight; }
+    Tile *getDownLeftTile() const { return downLeft; }
+    Tile *getDownRightTile() const { return downRight; }
     
     // Getter for the number of live cells
     uint32_t getLiveCount() const { return liveCount; }
@@ -104,6 +120,19 @@ public:
 
     // Rebuild the activity mask by scanning all words
     void rebuildActivityMask();
+
+    // Cooldown methods for tile eviction management
+    // Reset cooldown counter when tile becomes active
+    void resetCooldown() { cooldownCounter = TILE_COOLDOWN_GENERATIONS; }
+
+    // Decrement cooldown, returns true when tile should be evicted
+    bool decrementCooldown() {
+        if (cooldownCounter == 0) {
+            cooldownCounter = TILE_COOLDOWN_GENERATIONS;
+            return false;  // First time inactive, start cooldown
+        }
+        return --cooldownCounter == 0;  // Evict when counter reaches 0
+    }
 
     // Friend declarations to allow access to private members
     friend class VLife;

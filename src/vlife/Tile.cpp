@@ -19,7 +19,8 @@
 #endif
 
 Tile::Tile(VLife *board, int32_t tileX, int32_t tileY) :
-    board(board), tileX(tileX), tileY(tileY), left(nullptr), right(nullptr), up(nullptr), down(nullptr), liveCount(0), activityMask(0) {
+    board(board), tileX(tileX), tileY(tileY), left(nullptr), right(nullptr), up(nullptr), down(nullptr),
+    upLeft(nullptr), upRight(nullptr), downLeft(nullptr), downRight(nullptr), liveCount(0), activityMask(0) {
     // Initialize all cells to zero (dead)
     std::memset(cells, 0, sizeof(cells));
     std::memset(changes, 0, sizeof(changes));
@@ -46,6 +47,18 @@ void Tile::setNeighbor(Tile *tile, int dx, int dy) {
         if (tile) {
             tile->up = this;
         }
+    } else if (dx == -1 && dy == -1) {
+        upLeft = tile;
+        if (tile) tile->downRight = this;
+    } else if (dx == 1 && dy == -1) {
+        upRight = tile;
+        if (tile) tile->downLeft = this;
+    } else if (dx == -1 && dy == 1) {
+        downLeft = tile;
+        if (tile) tile->upRight = this;
+    } else if (dx == 1 && dy == 1) {
+        downRight = tile;
+        if (tile) tile->upLeft = this;
     }
 }
 
@@ -162,9 +175,30 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
                     adjTile = board->getTile(tileX, tileY + 1);
                     down = adjTile;
                 }
-            } else {
-                // Corner cases - need to find or create the diagonal tile
-                adjTile = board->getTile(tileX + tileOffsetX, tileY + tileOffsetY);
+            } else if (tileOffsetX == -1 && tileOffsetY == -1) {
+                adjTile = upLeft;
+                if (!adjTile) {
+                    adjTile = board->getTile(tileX - 1, tileY - 1);
+                    upLeft = adjTile;
+                }
+            } else if (tileOffsetX == 1 && tileOffsetY == -1) {
+                adjTile = upRight;
+                if (!adjTile) {
+                    adjTile = board->getTile(tileX + 1, tileY - 1);
+                    upRight = adjTile;
+                }
+            } else if (tileOffsetX == -1 && tileOffsetY == 1) {
+                adjTile = downLeft;
+                if (!adjTile) {
+                    adjTile = board->getTile(tileX - 1, tileY + 1);
+                    downLeft = adjTile;
+                }
+            } else if (tileOffsetX == 1 && tileOffsetY == 1) {
+                adjTile = downRight;
+                if (!adjTile) {
+                    adjTile = board->getTile(tileX + 1, tileY + 1);
+                    downRight = adjTile;
+                }
             }
 
             adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
@@ -619,10 +653,13 @@ Tile* Tile::ensureNeighborTile(int dx, int dy) {
     else if (dx == 1 && dy == 0) neighbor = &right;
     else if (dx == 0 && dy == -1) neighbor = &up;
     else if (dx == 0 && dy == 1) neighbor = &down;
+    else if (dx == -1 && dy == -1) neighbor = &upLeft;
+    else if (dx == 1 && dy == -1) neighbor = &upRight;
+    else if (dx == -1 && dy == 1) neighbor = &downLeft;
+    else if (dx == 1 && dy == 1) neighbor = &downRight;
     else return nullptr;
 
     if (*neighbor == nullptr) {
-        // Create the tile on demand - this will also link it as our neighbor
         *neighbor = board->getTile(tileX + dx, tileY + dy);
     }
     return *neighbor;

@@ -48,13 +48,20 @@ struct PackedDeltas {
     int8_t verticalRow[4]; // [0]=x-1, [1]=x, [2]=x+1, [3]=x+2 (for rows above/below)
 };
 
-// Tile dimensions in base-2 multiples
-#define TILE_WIDTH_2 5 // 2^5 = 32
-#define TILE_HEIGHT_2 5 // 2^5 = 32
+// Tile dimensions as compile-time constants
+// Using constexpr instead of macros for type safety and namespace hygiene
+namespace VLifeConstants {
+    constexpr int TILE_WIDTH_BITS = 5;   // 2^5 = 32
+    constexpr int TILE_HEIGHT_BITS = 5;  // 2^5 = 32
+    constexpr int TILE_WIDTH = 1 << TILE_WIDTH_BITS;   // 32
+    constexpr int TILE_HEIGHT = 1 << TILE_HEIGHT_BITS; // 32
+}
 
-// Tile dimensions in base 10
-#define TILE_WIDTH (1 << TILE_WIDTH_2) // 32
-#define TILE_HEIGHT (1 << TILE_HEIGHT_2) // 32
+// Preserve macros for backward compatibility with existing code
+#define TILE_WIDTH_2 VLifeConstants::TILE_WIDTH_BITS
+#define TILE_HEIGHT_2 VLifeConstants::TILE_HEIGHT_BITS
+#define TILE_WIDTH VLifeConstants::TILE_WIDTH
+#define TILE_HEIGHT VLifeConstants::TILE_HEIGHT
 
 class VLife : public GameOfLife {
 
@@ -144,6 +151,5 @@ private:
 
 public:
     std::byte ruleLUT[256];
-    std::int16_t updateLUT[1024];
     PackedDeltas deltaLUT[16];  // LUT for neighbor count updates indexed by change/alive flags
 };

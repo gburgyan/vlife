@@ -5,6 +5,7 @@
 #include "VLife.h"
 #include "Tile.h"
 #include <algorithm>
+#include <cassert>
 
 // ThreadPool implementation
 ThreadPool::ThreadPool(size_t numThreads) {
@@ -111,6 +112,8 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
     spatialOrderDirty = true;
 
     // Connect to neighboring tiles if they exist (already under exclusive lock)
+    // We link all 8 neighbors (orthogonal and diagonal) here.
+    // The 4-color parallel scheme ensures same-color tiles don't share neighbors.
 
     // Check left (-1, 0)
     auto leftIt = tiles.find(TileCoord{tileX - 1, tileY});
@@ -134,6 +137,24 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
     auto downIt = tiles.find(TileCoord{tileX, tileY + 1});
     if (downIt != tiles.end()) {
         tilePtr->setNeighbor(downIt->second.get(), 0, 1);
+    }
+
+    // Check diagonal neighbors
+    auto upLeftIt = tiles.find(TileCoord{tileX - 1, tileY - 1});
+    if (upLeftIt != tiles.end()) {
+        tilePtr->setNeighbor(upLeftIt->second.get(), -1, -1);
+    }
+    auto upRightIt = tiles.find(TileCoord{tileX + 1, tileY - 1});
+    if (upRightIt != tiles.end()) {
+        tilePtr->setNeighbor(upRightIt->second.get(), 1, -1);
+    }
+    auto downLeftIt = tiles.find(TileCoord{tileX - 1, tileY + 1});
+    if (downLeftIt != tiles.end()) {
+        tilePtr->setNeighbor(downLeftIt->second.get(), -1, 1);
+    }
+    auto downRightIt = tiles.find(TileCoord{tileX + 1, tileY + 1});
+    if (downRightIt != tiles.end()) {
+        tilePtr->setNeighbor(downRightIt->second.get(), 1, 1);
     }
 
     return tilePtr;
@@ -206,8 +227,10 @@ std::vector<GameOfLife::CellState> VLife::getCells(uint32_t startX, uint32_t sta
 
 void VLife::setCells(uint32_t offsetX, uint32_t offsetY, uint32_t width, uint32_t height,
                      const std::vector<CellState> &cells) {
+    // Validate input: cells vector must match the specified dimensions
+    assert(cells.size() == width * height && "setCells: cells vector size doesn't match width*height");
     if (cells.size() != width * height) {
-        return; // Error: cells vector size doesn't match width*height
+        return;
     }
 
     for (uint32_t y = 0; y < height; y++) {
@@ -249,15 +272,13 @@ void VLife::runGeneration() {
         return;
     }
 
-    // Lazy initialize thread pool
+    // Lazy initialize thread pool and cache thread count
+    unsigned int numThreads = std::thread::hardware_concurrency();
+    if (numThreads == 0) numThreads = 4;  // Fallback if detection fails
+
     if (!threadPool) {
-        unsigned int numThreads = std::thread::hardware_concurrency();
-        if (numThreads == 0) numThreads = 4;  // Fallback if detection fails
         threadPool = std::make_unique<ThreadPool>(numThreads);
     }
-
-    unsigned int numThreads = std::thread::hardware_concurrency();
-    if (numThreads == 0) numThreads = 4;
 
     // PHASE 1: Fully parallel (no dependencies between tiles)
     // Each tile only writes to its own changes[] array
@@ -345,6 +366,10 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
     if (tile->down) {
         tile->down->up = nullptr;
     }
+    if (tile->upLeft) tile->upLeft->downRight = nullptr;
+    if (tile->upRight) tile->upRight->downLeft = nullptr;
+    if (tile->downLeft) tile->downLeft->upRight = nullptr;
+    if (tile->downRight) tile->downRight->upLeft = nullptr;
 
 #ifdef DEBUG_VLIFE
     // Verify all cells are dead
@@ -397,9 +422,8 @@ void VLife::rebuildColorGroups() {
 }
 
 void VLife::evictDeadTiles() {
-    // Collect dead tiles (tiles with no live cells AND no activity)
-    // A tile with activity (non-zero neighbor counts) might produce births
-    // in the next generation, so we must keep it
+    // Collect dead tiles using cooldown-based eviction to prevent flapping
+    // Tiles must remain inactive for TILE_COOLDOWN_GENERATIONS before being evicted
     std::vector<TileCoord> deadTiles;
 
     for (auto& [coord, tile] : tiles) {
@@ -409,8 +433,18 @@ void VLife::evictDeadTiles() {
             tile->rebuildActivityMask();
 
             if (!tile->hasActivity()) {
-                deadTiles.push_back(coord);
+                // Tile is completely inactive - decrement cooldown
+                if (tile->decrementCooldown()) {
+                    // Cooldown expired, mark for eviction
+                    deadTiles.push_back(coord);
+                }
+            } else {
+                // Tile has neighbor counts but no live cells - reset cooldown
+                tile->resetCooldown();
             }
+        } else {
+            // Tile has live cells - reset cooldown
+            tile->resetCooldown();
         }
     }
 
