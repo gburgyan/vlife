@@ -7,39 +7,12 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
-#include <thread>
-#include <future>
-#include <functional>
-#include <queue>
 #include <mutex>
 #include <shared_mutex>
-#include <condition_variable>
-#include <atomic>
 #include "../GameOfLife.h"
 
 // Forward declaration
 class Tile;
-
-// Simple thread pool for parallel generation processing
-class ThreadPool {
-public:
-    explicit ThreadPool(size_t numThreads);
-    ~ThreadPool();
-
-    // Submit a batch of tasks and wait for all to complete
-    void runBatch(const std::vector<std::function<void()>>& tasks);
-
-private:
-    std::vector<std::thread> workers;
-    std::queue<std::function<void()>> taskQueue;
-    std::mutex queueMutex;
-    std::condition_variable taskAvailable;
-    std::condition_variable tasksDone;
-    std::atomic<size_t> pendingTasks{0};
-    std::atomic<bool> stop{false};
-
-    void workerLoop();
-};
 
 // Packed deltas for neighbor count updates when cell pairs change
 // Used by the LUT-based optimization in runGenerationChanges
@@ -133,9 +106,6 @@ private:
     // Tiles of the same color are at least 2 steps apart, so they share no neighbors
     std::vector<Tile*> colorGroups[4];
     bool parallelEnabled = true;
-
-    // Thread pool for parallel processing (lazy initialized)
-    std::unique_ptr<ThreadPool> threadPool;
 
     // Rebuild the spatial order vector
     void rebuildSpatialOrder();

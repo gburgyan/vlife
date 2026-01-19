@@ -41,6 +41,9 @@ find_package(Qt5 COMPONENTS Core Widgets REQUIRED)
 # Find threading library
 find_package(Threads REQUIRED)
 
+# Find TBB for parallel processing
+find_package(TBB REQUIRED)
+
 # Find GTest
 find_package(GTest QUIET)
 if(NOT GTEST_FOUND)
@@ -66,8 +69,8 @@ add_library(
         src/vlife/Tile.h
 )
 
-# Link threading library to GameOfLifeLib
-target_link_libraries(GameOfLifeLib PUBLIC Threads::Threads)
+# Link threading library and TBB to GameOfLifeLib
+target_link_libraries(GameOfLifeLib PUBLIC Threads::Threads TBB::tbb)
 
 # Frontend application
 add_executable(

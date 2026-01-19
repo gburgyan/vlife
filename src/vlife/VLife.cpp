@@ -6,68 +6,8 @@
 #include "Tile.h"
 #include <algorithm>
 #include <cassert>
-
-// ThreadPool implementation
-ThreadPool::ThreadPool(size_t numThreads) {
-    workers.reserve(numThreads);
-    for (size_t i = 0; i < numThreads; ++i) {
-        workers.emplace_back([this] { workerLoop(); });
-    }
-}
-
-ThreadPool::~ThreadPool() {
-    {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        stop = true;
-    }
-    taskAvailable.notify_all();
-    for (auto& worker : workers) {
-        worker.join();
-    }
-}
-
-void ThreadPool::workerLoop() {
-    while (true) {
-        std::function<void()> task;
-        {
-            std::unique_lock<std::mutex> lock(queueMutex);
-            taskAvailable.wait(lock, [this] { return stop || !taskQueue.empty(); });
-
-            if (stop && taskQueue.empty()) {
-                return;
-            }
-
-            task = std::move(taskQueue.front());
-            taskQueue.pop();
-        }
-
-        task();
-
-        {
-            std::lock_guard<std::mutex> lock(queueMutex);
-            if (--pendingTasks == 0) {
-                tasksDone.notify_all();
-            }
-        }
-    }
-}
-
-void ThreadPool::runBatch(const std::vector<std::function<void()>>& tasks) {
-    if (tasks.empty()) return;
-
-    {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        pendingTasks = tasks.size();
-        for (const auto& task : tasks) {
-            taskQueue.push(task);
-        }
-    }
-    taskAvailable.notify_all();
-
-    // Wait for all tasks to complete
-    std::unique_lock<std::mutex> lock(queueMutex);
-    tasksDone.wait(lock, [this] { return pendingTasks == 0; });
-}
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
 
 VLife::VLife() {
     resetBoard();
@@ -268,27 +208,13 @@ void VLife::runGeneration() {
     }
 
     // Fall back to sequential for small tile counts or when parallel is disabled
-    // Higher threshold due to synchronization overhead
     if (!parallelEnabled || spatialOrder.size() < 64) {
         runGenerationSequential();
         evictDeadTiles();
         return;
     }
 
-    // Lazy initialize thread pool and cache thread count
-    unsigned int numThreads = std::thread::hardware_concurrency();
-    if (numThreads == 0) numThreads = 4;  // Fallback if detection fails
-
-    if (!threadPool) {
-        threadPool = std::make_unique<ThreadPool>(numThreads);
-    }
-
-    // PHASE 1: Fully parallel (no dependencies between tiles)
-    // Each tile only writes to its own changes[] array
-    // Batch tiles together to reduce task overhead
-    std::vector<std::function<void()>> tasks;
-
-    // Collect active tiles
+    // Collect active tiles for Phase 1
     std::vector<Tile*> activeTiles;
     activeTiles.reserve(spatialOrder.size());
     for (Tile* tile : spatialOrder) {
@@ -297,20 +223,17 @@ void VLife::runGeneration() {
         }
     }
 
-    // Create batched tasks for Phase 1
-    size_t batchSize = std::max(size_t(1), activeTiles.size() / numThreads);
-    tasks.reserve(numThreads + 1);
-
-    for (size_t i = 0; i < activeTiles.size(); i += batchSize) {
-        size_t end = std::min(i + batchSize, activeTiles.size());
-        tasks.push_back([&activeTiles, i, end] {
-            for (size_t j = i; j < end; j++) {
-                activeTiles[j]->runGenerationPrepare();
+    // PHASE 1: Fully parallel (no dependencies between tiles)
+    // Each tile only writes to its own changes[] array
+    // TBB's work-stealing scheduler handles load balancing automatically
+    tbb::parallel_for(
+        tbb::blocked_range<size_t>(0, activeTiles.size()),
+        [&activeTiles](const tbb::blocked_range<size_t>& r) {
+            for (size_t i = r.begin(); i != r.end(); ++i) {
+                activeTiles[i]->runGenerationPrepare();
             }
-        });
-    }
-    threadPool->runBatch(tasks);
-    tasks.clear();
+        }
+    );
 
     // PHASE 2: 4-color parallel (each color group is independent)
     // Tiles of the same color are at least 2 steps apart in both X and Y,
@@ -320,19 +243,14 @@ void VLife::runGeneration() {
         auto& group = colorGroups[color];
         if (group.empty()) continue;
 
-        // Batch tiles within the color group
-        batchSize = std::max(size_t(1), group.size() / numThreads);
-
-        for (size_t i = 0; i < group.size(); i += batchSize) {
-            size_t end = std::min(i + batchSize, group.size());
-            tasks.push_back([&group, i, end] {
-                for (size_t j = i; j < end; j++) {
-                    group[j]->runGenerationChanges();
+        tbb::parallel_for(
+            tbb::blocked_range<size_t>(0, group.size()),
+            [&group](const tbb::blocked_range<size_t>& r) {
+                for (size_t i = r.begin(); i != r.end(); ++i) {
+                    group[i]->runGenerationChanges();
                 }
-            });
-        }
-        threadPool->runBatch(tasks);
-        tasks.clear();
+            }
+        );
     }
 
     // Evict dead tiles to prevent memory growth
