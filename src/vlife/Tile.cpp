@@ -404,6 +404,38 @@ void Tile::runGenerationPrepare() {
 #endif
 }
 
+// Helper: Accumulate deltas to a local int8_t array (no carry propagation issues)
+// x is the cell x-coordinate within the row (0-31)
+// delta is the value to add (-2 to +2 typically)
+static inline void accumulateToDeltaArray(int8_t* deltaArray, int x, int8_t delta) {
+    if (delta == 0) return;
+    deltaArray[x] += delta;
+}
+
+// Helper: Accumulate vertical deltas (4 cells: x-1, x, x+1, x+2) to buffer arrays
+// baseX is the x coordinate of the right cell in the pair (even x)
+// Handles wrap-around for cells outside 0-31 range (corner cases)
+static inline void accumulateVerticalDeltasToArrays(int8_t* deltaArray, int baseX, const int8_t* deltas,
+                                                     int8_t* leftCornerDelta, int8_t* rightCornerDelta) {
+    int leftX = baseX - 1;
+    for (int i = 0; i < 4; i++) {
+        int x = leftX + i;
+        int8_t delta = deltas[i];
+        if (delta == 0) continue;
+
+        if (x >= 0 && x < TILE_WIDTH) {
+            // Cell is within this tile's row
+            accumulateToDeltaArray(deltaArray, x, delta);
+        } else if (x < 0 && leftCornerDelta != nullptr) {
+            // Left boundary: accumulate to left corner (cell x=31 in neighbor)
+            *leftCornerDelta += delta;
+        } else if (x >= TILE_WIDTH && rightCornerDelta != nullptr) {
+            // Right boundary: accumulate to right corner (cell x=0 in neighbor)
+            *rightCornerDelta += delta;
+        }
+    }
+}
+
 void Tile::runGenerationChanges() {
     // Process the changes array to find cells that need to toggle.
     // Uses LUT-based optimization to handle cell pairs together.
@@ -415,6 +447,20 @@ void Tile::runGenerationChanges() {
     //   4. Apply deltas to all affected neighbors
 
     const PackedDeltas* deltaLUT = board->deltaLUT;
+    const bool useBufferedBoundary = board->isBufferedBoundaryEnabled();
+
+    // Stack-local buffers for neighbor boundary deltas (simple int8_t arrays)
+    // Using int8_t avoids carry propagation issues that occur with packed nibbles
+    int8_t upNeighborDeltas[TILE_WIDTH] = {0};    // For up tile's row 31
+    int8_t downNeighborDeltas[TILE_WIDTH] = {0};  // For down tile's row 0
+    // Corner deltas for diagonal neighbors (single cell each)
+    int8_t upLeftCornerDelta = 0;    // For up-left tile's cell (31, 31)
+    int8_t upRightCornerDelta = 0;   // For up-right tile's cell (0, 31)
+    int8_t downLeftCornerDelta = 0;  // For down-left tile's cell (31, 0)
+    int8_t downRightCornerDelta = 0; // For down-right tile's cell (0, 0)
+    bool hasUpDeltas = false;
+    bool hasDownDeltas = false;
+    bool hasCornerDeltas = false;
 
     for (int changeIdx = 0; changeIdx < TILE_CHANGE_64S; changeIdx++) {
         uint64_t changeBits = changes[changeIdx];
@@ -490,7 +536,117 @@ void Tile::runGenerationChanges() {
 
             // Build LUT index and apply deltas
             int lutIndex = (leftState << 2) | rightState;
-            applyDeltasForCellPair(baseX, localY, deltaLUT[lutIndex]);
+            const PackedDeltas& deltas = deltaLUT[lutIndex];
+
+            // Check if this cell pair is on a cross-tile boundary row and we're using buffered mode
+            bool isTopRow = (localY == 0);
+            bool isBottomRow = (localY == TILE_HEIGHT - 1);
+
+            if (useBufferedBoundary && (isTopRow || isBottomRow)) {
+                // Buffered path: accumulate cross-tile vertical deltas locally
+                // Still apply same-row and within-tile vertical deltas immediately
+
+                // Apply same-row horizontal neighbors (x-1 and x+2) - same logic as before
+                int leftNeighborX = baseX - 1;
+                int rightNeighborX = baseX + 2;
+
+                if (deltas.sameRow[0] != 0) {
+                    if (leftNeighborX >= 0) {
+                        applyDelta(leftNeighborX, localY, deltas.sameRow[0]);
+                    } else {
+                        Tile* leftTile = ensureNeighborTile(-1, 0);
+                        if (leftTile) {
+                            leftTile->atomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
+                        }
+                    }
+                }
+
+                if (deltas.sameRow[1] != 0) {
+                    if (rightNeighborX < TILE_WIDTH) {
+                        applyDelta(rightNeighborX, localY, deltas.sameRow[1]);
+                    } else {
+                        Tile* rightTile = ensureNeighborTile(1, 0);
+                        if (rightTile) {
+                            rightTile->atomicApplyDelta(0, localY, deltas.sameRow[1]);
+                        }
+                    }
+                }
+
+                // Handle vertical deltas for row above (y-1)
+                if (isTopRow) {
+                    // Cross-tile to up neighbor's row 31: buffer it
+                    // Also handle corner cases for up-left and up-right tiles
+                    int8_t* leftCorner = (baseX == 0) ? &upLeftCornerDelta : nullptr;
+                    int8_t* rightCorner = (baseX == TILE_WIDTH - 2) ? &upRightCornerDelta : nullptr;
+                    accumulateVerticalDeltasToArrays(upNeighborDeltas, baseX, deltas.verticalRow,
+                                                      leftCorner, rightCorner);
+                    hasUpDeltas = true;
+                    if (leftCorner || rightCorner) hasCornerDeltas = true;
+                } else {
+                    // Within-tile row above
+                    applyVerticalDeltas(baseX, localY - 1, deltas.verticalRow);
+                }
+
+                // Handle vertical deltas for row below (y+1)
+                if (isBottomRow) {
+                    // Cross-tile to down neighbor's row 0: buffer it
+                    int8_t* leftCorner = (baseX == 0) ? &downLeftCornerDelta : nullptr;
+                    int8_t* rightCorner = (baseX == TILE_WIDTH - 2) ? &downRightCornerDelta : nullptr;
+                    accumulateVerticalDeltasToArrays(downNeighborDeltas, baseX, deltas.verticalRow,
+                                                      leftCorner, rightCorner);
+                    hasDownDeltas = true;
+                    if (leftCorner || rightCorner) hasCornerDeltas = true;
+                } else {
+                    // Within-tile row below
+                    applyVerticalDeltas(baseX, localY + 1, deltas.verticalRow);
+                }
+            } else {
+                // Original path: apply all deltas immediately
+                applyDeltasForCellPair(baseX, localY, deltas);
+            }
+        }
+    }
+
+    // Flush buffered deltas to neighbor tiles
+    if (useBufferedBoundary) {
+        if (hasUpDeltas) {
+            Tile* upTile = ensureNeighborTile(0, -1);
+            if (upTile) {
+                upTile->atomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
+            }
+        }
+        if (hasDownDeltas) {
+            Tile* downTile = ensureNeighborTile(0, 1);
+            if (downTile) {
+                downTile->atomicAddBoundaryDeltas(0, downNeighborDeltas);
+            }
+        }
+        // Handle corner deltas (diagonal neighbors)
+        if (hasCornerDeltas) {
+            if (upLeftCornerDelta != 0) {
+                Tile* upLeftTile = ensureNeighborTile(-1, -1);
+                if (upLeftTile) {
+                    upLeftTile->atomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
+                }
+            }
+            if (upRightCornerDelta != 0) {
+                Tile* upRightTile = ensureNeighborTile(1, -1);
+                if (upRightTile) {
+                    upRightTile->atomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
+                }
+            }
+            if (downLeftCornerDelta != 0) {
+                Tile* downLeftTile = ensureNeighborTile(-1, 1);
+                if (downLeftTile) {
+                    downLeftTile->atomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
+                }
+            }
+            if (downRightCornerDelta != 0) {
+                Tile* downRightTile = ensureNeighborTile(1, 1);
+                if (downRightTile) {
+                    downRightTile->atomicApplyDelta(0, 0, downRightCornerDelta);
+                }
+            }
         }
     }
 }
@@ -666,6 +822,17 @@ void Tile::atomicApplyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
             if (rightTile) {
                 rightTile->atomicApplyDelta(0, y, delta);
             }
+        }
+    }
+}
+
+// Apply buffered boundary deltas from an int8_t array
+// This applies each non-zero delta with atomicApplyDelta
+void Tile::atomicAddBoundaryDeltas(int y, const int8_t* deltaArray) {
+    for (int x = 0; x < TILE_WIDTH; x++) {
+        int8_t delta = deltaArray[x];
+        if (delta != 0) {
+            atomicApplyDelta(x, y, delta);
         }
     }
 }

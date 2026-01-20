@@ -93,6 +93,11 @@ public:
     void atomicApplyDelta(int x, int y, int8_t delta);
     void atomicApplyVerticalDeltas(int baseX, int y, const int8_t* deltas);
 
+    // Buffered boundary optimization: apply accumulated deltas from an int8_t array
+    // Each element contains the total delta for that cell's neighbor count
+    // This batches all boundary deltas for a row and applies them efficiently
+    void atomicAddBoundaryDeltas(int y, const int8_t* deltaArray);
+
     // Helper to ensure a neighbor tile exists, creating it on demand if needed
     // Returns the neighbor tile pointer (never null after call)
     Tile* ensureNeighborTile(int dx, int dy);

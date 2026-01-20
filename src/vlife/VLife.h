@@ -60,6 +60,12 @@ public:
     void setParallelEnabled(bool enabled) { parallelEnabled = enabled; }
     bool isParallelEnabled() const { return parallelEnabled; }
 
+    // Enable or disable buffered boundary optimization (for A/B comparison)
+    // When enabled, cross-tile boundary deltas are buffered locally and applied
+    // with a single atomic fetch_add per word instead of individual CAS operations
+    void setBufferedBoundaryEnabled(bool enabled) { bufferedBoundaryEnabled = enabled; }
+    bool isBufferedBoundaryEnabled() const { return bufferedBoundaryEnabled; }
+
     // Gets a tile at the specified coordinates. Creates it if it doesn't exist.
     Tile *getTile(int32_t tileX, int32_t tileY);
 
@@ -106,6 +112,9 @@ private:
     // Tiles of the same color are at least 2 steps apart, so they share no neighbors
     std::vector<Tile*> colorGroups[4];
     bool parallelEnabled = true;
+    // Buffered boundary optimization - accumulates deltas locally then applies them
+    // in batch at the end of runGenerationChanges(). Reduces redundant tile lookups.
+    bool bufferedBoundaryEnabled = true;
 
     // Rebuild the spatial order vector
     void rebuildSpatialOrder();
