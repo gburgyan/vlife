@@ -10,6 +10,33 @@ set(CMAKE_AUTOUIC ON)
 # Enable testing
 enable_testing()
 
+# AVX-512 optimization option
+option(ENABLE_AVX512 "Enable AVX-512 optimizations (uses SIMDE for emulation on non-x86)" OFF)
+
+if(ENABLE_AVX512)
+    message(STATUS "AVX-512 optimizations enabled")
+
+    # Check if we're on x86_64 with native AVX-512 support
+    include(CheckCXXCompilerFlag)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        check_cxx_compiler_flag("-mavx512f -mavx512bw" COMPILER_SUPPORTS_AVX512)
+        if(COMPILER_SUPPORTS_AVX512)
+            message(STATUS "Native AVX-512 support detected")
+            set(AVX512_NATIVE ON)
+        endif()
+    endif()
+
+    # Fetch SIMDE for portable AVX-512 emulation (always available for correctness testing)
+    include(FetchContent)
+    FetchContent_Declare(
+        simde
+        GIT_REPOSITORY https://github.com/simd-everywhere/simde.git
+        GIT_TAG v0.8.2
+    )
+    FetchContent_MakeAvailable(simde)
+    message(STATUS "SIMDE fetched for AVX-512 emulation support")
+endif()
+
 # Try to find Qt via Homebrew
 execute_process(
         COMMAND brew --prefix qt@5
@@ -71,6 +98,23 @@ add_library(
 
 # Link threading library and TBB to GameOfLifeLib
 target_link_libraries(GameOfLifeLib PUBLIC Threads::Threads TBB::tbb)
+
+# AVX-512 configuration for GameOfLifeLib
+if(ENABLE_AVX512)
+    target_compile_definitions(GameOfLifeLib PUBLIC VLIFE_AVX512_ENABLED)
+    target_include_directories(GameOfLifeLib PUBLIC ${simde_SOURCE_DIR})
+
+    if(AVX512_NATIVE)
+        # Native x86_64 with AVX-512: use native intrinsics
+        target_compile_options(GameOfLifeLib PRIVATE -mavx512f -mavx512bw -mavx512vl)
+        target_compile_definitions(GameOfLifeLib PRIVATE VLIFE_AVX512_NATIVE)
+        message(STATUS "GameOfLifeLib: Using native AVX-512 intrinsics")
+    else()
+        # Non-x86 or no native AVX-512: use SIMDE emulation
+        target_compile_definitions(GameOfLifeLib PRIVATE SIMDE_ENABLE_NATIVE_ALIASES)
+        message(STATUS "GameOfLifeLib: Using SIMDE for AVX-512 emulation (correctness testing)")
+    endif()
+endif()
 
 # Frontend application
 add_executable(

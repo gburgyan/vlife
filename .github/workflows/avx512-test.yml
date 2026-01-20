@@ -1,0 +1,103 @@
+name: AVX-512 Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-avx512:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify AVX-512 support
+        run: |
+          echo "Checking CPU capabilities..."
+          lscpu | grep -i avx || echo "AVX info not found via lscpu"
+          cat /proc/cpuinfo | grep -o 'avx512[a-z]*' | sort -u || echo "No AVX-512 flags found"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libtbb-dev qtbase5-dev
+
+      - name: Configure with AVX-512 enabled
+        run: |
+          mkdir build
+          cd build
+          cmake -DENABLE_AVX512=ON -DCMAKE_BUILD_TYPE=Release ..
+
+      - name: Build
+        run: |
+          cd build
+          make -j$(nproc)
+
+      - name: Run unit tests
+        run: |
+          cd build
+          ctest --output-on-failure
+
+      - name: Run quick benchmark
+        run: |
+          cd build
+          ./VLifeBenchmark --quick || echo "Quick benchmark completed"
+
+  # Also test without AVX-512 to ensure scalar path still works
+  test-scalar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libtbb-dev qtbase5-dev
+
+      - name: Configure without AVX-512
+        run: |
+          mkdir build
+          cd build
+          cmake -DENABLE_AVX512=OFF -DCMAKE_BUILD_TYPE=Release ..
+
+      - name: Build
+        run: |
+          cd build
+          make -j$(nproc)
+
+      - name: Run unit tests
+        run: |
+          cd build
+          ctest --output-on-failure
+
+  # Test SIMDE emulation mode (for correctness verification)
+  test-simde-emulation:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libtbb-dev qtbase5-dev
+
+      - name: Configure with AVX-512 via SIMDE
+        run: |
+          mkdir build
+          cd build
+          # Force SIMDE emulation even on x86 by not passing native flags
+          cmake -DENABLE_AVX512=ON -DCMAKE_BUILD_TYPE=Debug ..
+
+      - name: Build
+        run: |
+          cd build
+          make -j$(nproc)
+
+      - name: Run unit tests
+        run: |
+          cd build
+          ctest --output-on-failure

@@ -18,6 +18,18 @@
     #define PREFETCH(addr) ((void)0)
 #endif
 
+// AVX-512 support (either native or via SIMDE emulation)
+#ifdef VLIFE_AVX512_ENABLED
+    #include "CpuFeatures.h"
+    #ifdef VLIFE_AVX512_NATIVE
+        #include <immintrin.h>
+    #else
+        // SIMDE provides portable AVX-512 emulation
+        // Note: SIMDE_ENABLE_NATIVE_ALIASES is defined via CMake
+        #include <simde/x86/avx512.h>
+    #endif
+#endif
+
 Tile::Tile(VLife *board, int32_t tileX, int32_t tileY) :
     board(board), tileX(tileX), tileY(tileY), left(nullptr), right(nullptr), up(nullptr), down(nullptr),
     upLeft(nullptr), upRight(nullptr), downLeft(nullptr), downRight(nullptr), liveCount(0), activityMask(0) {
@@ -231,6 +243,14 @@ void Tile::updateNeighborCount(int localX, int localY, bool increment) {
 }
 
 void Tile::runGenerationPrepare() {
+#ifdef VLIFE_AVX512_ENABLED
+    // Use AVX-512 optimized version if available
+    if (CpuFeatures::hasAVX512Support()) {
+        runGenerationPrepare_AVX512();
+        return;
+    }
+#endif
+
     // Clear changes array
     std::memset(changes, 0, sizeof(changes));
 
@@ -405,6 +425,189 @@ void Tile::runGenerationPrepare() {
     }
 #endif
 }
+
+#ifdef VLIFE_AVX512_ENABLED
+// AVX-512 optimized version of runGenerationPrepare
+// Replaces LUT lookups with direct SIMD computation for better throughput
+//
+// Cell format (per nibble): bit 3 = alive, bits 0-2 = neighbor count (excluding paired cell)
+// Byte format: [left_alive:1][left_neighbors:3][right_alive:1][right_neighbors:3]
+//
+// Conway's Rules:
+// - Survive: alive AND (neighbors == 2 OR neighbors == 3)
+// - Birth: NOT alive AND neighbors == 3
+//
+// The true neighbor count = stored count + paired cell's alive state
+void Tile::runGenerationPrepare_AVX512() {
+    // Clear changes array
+    std::memset(changes, 0, sizeof(changes));
+
+    // Rebuild activity mask while processing
+    activityMask = 0;
+
+    // Constants for byte-level operations
+    // Note: AVX-512 doesn't have byte-level shifts, so we use masks and comparisons
+    const __m512i mask_left_alive = _mm512_set1_epi8(static_cast<char>(0x80));   // bit 7
+    const __m512i mask_left_neighbors = _mm512_set1_epi8(0x70);  // bits 6-4
+    const __m512i mask_right_alive = _mm512_set1_epi8(0x08);     // bit 3
+    const __m512i mask_right_neighbors = _mm512_set1_epi8(0x07); // bits 2-0
+
+    // For comparisons, we need normalized values (shifted to bits 2-0)
+    // left_neighbors needs to be shifted from bits 6-4 to bits 2-0 (divide by 16)
+    // We'll compare against shifted constants instead
+    const __m512i two_in_high_nibble = _mm512_set1_epi8(0x20);   // 2 << 4
+    const __m512i three_in_high_nibble = _mm512_set1_epi8(0x30); // 3 << 4
+    const __m512i twos = _mm512_set1_epi8(2);
+    const __m512i threes = _mm512_set1_epi8(3);
+    const __m512i ones = _mm512_set1_epi8(1);
+
+    // Process 64 bytes at a time (64 cell pairs, 8 uint64_t words)
+    const uint8_t* cellBytes = reinterpret_cast<const uint8_t*>(cells);
+
+    for (int byteOffset = 0; byteOffset < TILE_BYTES; byteOffset += 64) {
+        // Load 64 bytes (64 cell pairs)
+        __m512i data = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(cellBytes + byteOffset));
+
+        // Quick check: skip if all zero (no activity)
+        __mmask64 nonZeroMask = _mm512_test_epi8_mask(data, data);
+        if (nonZeroMask == 0) {
+            continue;
+        }
+
+        // Update activity mask for these 8 words
+        int baseWordIdx = byteOffset / 8;
+        for (int w = 0; w < 8; w++) {
+            uint8_t wordMaskBits = (nonZeroMask >> (w * 8)) & 0xFF;
+            if (wordMaskBits != 0) {
+                activityMask |= (1ULL << (baseWordIdx + w));
+            }
+        }
+
+        // Extract components using masks (no shifts needed for detection)
+        // Left cell alive: bit 7 set
+        __mmask64 left_alive_mask = _mm512_test_epi8_mask(data, mask_left_alive);
+
+        // Right cell alive: bit 3 set
+        __mmask64 right_alive_mask = _mm512_test_epi8_mask(data, mask_right_alive);
+
+        // For neighbor counts, we need to compute:
+        // left_true_count = left_neighbors + right_alive
+        // right_true_count = right_neighbors + left_alive
+        //
+        // Since we can't easily shift bytes in AVX-512, we'll process byte-by-byte
+        // for the final change calculation. But we can still use SIMD for the masks.
+
+        // Extract the raw neighbor count fields
+        __m512i left_neighbors_raw = _mm512_and_si512(data, mask_left_neighbors);  // bits 6-4
+        __m512i right_neighbors_raw = _mm512_and_si512(data, mask_right_neighbors); // bits 2-0
+
+        // For left cell: true_count = (left_neighbors_raw >> 4) + right_alive
+        // We'll check the conditions by comparing against shifted values
+        //
+        // left survives if: alive AND ((neighbors + right_alive) == 2 OR 3)
+        // left born if: !alive AND (neighbors + right_alive) == 3
+
+        // Case analysis for left cell:
+        // If right_alive = 0: compare left_neighbors_raw with 0x20 (2<<4) or 0x30 (3<<4)
+        // If right_alive = 1: compare left_neighbors_raw with 0x10 (1<<4) or 0x20 (2<<4)
+
+        // Compute masks for left cell survival/birth
+        // When right is dead: survive if neighbors == 2 or 3
+        __mmask64 left_eq2_when_right_dead = _mm512_cmpeq_epi8_mask(left_neighbors_raw, two_in_high_nibble);
+        __mmask64 left_eq3_when_right_dead = _mm512_cmpeq_epi8_mask(left_neighbors_raw, three_in_high_nibble);
+
+        // When right is alive: survive if neighbors == 1 or 2 (since total becomes 2 or 3)
+        const __m512i one_in_high_nibble = _mm512_set1_epi8(0x10);
+        __mmask64 left_eq1_when_right_alive = _mm512_cmpeq_epi8_mask(left_neighbors_raw, one_in_high_nibble);
+        __mmask64 left_eq2_when_right_alive = _mm512_cmpeq_epi8_mask(left_neighbors_raw, two_in_high_nibble);
+
+        // Left survives: (right dead AND (n==2 OR n==3)) OR (right alive AND (n==1 OR n==2))
+        __mmask64 left_survive_when_right_dead = left_eq2_when_right_dead | left_eq3_when_right_dead;
+        __mmask64 left_survive_when_right_alive = left_eq1_when_right_alive | left_eq2_when_right_alive;
+        __mmask64 left_survive = (~right_alive_mask & left_survive_when_right_dead) |
+                                  (right_alive_mask & left_survive_when_right_alive);
+
+        // Left born: !alive AND total_neighbors == 3
+        // When right dead: born if neighbors == 3
+        // When right alive: born if neighbors == 2
+        __mmask64 left_birth_when_right_dead = left_eq3_when_right_dead;
+        __mmask64 left_birth_when_right_alive = left_eq2_when_right_alive;
+        __mmask64 left_birth = (~right_alive_mask & left_birth_when_right_dead) |
+                               (right_alive_mask & left_birth_when_right_alive);
+
+        // Left changes: (alive AND !survive) OR (!alive AND birth)
+        __mmask64 left_changes = (left_alive_mask & ~left_survive) | (~left_alive_mask & left_birth);
+
+        // Similar for right cell
+        // right_true_count = right_neighbors_raw + left_alive (where left_alive is 0 or 1)
+        // When left is dead: compare right_neighbors_raw with 2 or 3
+        // When left is alive: compare right_neighbors_raw with 1 or 2
+
+        __mmask64 right_eq2_when_left_dead = _mm512_cmpeq_epi8_mask(right_neighbors_raw, twos);
+        __mmask64 right_eq3_when_left_dead = _mm512_cmpeq_epi8_mask(right_neighbors_raw, threes);
+        __mmask64 right_eq1_when_left_alive = _mm512_cmpeq_epi8_mask(right_neighbors_raw, ones);
+        __mmask64 right_eq2_when_left_alive = _mm512_cmpeq_epi8_mask(right_neighbors_raw, twos);
+
+        __mmask64 right_survive_when_left_dead = right_eq2_when_left_dead | right_eq3_when_left_dead;
+        __mmask64 right_survive_when_left_alive = right_eq1_when_left_alive | right_eq2_when_left_alive;
+        __mmask64 right_survive = (~left_alive_mask & right_survive_when_left_dead) |
+                                   (left_alive_mask & right_survive_when_left_alive);
+
+        __mmask64 right_birth_when_left_dead = right_eq3_when_left_dead;
+        __mmask64 right_birth_when_left_alive = right_eq2_when_left_alive;
+        __mmask64 right_birth = (~left_alive_mask & right_birth_when_left_dead) |
+                                (left_alive_mask & right_birth_when_left_alive);
+
+        __mmask64 right_changes = (right_alive_mask & ~right_survive) | (~right_alive_mask & right_birth);
+
+        // Pack change bits into the changes array
+        // Each byte becomes 2 bits: bit 1 = left changes, bit 0 = right changes
+        //
+        // IMPORTANT: The scalar code processes bytes in big-endian order within each
+        // 64-bit word (MSB first via >> 56, >> 48, etc.), but our mask bits are in
+        // memory/little-endian order (byte 0 at bit 0).
+        //
+        // Within each 64-bit word:
+        //   Scalar byte index: 0 (MSB) -> mask bit 7, 1 -> mask bit 6, ..., 7 (LSB) -> mask bit 0
+        //   So for cells[i], scalar byte j (from >>56, >>48, etc.) = memory byte (7-j) = mask bit i*8 + (7-j)
+        //
+        // Change word layout (from scalar code):
+        //   Word 0 (cells[changeIdx*4+0]): bytes 0-7 -> change bits 62-48
+        //   Word 1 (cells[changeIdx*4+1]): bytes 0-7 -> change bits 46-32
+        //   Word 2 (cells[changeIdx*4+2]): bytes 0-7 -> change bits 30-16
+        //   Word 3 (cells[changeIdx*4+3]): bytes 0-7 -> change bits 14-0
+        int changeWordBase = byteOffset / 32;
+
+        for (int cw = 0; cw < 2; cw++) {
+            uint64_t changeBuff = 0;
+            // Each change word covers 4 cell words = 32 bytes
+            int baseByteInBlock = cw * 32;  // 0 or 32 within this 64-byte AVX block
+
+            // Process 4 cell words (32 bytes) for this change word
+            for (int word = 0; word < 4; word++) {
+                // Process 8 bytes of this cell word
+                for (int byteInWord = 0; byteInWord < 8; byteInWord++) {
+                    // Scalar code processes from MSB to LSB (byte 7 down to byte 0 in memory)
+                    // byteInWord 0 = scalar's >>56 = memory byte 7
+                    // byteInWord 7 = scalar's &0xFF = memory byte 0
+                    int memByteInWord = 7 - byteInWord;
+                    int maskBit = baseByteInBlock + word * 8 + memByteInWord;
+
+                    int leftChange = (left_changes >> maskBit) & 1;
+                    int rightChange = (right_changes >> maskBit) & 1;
+                    int changePair = (leftChange << 1) | rightChange;
+
+                    // Position in change word: word 0 starts at bit 62, each byte takes 2 bits
+                    int shift = 62 - (word * 16) - (byteInWord * 2);
+                    changeBuff |= static_cast<uint64_t>(changePair) << shift;
+                }
+            }
+
+            changes[changeWordBase + cw] = changeBuff;
+        }
+    }
+}
+#endif // VLIFE_AVX512_ENABLED
 
 // Helper: Accumulate deltas to a local int8_t array (no carry propagation issues)
 // x is the cell x-coordinate within the row (0-31)

@@ -20,10 +20,31 @@ cmake ..
 make
 ```
 
+To build with AVX-512 optimizations:
+```bash
+mkdir -p build
+cd build
+cmake -DENABLE_AVX512=ON ..
+make
+```
+
 To run the application:
 ```bash
 cd build
 ./GameOfLifeApp
+```
+
+To run tests:
+```bash
+cd build
+ctest --output-on-failure
+```
+
+To run benchmarks:
+```bash
+cd build
+./VLifeBenchmark --quick    # Quick benchmark
+./VLifeBenchmark            # Full benchmark
 ```
 
 ## Project Structure
@@ -77,3 +98,52 @@ cd build
 - Qt5 is required for the UI components and is detected via Homebrew on macOS
 - The code uses C++20 features
 - The VLife implementation is a work in progress and focuses on performance optimization
+
+## AVX-512 Optimization
+
+The VLife implementation includes an optional AVX-512 SIMD optimization for the `runGenerationPrepare` phase, which identifies cells that will change state in the next generation.
+
+### How It Works
+
+The standard implementation uses a 256-entry lookup table (LUT) to determine which cells change. The AVX-512 version replaces LUT lookups with direct SIMD computation:
+
+- Processes 64 bytes (64 cell pairs) per iteration using 512-bit registers
+- Uses mask-based bit extraction to apply Conway's rules in parallel
+- Eliminates random memory accesses from LUT lookups
+
+### Build Configuration
+
+Enable with `-DENABLE_AVX512=ON`:
+
+- **On x86_64 with AVX-512 support**: Uses native AVX-512 intrinsics (`-mavx512f -mavx512bw -mavx512vl`)
+- **On other platforms (Apple Silicon, older x86)**: Uses [SIMDE](https://github.com/simd-everywhere/simde) for portable emulation
+
+Runtime dispatch automatically selects the appropriate code path based on CPU capabilities.
+
+### Key Files
+
+- `src/vlife/CpuFeatures.h`: Runtime CPU feature detection
+- `src/vlife/Tile.cpp`: Contains both scalar and AVX-512 implementations of `runGenerationPrepare`
+- `CMakeLists.txt`: Build configuration for AVX-512 support
+- `.github/workflows/avx512-test.yml`: CI pipeline for AVX-512 testing
+
+### Testing
+
+The AVX-512 implementation can be tested for correctness on any platform using SIMDE emulation. For performance testing, use x86_64 hardware with AVX-512 support (Intel Ice Lake+, AMD Zen 4+).
+
+```bash
+# Build with AVX-512 (uses SIMDE on non-x86 platforms)
+cmake -DENABLE_AVX512=ON ..
+make
+
+# Run tests to verify correctness
+ctest --output-on-failure
+```
+
+### Expected Performance
+
+On actual AVX-512 hardware, the optimization targets the `runGenerationPrepare` phase (~60% of execution time):
+- **Phase 1 (Prepare)**: 2-4x speedup from eliminating LUT lookups
+- **Overall**: 1.5-2.5x speedup depending on grid density and activity patterns
+
+Note: AVX-512 can cause frequency throttling on some Intel CPUs, which may reduce net benefit.

@@ -61,6 +61,12 @@ public:
     void runGenerationPrepare();
     void runGenerationChanges();
 
+#ifdef VLIFE_AVX512_ENABLED
+    // AVX-512 optimized version of runGenerationPrepare
+    // Uses direct SIMD computation instead of LUT lookups
+    void runGenerationPrepare_AVX512();
+#endif
+
     void lockTile();
     void unlockTile();
 
