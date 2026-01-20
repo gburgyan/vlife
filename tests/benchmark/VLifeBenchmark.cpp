@@ -234,7 +234,19 @@ int main(int argc, char* argv[]) {
         printResult("Gliders (" + std::to_string(count) + " gliders)", result, warmup, measured);
     }
 
-    // Benchmark 6: Acorn (methuselah - grows then stabilizes)
+    // Benchmark 6: Single Glider (50k generations - long-running minimal pattern)
+    {
+        VLife board;
+        BenchmarkPatterns::setupGlider(board, 0, 0);
+
+        int warmup = quickMode ? 500 : 1000;
+        int measured = quickMode ? 10000 : 50000;
+
+        auto result = VLifeBenchmark::runBenchmark(board, warmup, measured);
+        printResult("Single Glider (50k gen)", result, warmup, measured);
+    }
+
+    // Benchmark 7: Acorn (methuselah - grows then stabilizes)
     {
         VLife board;
         BenchmarkPatterns::setupAcorn(board);
@@ -246,7 +258,7 @@ int main(int argc, char* argv[]) {
         printResult("Acorn (methuselah)", result, warmup, measured);
     }
 
-    // Benchmark 7: Parallel vs Sequential Comparison (Large Random Soup)
+    // Benchmark 8: Parallel vs Sequential Comparison (Large Random Soup)
     // Use larger pattern to exceed the 64 tile threshold for parallel processing
     {
         std::cout << "\n--- Parallel vs Sequential Comparison ---\n";
