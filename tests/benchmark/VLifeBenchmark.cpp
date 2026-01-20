@@ -117,19 +117,7 @@ public:
 
 private:
     static size_t countTiles(VLife& board) {
-        // Count tiles by checking if any tiles exist
-        // We use a workaround since tiles is private
-        size_t count = 0;
-        // Scan a reasonable area to estimate tile count
-        // This is an approximation for benchmark purposes
-        for (int ty = -10; ty <= 50; ty++) {
-            for (int tx = -10; tx <= 50; tx++) {
-                if (board.getTileIfExists(tx, ty) != nullptr) {
-                    count++;
-                }
-            }
-        }
-        return count;
+        return board.getTileCount();
     }
 };
 

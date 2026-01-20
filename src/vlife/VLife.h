@@ -75,6 +75,9 @@ public:
     // Removes a tile at the specified coordinates
     void removeTile(int32_t tileX, int32_t tileY);
 
+    // Returns the current number of tiles
+    size_t getTileCount() const { return tiles.size(); }
+
 private:
     void populateRuleLUT();
     void populateUpdateLUT();

@@ -257,11 +257,12 @@ void Tile::runGenerationPrepare() {
             continue;
         }
 
-        // Update activity mask for non-zero words
-        if (cells[i] != 0) activityMask |= (1ULL << i);
-        if (cells[i + 1] != 0) activityMask |= (1ULL << (i + 1));
-        if (cells[i + 2] != 0) activityMask |= (1ULL << (i + 2));
-        if (cells[i + 3] != 0) activityMask |= (1ULL << (i + 3));
+        // Update activity mask branchlessly - convert non-zero to 1, then shift
+        // This avoids 4 unpredictable branches per iteration
+        activityMask |= (static_cast<uint64_t>(cells[i] != 0) << i) |
+                        (static_cast<uint64_t>(cells[i + 1] != 0) << (i + 1)) |
+                        (static_cast<uint64_t>(cells[i + 2] != 0) << (i + 2)) |
+                        (static_cast<uint64_t>(cells[i + 3] != 0) << (i + 3));
 
         uint64_t changeBuff = 0;
 
@@ -340,11 +341,12 @@ void Tile::runGenerationPrepare() {
             continue;  // Skip this group entirely - no activity possible
         }
 
-        // Update activity mask for non-zero words
-        if (cells[i] != 0) activityMask |= (1ULL << i);
-        if (cells[i + 1] != 0) activityMask |= (1ULL << (i + 1));
-        if (cells[i + 2] != 0) activityMask |= (1ULL << (i + 2));
-        if (cells[i + 3] != 0) activityMask |= (1ULL << (i + 3));
+        // Update activity mask branchlessly - convert non-zero to 1, then shift
+        // This avoids 4 unpredictable branches per iteration
+        activityMask |= (static_cast<uint64_t>(cells[i] != 0) << i) |
+                        (static_cast<uint64_t>(cells[i + 1] != 0) << (i + 1)) |
+                        (static_cast<uint64_t>(cells[i + 2] != 0) << (i + 2)) |
+                        (static_cast<uint64_t>(cells[i + 3] != 0) << (i + 3));
 
         // Process word 0
         uint64_t changeBuff = 0;
@@ -407,21 +409,21 @@ void Tile::runGenerationPrepare() {
 // Helper: Accumulate deltas to a local int8_t array (no carry propagation issues)
 // x is the cell x-coordinate within the row (0-31)
 // delta is the value to add (-2 to +2 typically)
+// Note: Branchless - adding 0 is a no-op, avoids branch misprediction
 static inline void accumulateToDeltaArray(int8_t* deltaArray, int x, int8_t delta) {
-    if (delta == 0) return;
     deltaArray[x] += delta;
 }
 
 // Helper: Accumulate vertical deltas (4 cells: x-1, x, x+1, x+2) to buffer arrays
 // baseX is the x coordinate of the right cell in the pair (even x)
 // Handles wrap-around for cells outside 0-31 range (corner cases)
+// Note: Removed delta==0 check; adding 0 is a no-op, avoids branch misprediction
 static inline void accumulateVerticalDeltasToArrays(int8_t* deltaArray, int baseX, const int8_t* deltas,
                                                      int8_t* leftCornerDelta, int8_t* rightCornerDelta) {
     int leftX = baseX - 1;
     for (int i = 0; i < 4; i++) {
         int x = leftX + i;
         int8_t delta = deltas[i];
-        if (delta == 0) continue;
 
         if (x >= 0 && x < TILE_WIDTH) {
             // Cell is within this tile's row
@@ -469,15 +471,20 @@ void Tile::runGenerationChanges() {
             continue;
         }
 
-        // Process 64 change bits (32 cell pairs, 2 bits per pair)
-        for (int bitPair = 0; bitPair < 32; bitPair++) {
-            // Extract 2 change bits for this cell pair (bit 1 = left changed, bit 0 = right changed)
+        // Process only non-zero bit pairs using leading zero count to skip directly to them
+        // This eliminates unpredictable branches from the inner loop
+        while (changeBits != 0) {
+            // Find the position of the highest set bit
+            int leadingZeros = __builtin_clzll(changeBits);
+            // Convert to bit pair index (0-31, where 0 is bits 63:62)
+            int bitPair = leadingZeros / 2;
             int shiftAmount = 62 - (bitPair * 2);
+
+            // Extract the 2-bit pair (guaranteed non-zero since we found a set bit)
             int pairChangeBits = (changeBits >> shiftAmount) & 0x3;
 
-            if (pairChangeBits == 0) {
-                continue;
-            }
+            // Clear this bit pair so we don't process it again
+            changeBits &= ~(0x3ULL << shiftAmount);
 
             // Calculate which cell word and bit position
             int wordsFromStart = bitPair / 8;  // 8 cell pairs per 64-bit word
@@ -495,44 +502,35 @@ void Tile::runGenerationChanges() {
             // Determine states for LUT index:
             // bits [3:2] = left cell: 00=unchanged, 01=became alive, 10=died
             // bits [1:0] = right cell: 00=unchanged, 01=became alive, 10=died
-            int leftState = 0;
-            int rightState = 0;
+            //
+            // Branchless computation:
+            // - Extract change flags (0 or 1)
+            // - Compute wasAlive from current cell state
+            // - state = 1 + wasAlive (1=became alive, 2=died)
+            // - delta = 1 - 2*wasAlive (+1 if born, -1 if died)
+            // - Mask by change flag to zero out unchanged cells
 
-            // Process left cell (odd x = baseX + 1)
-            if (pairChangeBits & 0x2) {
-                bool wasAlive = (cells[currentCellIdx] & (1ULL << leftCellBitPos)) != 0;
-                bool becameAlive = !wasAlive;
+            int leftChanged = (pairChangeBits >> 1) & 1;
+            int rightChanged = pairChangeBits & 1;
 
-                // Toggle the alive bit
-                cells[currentCellIdx] ^= (1ULL << leftCellBitPos);
+            // Read current alive states (0 or 1)
+            int leftWasAlive = (cells[currentCellIdx] >> leftCellBitPos) & 1;
+            int rightWasAlive = (cells[currentCellIdx] >> rightCellBitPos) & 1;
 
-                // Update live count
-                if (becameAlive) {
-                    liveCount++;
-                    leftState = 1;  // became alive
-                } else {
-                    liveCount--;
-                    leftState = 2;  // died
-                }
-            }
+            // Toggle alive bits for changed cells using XOR mask
+            uint64_t toggleMask = (static_cast<uint64_t>(leftChanged) << leftCellBitPos) |
+                                  (static_cast<uint64_t>(rightChanged) << rightCellBitPos);
+            cells[currentCellIdx] ^= toggleMask;
 
-            // Process right cell (even x = baseX)
-            if (pairChangeBits & 0x1) {
-                bool wasAlive = (cells[currentCellIdx] & (1ULL << rightCellBitPos)) != 0;
-                bool becameAlive = !wasAlive;
+            // Compute states branchlessly: state = (1 + wasAlive) if changed, 0 otherwise
+            int leftState = (1 + leftWasAlive) * leftChanged;
+            int rightState = (1 + rightWasAlive) * rightChanged;
 
-                // Toggle the alive bit
-                cells[currentCellIdx] ^= (1ULL << rightCellBitPos);
-
-                // Update live count
-                if (becameAlive) {
-                    liveCount++;
-                    rightState = 1;  // became alive
-                } else {
-                    liveCount--;
-                    rightState = 2;  // died
-                }
-            }
+            // Compute liveCount deltas branchlessly: +1 if born, -1 if died, 0 if unchanged
+            // delta = (1 - 2*wasAlive) * changed = changed - 2*wasAlive*changed
+            int leftDelta = leftChanged - 2 * leftWasAlive * leftChanged;
+            int rightDelta = rightChanged - 2 * rightWasAlive * rightChanged;
+            liveCount += leftDelta + rightDelta;
 
             // Build LUT index and apply deltas
             int lutIndex = (leftState << 2) | rightState;
@@ -677,12 +675,10 @@ inline void Tile::applyDelta(int x, int y, int8_t delta) {
     // Update the neighbor count (mask to 3 bits to prevent corruption from negative values)
     cells[cellIdx] = (cells[cellIdx] & ~mask) | (static_cast<uint64_t>(newCount & 0x7) << bitPos);
 
-    // Update activity mask based on whether word is now zero
-    if (cells[cellIdx] != 0) {
-        activityMask |= (1ULL << cellIdx);
-    } else {
-        activityMask &= ~(1ULL << cellIdx);
-    }
+    // Update activity mask branchlessly: clear bit, then conditionally set it
+    uint64_t bit = 1ULL << cellIdx;
+    uint64_t setBit = bit & -static_cast<uint64_t>(cells[cellIdx] != 0);
+    activityMask = (activityMask & ~bit) | setBit;
 }
 
 // Apply vertical deltas to 4 consecutive cells in a row (x-1, x, x+1, x+2)
@@ -712,28 +708,30 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
 
         uint64_t word = cells[cellIdx];
 
-        // Extract, add, clamp, and repack 4 nibbles
-        for (int i = 0; i < 4; i++) {
-            int8_t delta = deltas[i];
-            if (delta == 0) continue;
+        // Branchless unrolled version: always update all 4 nibbles
+        // Adding 0 is a no-op, so we avoid branch mispredictions
+        uint64_t m0 = 0x7ULL << baseBitPos;
+        uint64_t m1 = 0x7ULL << (baseBitPos + 4);
+        uint64_t m2 = 0x7ULL << (baseBitPos + 8);
+        uint64_t m3 = 0x7ULL << (baseBitPos + 12);
 
-            uint32_t bitPos = baseBitPos + i * 4;
-            uint64_t mask = 0x7ULL << bitPos;
-            int count = (word & mask) >> bitPos;
+        int c0 = static_cast<int>((word & m0) >> baseBitPos) + deltas[0];
+        int c1 = static_cast<int>((word & m1) >> (baseBitPos + 4)) + deltas[1];
+        int c2 = static_cast<int>((word & m2) >> (baseBitPos + 8)) + deltas[2];
+        int c3 = static_cast<int>((word & m3) >> (baseBitPos + 12)) + deltas[3];
 
-            // Apply delta (mask to 3 bits to prevent corruption from negative values)
-            count += delta;
-
-            word = (word & ~mask) | (static_cast<uint64_t>(count & 0x7) << bitPos);
-        }
+        // Clear all 4 nibbles and set new values (masked to 3 bits each)
+        word = (word & ~(m0 | m1 | m2 | m3)) |
+               (static_cast<uint64_t>(c0 & 0x7) << baseBitPos) |
+               (static_cast<uint64_t>(c1 & 0x7) << (baseBitPos + 4)) |
+               (static_cast<uint64_t>(c2 & 0x7) << (baseBitPos + 8)) |
+               (static_cast<uint64_t>(c3 & 0x7) << (baseBitPos + 12));
 
         cells[cellIdx] = word;
-        // Update activity mask based on whether word is now zero
-        if (word != 0) {
-            activityMask |= (1ULL << cellIdx);
-        } else {
-            activityMask &= ~(1ULL << cellIdx);
-        }
+        // Update activity mask branchlessly: clear bit, then conditionally set it
+        uint64_t bit = 1ULL << cellIdx;
+        uint64_t setBit = bit & -static_cast<uint64_t>(word != 0);
+        activityMask = (activityMask & ~bit) | setBit;
     } else {
         // Slow path: handle boundaries individually
         // Uses applyDelta which routes boundary cells through atomicApplyDelta
