@@ -18,7 +18,9 @@
 // This prevents "flapping" (tiles being repeatedly created and destroyed)
 static constexpr uint8_t TILE_COOLDOWN_GENERATIONS = 4;
 
-class Tile {
+// Align Tile to 64-byte cache line boundaries to prevent false sharing
+// when multiple threads update adjacent tiles in parallel
+class alignas(64) Tile {
     VLife *board;
     int32_t tileX;
     int32_t tileY;
@@ -67,8 +69,15 @@ public:
     void setCell(uint32_t localX, uint32_t localY, bool alive);
     void updateNeighborCount(int localX, int localY, bool increment);
 
+    // Check if a cell is on the boundary of the tile (could race with neighbor tiles)
+    // Boundary cells: first/last row or first/last column
+    inline bool isBoundaryCell(int x, int y) const {
+        return x == 0 || x == TILE_WIDTH - 1 || y == 0 || y == TILE_HEIGHT - 1;
+    }
+
     // LUT-based optimization helpers for runGenerationChanges
     // Apply a single delta to a cell's neighbor count (inline for performance)
+    // Uses atomic for boundary cells when in full parallel mode
     inline void applyDelta(int x, int y, int8_t delta);
 
     // Apply vertical deltas to 4 consecutive cells in a row (x-1, x, x+1, x+2)
@@ -118,6 +127,12 @@ public:
 
     // Get the number of active word groups (for profiling/debugging)
     inline int getActiveWordCount() const {
+        return __builtin_popcountll(activityMask);
+    }
+
+    // Estimate the amount of work for this tile (higher = more work)
+    // Used for work-weighted scheduling to put heavy tiles first
+    inline uint32_t estimateWork() const {
         return __builtin_popcountll(activityMask);
     }
 

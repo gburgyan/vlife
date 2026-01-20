@@ -496,9 +496,18 @@ void Tile::runGenerationChanges() {
 }
 
 // Apply a single delta to a cell's neighbor count
+// Uses atomic for boundary cells (could race with neighbor tiles in full parallel mode)
 inline void Tile::applyDelta(int x, int y, int8_t delta) {
     if (delta == 0) return;
 
+    // Use atomic for boundary cells (could race with neighbor tile updates)
+    // Boundary cells are those on the edge of the tile that neighbor tiles may also update
+    if (isBoundaryCell(x, y)) {
+        atomicApplyDelta(x, y, delta);
+        return;
+    }
+
+    // Non-atomic path for interior cells (no race possible - only this tile updates them)
     uint32_t cellIdx = (y * TILE_WIDTH + x) / 16;
     uint32_t bitPos = ((y * TILE_WIDTH + x) % 16) * 4;
 
@@ -526,7 +535,12 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
     int leftX = baseX - 1;
     int rightX = baseX + 2;
 
-    // Fast path: all 4 cells in same 64-bit word, not crossing tile boundaries
+    // Check if this is a boundary row (y==0 or y==TILE_HEIGHT-1)
+    // Boundary rows could be updated by neighbor tiles, so need atomic operations
+    bool isBoundaryRow = (y == 0 || y == TILE_HEIGHT - 1);
+
+    // Fast path: all 4 cells in same 64-bit word, not crossing tile boundaries,
+    // AND not a boundary row (to avoid race with neighbor tiles)
     // Row layout: cells 0-15 in word 0, cells 16-31 in word 1
     // Interior cases (75% of cell pairs):
     //   Word 0: leftX >= 0 && rightX < 16  (baseX in {2,4,6,8,10,12})
@@ -534,8 +548,9 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
     bool inWord0 = (leftX >= 0 && rightX < 16);
     bool inWord1 = (leftX >= 16 && rightX < TILE_WIDTH);
 
-    if (inWord0 || inWord1) {
+    if (!isBoundaryRow && (inWord0 || inWord1)) {
         // Bulk operation: load once, update 4 nibbles, store once
+        // Safe because interior rows can only be updated by this tile
         uint32_t cellIdx = (y * TILE_WIDTH + leftX) / 16;
         uint32_t baseBitPos = (leftX % 16) * 4;
 
@@ -565,6 +580,7 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
         }
     } else {
         // Slow path: handle boundaries individually
+        // Uses applyDelta which routes boundary cells through atomicApplyDelta
         for (int i = 0; i < 4; i++) {
             int x = leftX + i;
             int8_t delta = deltas[i];

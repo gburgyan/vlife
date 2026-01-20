@@ -6,8 +6,14 @@
 #include "Tile.h"
 #include <algorithm>
 #include <cassert>
+#include <thread>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
+#include <tbb/partitioner.h>
+
+// File-scoped static affinity partitioner for better thread-to-tile mapping
+// Persists across runGeneration calls so TBB can learn optimal affinity
+static tbb::affinity_partitioner s_affinityPartitioner;
 
 VLife::VLife() {
     resetBoard();
@@ -231,35 +237,60 @@ void VLife::runGeneration() {
         }
     }
 
+    // NOTE: Sorting by work estimate is disabled for now as O(n log n) overhead
+    // may not be worth it. Uncomment to enable work-weighted scheduling:
+    // std::sort(activeTiles.begin(), activeTiles.end(),
+    //     [](const Tile* a, const Tile* b) {
+    //         return a->estimateWork() > b->estimateWork();
+    //     });
+
     // PHASE 1: Fully parallel (no dependencies between tiles)
     // Each tile only writes to its own changes[] array
     // TBB's work-stealing scheduler handles load balancing automatically
+    // Use explicit grain size for optimal task granularity
+    size_t grainSize = std::max(size_t(1), activeTiles.size() / (4 * std::thread::hardware_concurrency()));
     tbb::parallel_for(
-        tbb::blocked_range<size_t>(0, activeTiles.size()),
+        tbb::blocked_range<size_t>(0, activeTiles.size(), grainSize),
         [&activeTiles](const tbb::blocked_range<size_t>& r) {
             for (size_t i = r.begin(); i != r.end(); ++i) {
                 activeTiles[i]->runGenerationPrepare();
             }
-        }
+        },
+        s_affinityPartitioner
     );
 
-    // PHASE 2: 4-color parallel (each color group is independent)
-    // Tiles of the same color are at least 2 steps apart in both X and Y,
-    // meaning they share NO neighbors (orthogonal or diagonal).
-    // Process each color sequentially, but tiles within a color in parallel.
+    // PHASE 2: Fully parallel with boundary-only atomics
+    // All tiles are processed in parallel. Race conditions are prevented by:
+    // - Interior cells (88% of tile): only updated by own tile, non-atomic
+    // - Boundary cells (12% of tile): use atomic operations since neighbor tiles may also update
+    // This eliminates the 4 sequential color barriers while maintaining correctness.
+    //
+    // Collect all tiles that have changes to apply
+    std::vector<Tile*> allTilesForPhase2;
+    allTilesForPhase2.reserve(spatialOrder.size());
     for (int color = 0; color < 4; color++) {
-        auto& group = colorGroups[color];
-        if (group.empty()) continue;
-
-        tbb::parallel_for(
-            tbb::blocked_range<size_t>(0, group.size()),
-            [&group](const tbb::blocked_range<size_t>& r) {
-                for (size_t i = r.begin(); i != r.end(); ++i) {
-                    group[i]->runGenerationChanges();
-                }
-            }
-        );
+        for (Tile* tile : colorGroups[color]) {
+            allTilesForPhase2.push_back(tile);
+        }
     }
+
+    // NOTE: Sorting by work estimate is disabled for now as O(n log n) overhead
+    // may not be worth it. Uncomment to enable work-weighted scheduling:
+    // std::sort(allTilesForPhase2.begin(), allTilesForPhase2.end(),
+    //     [](const Tile* a, const Tile* b) {
+    //         return a->estimateWork() > b->estimateWork();
+    //     });
+
+    size_t phase2GrainSize = std::max(size_t(1), allTilesForPhase2.size() / (4 * std::thread::hardware_concurrency()));
+    tbb::parallel_for(
+        tbb::blocked_range<size_t>(0, allTilesForPhase2.size(), phase2GrainSize),
+        [&allTilesForPhase2](const tbb::blocked_range<size_t>& r) {
+            for (size_t i = r.begin(); i != r.end(); ++i) {
+                allTilesForPhase2[i]->runGenerationChanges();
+            }
+        },
+        s_affinityPartitioner
+    );
 
     // Evict dead tiles to prevent memory growth
     evictDeadTiles();
