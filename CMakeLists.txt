@@ -146,6 +146,39 @@ add_custom_target(run_benchmark_quick
     DEPENDS VLifeBenchmark
 )
 
+# Extended benchmark executable (comprehensive publication-quality benchmarks)
+add_executable(
+        VLifeExtendedBenchmark
+        tests/benchmark/ExtendedBenchmark.cpp
+)
+
+target_link_libraries(
+        VLifeExtendedBenchmark
+        PRIVATE
+        GameOfLifeLib
+)
+
+target_include_directories(VLifeExtendedBenchmark PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# Add custom targets for extended benchmarks
+add_custom_target(run_extended_benchmark
+    COMMAND VLifeExtendedBenchmark
+    DEPENDS VLifeExtendedBenchmark
+)
+
+add_custom_target(run_density_sweep
+    COMMAND VLifeExtendedBenchmark --density
+    DEPENDS VLifeExtendedBenchmark
+)
+
+add_custom_target(run_activity_test
+    COMMAND VLifeExtendedBenchmark --activity
+    DEPENDS VLifeExtendedBenchmark
+)
+
 # Add test-related messages
 message(STATUS "Tests configured. Build 'run_tests' target to execute tests.")
 message(STATUS "Benchmark configured. Build 'run_benchmark' or 'run_benchmark_quick' targets.")
+message(STATUS "Extended benchmarks: 'run_extended_benchmark', 'run_density_sweep', 'run_activity_test'.")
