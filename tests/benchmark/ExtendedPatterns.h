@@ -8,6 +8,7 @@
 #include "../../src/vlife/VLife.h"
 #include <random>
 #include <cmath>
+#include <cstring>
 
 namespace ExtendedPatterns {
 
