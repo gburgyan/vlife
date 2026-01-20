@@ -1,18 +1,14 @@
 // GameOfLife.cpp - Implementation file for Game of Life library
 
-#include "GameOfLife.h"
+#include "SimpleGameOfLife.h"
 #include <algorithm>
 #include <unordered_set>
 
-GameOfLife::GameOfLife() {
-    resetBoard();
-}
+SimpleGameOfLife::SimpleGameOfLife() { resetBoard(); }
 
-void GameOfLife::resetBoard() {
-    cells.clear();
-}
+void SimpleGameOfLife::resetBoard() { cells.clear(); }
 
-GameOfLife::CellState GameOfLife::getCell(uint32_t x, uint32_t y) const {
+SimpleGameOfLife::CellState SimpleGameOfLife::getCell(uint32_t x, uint32_t y) const {
     CellCoord coord{x, y};
     auto it = cells.find(coord);
     if (it != cells.end()) {
@@ -21,7 +17,7 @@ GameOfLife::CellState GameOfLife::getCell(uint32_t x, uint32_t y) const {
     return CellState::DEAD;
 }
 
-void GameOfLife::setCell(uint32_t x, uint32_t y, CellState state) {
+void SimpleGameOfLife::setCell(uint32_t x, uint32_t y, CellState state) {
     CellCoord coord{x, y};
     if (state == CellState::ALIVE) {
         cells[coord] = state;
@@ -31,25 +27,26 @@ void GameOfLife::setCell(uint32_t x, uint32_t y, CellState state) {
     }
 }
 
-std::vector<GameOfLife::CellState> GameOfLife::getCells(uint32_t startX, uint32_t startY, uint32_t width, uint32_t height) const {
+std::vector<SimpleGameOfLife::CellState> SimpleGameOfLife::getCells(uint32_t startX, uint32_t startY, uint32_t width,
+                                                                    uint32_t height) const {
     std::vector<CellState> result(width * height, CellState::DEAD);
-    
+
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
             result[y * width + x] = getCell(startX + x, startY + y);
         }
     }
-    
+
     return result;
 }
 
-void GameOfLife::setCells(uint32_t offsetX, uint32_t offsetY, uint32_t width, uint32_t height, 
-                           const std::vector<CellState>& cellsData) {
+void SimpleGameOfLife::setCells(uint32_t offsetX, uint32_t offsetY, uint32_t width, uint32_t height,
+                                const std::vector<CellState> &cellsData) {
     if (cellsData.size() != width * height) {
         // Handle error: size mismatch
         return;
     }
-    
+
     for (uint32_t y = 0; y < height; ++y) {
         for (uint32_t x = 0; x < width; ++x) {
             setCell(offsetX + x, offsetY + y, cellsData[y * width + x]);
@@ -57,31 +54,32 @@ void GameOfLife::setCells(uint32_t offsetX, uint32_t offsetY, uint32_t width, ui
     }
 }
 
-int GameOfLife::countLiveNeighbors(uint32_t x, uint32_t y) const {
+int SimpleGameOfLife::countLiveNeighbors(uint32_t x, uint32_t y) const {
     int count = 0;
-    
+
     // Check all 8 neighboring cells
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             // Skip the center cell itself
-            if (dx == 0 && dy == 0) continue;
-            
+            if (dx == 0 && dy == 0)
+                continue;
+
             // Handle edge cases with wraparound (due to uint32_t)
             uint32_t nx = (x + dx) & 0xFFFFFFFF;
             uint32_t ny = (y + dy) & 0xFFFFFFFF;
-            
+
             if (getCell(nx, ny) == CellState::ALIVE) {
                 count++;
             }
         }
     }
-    
+
     return count;
 }
 
-GameOfLife::CellState GameOfLife::getNextCellState(uint32_t x, uint32_t y, CellState currentState) const {
+SimpleGameOfLife::CellState SimpleGameOfLife::getNextCellState(uint32_t x, uint32_t y, CellState currentState) const {
     int liveNeighbors = countLiveNeighbors(x, y);
-    
+
     // Apply Conway's Game of Life rules
     if (currentState == CellState::ALIVE) {
         // Any live cell with fewer than two live neighbors dies (underpopulation)
@@ -100,46 +98,47 @@ GameOfLife::CellState GameOfLife::getNextCellState(uint32_t x, uint32_t y, CellS
     }
 }
 
-void GameOfLife::runGeneration() {
+void SimpleGameOfLife::runGeneration() {
     // Since we only store live cells, we need to consider all cells that might become alive
     // This includes all current live cells and their neighbors
     std::unordered_set<CellCoord, CellCoordHash> cellsToCheck;
-    
+
     // Add all currently live cells
-    for (const auto& cell : cells) {
+    for (const auto &cell: cells) {
         CellCoord coord = cell.first;
         cellsToCheck.insert(coord);
-        
+
         // Add all neighbors
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
-                if (dx == 0 && dy == 0) continue;
-                
+                if (dx == 0 && dy == 0)
+                    continue;
+
                 uint32_t nx = (coord.x + dx) & 0xFFFFFFFF;
                 uint32_t ny = (coord.y + dy) & 0xFFFFFFFF;
-                
+
                 cellsToCheck.insert({nx, ny});
             }
         }
     }
-    
+
     // Calculate the next state
     std::unordered_map<CellCoord, CellState, CellCoordHash> nextGeneration;
-    
-    for (const auto& coord : cellsToCheck) {
+
+    for (const auto &coord: cellsToCheck) {
         CellState currentState = getCell(coord.x, coord.y);
         CellState nextState = getNextCellState(coord.x, coord.y, currentState);
-        
+
         if (nextState == CellState::ALIVE) {
             nextGeneration[coord] = nextState;
         }
     }
-    
+
     // Update the state
     cells = std::move(nextGeneration);
 }
 
-void GameOfLife::runGenerations(uint32_t count) {
+void SimpleGameOfLife::runGenerations(uint32_t count) {
     for (uint32_t i = 0; i < count; ++i) {
         runGeneration();
     }
