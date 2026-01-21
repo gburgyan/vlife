@@ -10,23 +10,14 @@ set(CMAKE_AUTOUIC ON)
 # Enable testing
 enable_testing()
 
-# AVX-512 optimization option
-option(ENABLE_AVX512 "Enable AVX-512 optimizations (uses SIMDE for emulation on non-x86)" OFF)
+# AVX-512 optimization options
+option(ENABLE_AVX512 "Enable AVX-512 optimizations (uses SIMDE for portable emulation)" OFF)
+option(AVX512_NATIVE "Use native AVX-512 intrinsics (requires CPU with AVX-512 support)" OFF)
 
 if(ENABLE_AVX512)
     message(STATUS "AVX-512 optimizations enabled")
 
-    # Check if we're on x86_64 with native AVX-512 support
-    include(CheckCXXCompilerFlag)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-        check_cxx_compiler_flag("-mavx512f -mavx512bw" COMPILER_SUPPORTS_AVX512)
-        if(COMPILER_SUPPORTS_AVX512)
-            message(STATUS "Native AVX-512 support detected")
-            set(AVX512_NATIVE ON)
-        endif()
-    endif()
-
-    # Fetch SIMDE for portable AVX-512 emulation (always available for correctness testing)
+    # Fetch SIMDE for portable AVX-512 emulation
     include(FetchContent)
     FetchContent_Declare(
         simde
@@ -35,6 +26,16 @@ if(ENABLE_AVX512)
     )
     FetchContent_MakeAvailable(simde)
     message(STATUS "SIMDE fetched for AVX-512 emulation support")
+
+    if(AVX512_NATIVE)
+        # User explicitly requested native AVX-512 - verify compiler support
+        include(CheckCXXCompilerFlag)
+        check_cxx_compiler_flag("-mavx512f -mavx512bw" COMPILER_SUPPORTS_AVX512)
+        if(NOT COMPILER_SUPPORTS_AVX512)
+            message(FATAL_ERROR "AVX512_NATIVE requested but compiler doesn't support AVX-512 flags")
+        endif()
+        message(STATUS "Native AVX-512 mode enabled - binary will require AVX-512 capable CPU")
+    endif()
 endif()
 
 # Try to find Qt via Homebrew

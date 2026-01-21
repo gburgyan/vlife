@@ -7,27 +7,24 @@ on:
     branches: [ main ]
 
 jobs:
-  test-avx512:
+  # Test with AVX-512 code path using SIMDE emulation (portable, works on any CPU)
+  test-avx512-simde:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Verify AVX-512 support
-        run: |
-          echo "Checking CPU capabilities..."
-          lscpu | grep -i avx || echo "AVX info not found via lscpu"
-          cat /proc/cpuinfo | grep -o 'avx512[a-z]*' | sort -u || echo "No AVX-512 flags found"
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake g++ libtbb-dev qtbase5-dev
 
-      - name: Configure with AVX-512 enabled
+      - name: Configure with AVX-512 via SIMDE
         run: |
           mkdir build
           cd build
+          # ENABLE_AVX512=ON uses SIMDE for portable emulation
+          # AVX512_NATIVE=OFF (default) ensures no native AVX-512 instructions
           cmake -DENABLE_AVX512=ON -DCMAKE_BUILD_TYPE=Release ..
 
       - name: Build
@@ -45,7 +42,7 @@ jobs:
           cd build
           ./VLifeBenchmark --quick || echo "Quick benchmark completed"
 
-  # Also test without AVX-512 to ensure scalar path still works
+  # Test without AVX-512 to ensure scalar/NEON paths work
   test-scalar:
     runs-on: ubuntu-latest
 
@@ -62,35 +59,6 @@ jobs:
           mkdir build
           cd build
           cmake -DENABLE_AVX512=OFF -DCMAKE_BUILD_TYPE=Release ..
-
-      - name: Build
-        run: |
-          cd build
-          make -j$(nproc)
-
-      - name: Run unit tests
-        run: |
-          cd build
-          ctest --output-on-failure
-
-  # Test SIMDE emulation mode (for correctness verification)
-  test-simde-emulation:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake g++ libtbb-dev qtbase5-dev
-
-      - name: Configure with AVX-512 via SIMDE
-        run: |
-          mkdir build
-          cd build
-          # Force SIMDE emulation even on x86 by not passing native flags
-          cmake -DENABLE_AVX512=ON -DCMAKE_BUILD_TYPE=Debug ..
 
       - name: Build
         run: |

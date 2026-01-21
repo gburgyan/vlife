@@ -113,12 +113,21 @@ The standard implementation uses a 256-entry lookup table (LUT) to determine whi
 
 ### Build Configuration
 
-Enable with `-DENABLE_AVX512=ON`:
+Two CMake options control AVX-512:
 
-- **On x86_64 with AVX-512 support**: Uses native AVX-512 intrinsics (`-mavx512f -mavx512bw -mavx512vl`)
-- **On other platforms (Apple Silicon, older x86)**: Uses [SIMDE](https://github.com/simd-everywhere/simde) for portable emulation
+- **`-DENABLE_AVX512=ON`**: Enables AVX-512 code path using [SIMDE](https://github.com/simd-everywhere/simde) for portable emulation. Works on any CPU (x86, ARM, etc.) and is safe for CI/testing.
 
-Runtime dispatch automatically selects the appropriate code path based on CPU capabilities.
+- **`-DAVX512_NATIVE=ON`**: (Requires `ENABLE_AVX512=ON`) Uses native AVX-512 intrinsics instead of SIMDE. The resulting binary **requires** a CPU with AVX-512 support (Intel Ice Lake+, AMD Zen 4+). Use this only when targeting known AVX-512 hardware.
+
+```bash
+# Portable build (SIMDE emulation, works everywhere)
+cmake -DENABLE_AVX512=ON ..
+
+# Native AVX-512 build (requires AVX-512 CPU at runtime)
+cmake -DENABLE_AVX512=ON -DAVX512_NATIVE=ON ..
+```
+
+Runtime dispatch automatically selects the appropriate code path based on CPU capabilities when using SIMDE mode.
 
 ### Key Files
 
