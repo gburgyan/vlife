@@ -810,11 +810,10 @@ TEST_F(TileEdgeTest, LongLineSpanningThreeTiles) {
 // Category 7: Parallel Processing Safety (2 tests)
 // =============================================================================
 
-// Multiple gliders at color-0 tile boundaries (maximum parallel contention)
+// Multiple gliders at tile boundaries (maximum parallel contention)
 TEST_F(TileEdgeTest, ManyGlidersAtBoundaries_ParallelSafety) {
     // Place gliders at boundary positions that will maximize parallel contention
-    // Color-0 tiles are at (even, even) positions: (0,0), (2,0), (0,2), (2,2), etc.
-    // These are all processed in parallel and share neighbor tiles
+    // Multiple tiles are processed in parallel and share neighbor tiles
 
     // Gliders crossing from (0,0) to (1,0)
     setupGlider(TILE_WIDTH - 4, 5);

@@ -675,13 +675,13 @@ TEST_F(VLifeTest, GliderCrossingCornerBoundary) {
 }
 
 // Test multiple gliders crossing different boundaries simultaneously
-// This is most likely to trigger the race condition because multiple tiles
-// in the same color group will be updating shared neighbor tiles
+// This is most likely to trigger race conditions because multiple tiles
+// will be updating shared neighbor tiles in parallel
 TEST_F(VLifeTest, MultipleGlidersCrossingSimultaneously) {
     // Place gliders near boundaries that will cause maximum contention:
     // - Glider at (TILE_WIDTH-4, 10) crosses right from tile (0,0) to (1,0)
     // - Glider at (TILE_WIDTH*2-4, 10) crosses right from tile (1,0) to (2,0)
-    // Tiles (0,0) and (2,0) are both color 0 and will be processed in parallel
+    // Tiles (0,0) and (2,0) will be processed in parallel
 
     setupGlider(*vlife, TILE_WIDTH - 4, 10);      // Crosses from tile 0,0 to 1,0
     setupGlider(*vlife, TILE_WIDTH * 2 - 4, 10);  // Crosses from tile 1,0 to 2,0

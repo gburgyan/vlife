@@ -105,29 +105,10 @@ private:
     // can proceed concurrently, while writes (tile creation) require exclusive access
     mutable std::shared_mutex tilesMutex;
 
-    // Spatial ordering for cache-friendly iteration
-    std::vector<Tile*> spatialOrder;
-    bool spatialOrderDirty = true;
-
-    // 4-color scheme for parallel processing: tiles colored by (tileX % 2, tileY % 2)
-    // Color 0: (even X, even Y), Color 1: (odd X, even Y)
-    // Color 2: (even X, odd Y),  Color 3: (odd X, odd Y)
-    // Tiles of the same color are at least 2 steps apart, so they share no neighbors
-    std::vector<Tile*> colorGroups[4];
     bool parallelEnabled = true;
     // Buffered boundary optimization - accumulates deltas locally then applies them
     // in batch at the end of runGenerationChanges(). Reduces redundant tile lookups.
     bool bufferedBoundaryEnabled = true;
-
-    // Rebuild the spatial order vector
-    void rebuildSpatialOrder();
-
-    // Compute color index for a tile based on its coordinates
-    // Color 0: (even X, even Y), Color 1: (odd X, even Y)
-    // Color 2: (even X, odd Y),  Color 3: (odd X, odd Y)
-    static int computeColorIndex(int32_t tileX, int32_t tileY) {
-        return (tileX & 1) + ((tileY & 1) << 1);
-    }
 
     // Sequential implementation (fallback for small tile counts)
     void runGenerationSequential();

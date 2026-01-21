@@ -48,9 +48,6 @@ class alignas(64) Tile {
     // Tiles must remain inactive for TILE_COOLDOWN_GENERATIONS before being evicted
     size_t cooldownCounter{TILE_COOLDOWN_GENERATIONS};
 
-    // Index of this tile within its color group vector (for O(1) swap-and-pop removal)
-    size_t colorGroupIndex{0};
-
     std::mutex tileMutex;
 
 public:
@@ -95,7 +92,7 @@ public:
 
     // Atomic versions for cross-tile updates (thread-safe for parallel processing)
     // These use compare-and-swap to safely update neighbor counts when
-    // multiple tiles of the same color are processed in parallel
+    // multiple tiles are processed in parallel
     void atomicApplyDelta(int x, int y, int8_t delta);
     void atomicApplyVerticalDeltas(int baseX, int y, const int8_t* deltas);
 
@@ -162,10 +159,6 @@ public:
         }
         return --cooldownCounter == 0;  // Evict when counter reaches 0
     }
-
-    // Color group index accessors for O(1) swap-and-pop removal
-    void setColorGroupIndex(size_t idx) { colorGroupIndex = idx; }
-    size_t getColorGroupIndex() const { return colorGroupIndex; }
 
     // Friend declarations to allow access to private members
     friend class VLife;

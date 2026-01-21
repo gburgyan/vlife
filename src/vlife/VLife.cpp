@@ -29,11 +29,6 @@ VLife::~VLife() {
 void VLife::resetBoard() {
     // Clear all existing tiles
     tiles.clear();
-    spatialOrder.clear();
-    for (int i = 0; i < 4; i++) {
-        colorGroups[i].clear();
-    }
-    spatialOrderDirty = true;
 }
 
 Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
@@ -61,16 +56,9 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
     auto newTile = std::make_unique<Tile>(this, tileX, tileY);
     Tile *tilePtr = newTile.get();
     tiles[coord] = std::move(newTile);
-    spatialOrderDirty = true;
-
-    // Add to color group for parallel processing (O(1) insertion)
-    int colorIdx = computeColorIndex(tileX, tileY);
-    tilePtr->setColorGroupIndex(colorGroups[colorIdx].size());
-    colorGroups[colorIdx].push_back(tilePtr);
 
     // Connect to neighboring tiles if they exist (already under exclusive lock)
     // We link all 8 neighbors (orthogonal and diagonal) here.
-    // The 4-color parallel scheme ensures same-color tiles don't share neighbors.
 
     // Check left (-1, 0)
     auto leftIt = tiles.find(TileCoord{tileX - 1, tileY});
@@ -198,9 +186,9 @@ void VLife::setCells(uint32_t offsetX, uint32_t offsetY, uint32_t width, uint32_
 }
 
 void VLife::runGenerationSequential() {
-    // First pass: prepare all tiles for the generation (in spatial order)
+    // First pass: prepare all tiles for the generation
     // Tile-level skip optimization: skip tiles with no activity
-    for (Tile* tile : spatialOrder) {
+    for (auto& [coord, tile] : tiles) {
         // Only process tiles that have potential activity
         // A tile with activityMask == 0 has no live cells and no neighbor counts,
         // so it cannot produce any changes
@@ -209,40 +197,35 @@ void VLife::runGenerationSequential() {
         }
     }
 
-    // Second pass: apply the changes (in spatial order)
-    for (Tile* tile : spatialOrder) {
+    // Second pass: apply the changes
+    for (auto& [coord, tile] : tiles) {
         tile->runGenerationChanges();
     }
 }
 
 void VLife::runGeneration() {
-    // Rebuild spatial order if needed
-    if (spatialOrderDirty) {
-        rebuildSpatialOrder();
-    }
-
     // Fall back to sequential for small tile counts or when parallel is disabled
-    if (!parallelEnabled || spatialOrder.size() < 10) {
+    if (!parallelEnabled || tiles.size() < 10) {
         runGenerationSequential();
         evictDeadTiles();
         return;
     }
 
+    // Build vector of all tiles for parallel iteration
+    std::vector<Tile*> allTiles;
+    allTiles.reserve(tiles.size());
+    for (auto& [coord, tile] : tiles) {
+        allTiles.push_back(tile.get());
+    }
+
     // Collect active tiles for Phase 1
     std::vector<Tile*> activeTiles;
-    activeTiles.reserve(spatialOrder.size());
-    for (Tile* tile : spatialOrder) {
+    activeTiles.reserve(tiles.size());
+    for (Tile* tile : allTiles) {
         if (tile->hasActivity()) {
             activeTiles.push_back(tile);
         }
     }
-
-    // NOTE: Sorting by work estimate is disabled for now as O(n log n) overhead
-    // may not be worth it. Uncomment to enable work-weighted scheduling:
-    // std::sort(activeTiles.begin(), activeTiles.end(),
-    //     [](const Tile* a, const Tile* b) {
-    //         return a->estimateWork() > b->estimateWork();
-    //     });
 
     // PHASE 1: Fully parallel (no dependencies between tiles)
     // Each tile only writes to its own changes[] array
@@ -263,30 +246,12 @@ void VLife::runGeneration() {
     // All tiles are processed in parallel. Race conditions are prevented by:
     // - Interior cells (88% of tile): only updated by own tile, non-atomic
     // - Boundary cells (12% of tile): use atomic operations since neighbor tiles may also update
-    // This eliminates the 4 sequential color barriers while maintaining correctness.
-    //
-    // Collect all tiles that have changes to apply
-    std::vector<Tile*> allTilesForPhase2;
-    allTilesForPhase2.reserve(spatialOrder.size());
-    for (int color = 0; color < 4; color++) {
-        for (Tile* tile : colorGroups[color]) {
-            allTilesForPhase2.push_back(tile);
-        }
-    }
-
-    // NOTE: Sorting by work estimate is disabled for now as O(n log n) overhead
-    // may not be worth it. Uncomment to enable work-weighted scheduling:
-    // std::sort(allTilesForPhase2.begin(), allTilesForPhase2.end(),
-    //     [](const Tile* a, const Tile* b) {
-    //         return a->estimateWork() > b->estimateWork();
-    //     });
-
-    size_t phase2GrainSize = std::max(size_t(1), allTilesForPhase2.size() / (4 * std::thread::hardware_concurrency()));
+    size_t phase2GrainSize = std::max(size_t(1), allTiles.size() / (4 * std::thread::hardware_concurrency()));
     tbb::parallel_for(
-        tbb::blocked_range<size_t>(0, allTilesForPhase2.size(), phase2GrainSize),
-        [&allTilesForPhase2](const tbb::blocked_range<size_t>& r) {
+        tbb::blocked_range<size_t>(0, allTiles.size(), phase2GrainSize),
+        [&allTiles](const tbb::blocked_range<size_t>& r) {
             for (size_t i = r.begin(); i != r.end(); ++i) {
-                allTilesForPhase2[i]->runGenerationChanges();
+                allTiles[i]->runGenerationChanges();
             }
         },
         s_affinityPartitioner
@@ -312,19 +277,6 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
     }
 
     Tile *tile = it->second.get();
-
-    // Remove from color group using swap-and-pop (O(1) removal)
-    int colorIdx = computeColorIndex(tileX, tileY);
-    size_t tileIndex = tile->getColorGroupIndex();
-    auto& group = colorGroups[colorIdx];
-
-    if (tileIndex < group.size() - 1) {
-        // Swap with last element
-        Tile* lastTile = group.back();
-        group[tileIndex] = lastTile;
-        lastTile->setColorGroupIndex(tileIndex);
-    }
-    group.pop_back();
 
     // Unlink from neighbors
     if (tile->left) {
@@ -356,26 +308,6 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
 
     // Remove the tile from the map
     tiles.erase(it);
-    spatialOrderDirty = true;
-}
-
-void VLife::rebuildSpatialOrder() {
-    spatialOrder.clear();
-    spatialOrder.reserve(tiles.size());
-
-    for (auto& [coord, tile] : tiles) {
-        spatialOrder.push_back(tile.get());
-    }
-
-    // Sort tiles by row-major order (y first, then x) for cache-friendly iteration
-    std::sort(spatialOrder.begin(), spatialOrder.end(),
-        [](const Tile* a, const Tile* b) {
-            int64_t aKey = (static_cast<int64_t>(a->getTileY()) << 32) | (a->getTileX() & 0xFFFFFFFF);
-            int64_t bKey = (static_cast<int64_t>(b->getTileY()) << 32) | (b->getTileX() & 0xFFFFFFFF);
-            return aKey < bKey;
-        });
-
-    spatialOrderDirty = false;
 }
 
 void VLife::evictDeadTiles() {
