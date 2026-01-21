@@ -4,6 +4,7 @@
 
 #include "VLife.h"
 #include "Tile.h"
+#include "VLifeMetrics.h"
 #include <algorithm>
 #include <cassert>
 #include <thread>
@@ -186,6 +187,11 @@ void VLife::setCells(uint32_t offsetX, uint32_t offsetY, uint32_t width, uint32_
 }
 
 void VLife::runGenerationSequential() {
+#ifdef VLIFE_METRICS_ENABLED
+    auto metricsTimerStart = std::chrono::high_resolution_clock::now();
+    size_t activeTilesCount = 0;
+#endif
+
     // First pass: prepare all tiles for the generation
     // Tile-level skip optimization: skip tiles with no activity
     for (auto& [coord, tile] : tiles) {
@@ -194,20 +200,70 @@ void VLife::runGenerationSequential() {
         // so it cannot produce any changes
         if (tile->hasActivity()) {
             tile->runGenerationPrepare();
+#ifdef VLIFE_METRICS_ENABLED
+            activeTilesCount++;
+            VLIFE_METRICS_ADD_ACTIVE_WORDS(tile->getActiveWordCount());
+#endif
         }
     }
+
+#ifdef VLIFE_METRICS_ENABLED
+    auto phase1End = std::chrono::high_resolution_clock::now();
+    uint64_t phase1Time = std::chrono::duration_cast<std::chrono::microseconds>(phase1End - metricsTimerStart).count();
+    if (metricsCollector) {
+        VLIFE_METRICS_MERGE_TL(*metricsCollector);
+        VLIFE_METRICS_END_PHASE1(*metricsCollector, activeTilesCount, phase1Time);
+    }
+    auto phase2Start = std::chrono::high_resolution_clock::now();
+#endif
 
     // Second pass: apply the changes
     for (auto& [coord, tile] : tiles) {
         tile->runGenerationChanges();
     }
+
+#ifdef VLIFE_METRICS_ENABLED
+    auto phase2End = std::chrono::high_resolution_clock::now();
+    uint64_t phase2Time = std::chrono::duration_cast<std::chrono::microseconds>(phase2End - phase2Start).count();
+    if (metricsCollector) {
+        VLIFE_METRICS_MERGE_TL(*metricsCollector);
+        VLIFE_METRICS_END_PHASE2(*metricsCollector, tiles.size(), phase2Time);
+    }
+#endif
 }
 
 void VLife::runGeneration() {
+#ifdef VLIFE_METRICS_ENABLED
+    auto genStartTime = std::chrono::high_resolution_clock::now();
+    size_t initialTileCount = tiles.size();
+    if (metricsCollector) {
+        VLIFE_METRICS_BEGIN_GEN(*metricsCollector, generationNumber, initialTileCount);
+    }
+#endif
+
     // Fall back to sequential for small tile counts or when parallel is disabled
     if (!parallelEnabled || tiles.size() < 10) {
         runGenerationSequential();
+
+#ifdef VLIFE_METRICS_ENABLED
+        size_t tilesCreated = tiles.size() > initialTileCount ? tiles.size() - initialTileCount : 0;
+        size_t preEvictCount = tiles.size();
+#endif
+
         evictDeadTiles();
+
+#ifdef VLIFE_METRICS_ENABLED
+        size_t tilesEvicted = preEvictCount > tiles.size() ? preEvictCount - tiles.size() : 0;
+        auto genEndTime = std::chrono::high_resolution_clock::now();
+        uint64_t totalTime = std::chrono::duration_cast<std::chrono::microseconds>(genEndTime - genStartTime).count();
+        if (metricsCollector) {
+            int32_t minX, maxX, minY, maxY;
+            getBoardExtent(minX, maxX, minY, maxY);
+            VLIFE_METRICS_END_GEN(*metricsCollector, getTotalLiveCells(), tiles.size(),
+                                   minX, maxX, minY, maxY, totalTime, tilesCreated, tilesEvicted);
+        }
+        generationNumber++;
+#endif
         return;
     }
 
@@ -227,6 +283,17 @@ void VLife::runGeneration() {
         }
     }
 
+#ifdef VLIFE_METRICS_ENABLED
+    // Accumulate active words before parallel phase
+    for (Tile* tile : activeTiles) {
+        VLIFE_METRICS_ADD_ACTIVE_WORDS(tile->getActiveWordCount());
+    }
+    if (metricsCollector) {
+        VLIFE_METRICS_MERGE_TL(*metricsCollector);
+    }
+    auto phase1Start = std::chrono::high_resolution_clock::now();
+#endif
+
     // PHASE 1: Fully parallel (no dependencies between tiles)
     // Each tile only writes to its own changes[] array
     // TBB's work-stealing scheduler handles load balancing automatically
@@ -241,6 +308,15 @@ void VLife::runGeneration() {
         },
         s_affinityPartitioner
     );
+
+#ifdef VLIFE_METRICS_ENABLED
+    auto phase1End = std::chrono::high_resolution_clock::now();
+    uint64_t phase1Time = std::chrono::duration_cast<std::chrono::microseconds>(phase1End - phase1Start).count();
+    if (metricsCollector) {
+        VLIFE_METRICS_END_PHASE1(*metricsCollector, activeTiles.size(), phase1Time);
+    }
+    auto phase2Start = std::chrono::high_resolution_clock::now();
+#endif
 
     // PHASE 2: Fully parallel with boundary-only atomics
     // All tiles are processed in parallel. Race conditions are prevented by:
@@ -257,8 +333,31 @@ void VLife::runGeneration() {
         s_affinityPartitioner
     );
 
+#ifdef VLIFE_METRICS_ENABLED
+    auto phase2End = std::chrono::high_resolution_clock::now();
+    uint64_t phase2Time = std::chrono::duration_cast<std::chrono::microseconds>(phase2End - phase2Start).count();
+    size_t tilesCreated = tiles.size() > initialTileCount ? tiles.size() - initialTileCount : 0;
+    size_t preEvictCount = tiles.size();
+    if (metricsCollector) {
+        VLIFE_METRICS_END_PHASE2(*metricsCollector, allTiles.size(), phase2Time);
+    }
+#endif
+
     // Evict dead tiles to prevent memory growth
     evictDeadTiles();
+
+#ifdef VLIFE_METRICS_ENABLED
+    size_t tilesEvicted = preEvictCount > tiles.size() ? preEvictCount - tiles.size() : 0;
+    auto genEndTime = std::chrono::high_resolution_clock::now();
+    uint64_t totalTime = std::chrono::duration_cast<std::chrono::microseconds>(genEndTime - genStartTime).count();
+    if (metricsCollector) {
+        int32_t minX, maxX, minY, maxY;
+        getBoardExtent(minX, maxX, minY, maxY);
+        VLIFE_METRICS_END_GEN(*metricsCollector, getTotalLiveCells(), tiles.size(),
+                               minX, maxX, minY, maxY, totalTime, tilesCreated, tilesEvicted);
+    }
+    generationNumber++;
+#endif
 }
 
 void VLife::runGenerations(uint32_t count) {
@@ -470,5 +569,32 @@ void VLife::populateUpdateLUT() {
             // [3] (x+2): only left cell
             deltaLUT[idx].verticalRow[3] = leftDelta;
         }
+    }
+}
+
+uint64_t VLife::getTotalLiveCells() const {
+    uint64_t total = 0;
+    for (const auto& [coord, tile] : tiles) {
+        total += tile->getLiveCount();
+    }
+    return total;
+}
+
+void VLife::getBoardExtent(int32_t& minX, int32_t& maxX, int32_t& minY, int32_t& maxY) const {
+    if (tiles.empty()) {
+        minX = maxX = minY = maxY = 0;
+        return;
+    }
+
+    minX = INT32_MAX;
+    maxX = INT32_MIN;
+    minY = INT32_MAX;
+    maxY = INT32_MIN;
+
+    for (const auto& [coord, tile] : tiles) {
+        if (coord.x < minX) minX = coord.x;
+        if (coord.x > maxX) maxX = coord.x;
+        if (coord.y < minY) minY = coord.y;
+        if (coord.y > maxY) maxY = coord.y;
     }
 }

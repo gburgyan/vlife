@@ -14,6 +14,9 @@ enable_testing()
 option(ENABLE_AVX512 "Enable AVX-512 optimizations (uses SIMDE for portable emulation)" OFF)
 option(AVX512_NATIVE "Use native AVX-512 intrinsics (requires CPU with AVX-512 support)" OFF)
 
+# Metrics collection option
+option(ENABLE_METRICS "Enable optional metrics collection for research/analysis" OFF)
+
 if(ENABLE_AVX512)
     message(STATUS "AVX-512 optimizations enabled")
 
@@ -95,6 +98,8 @@ add_library(
         src/vlife/VLife.h
         src/vlife/Tile.cpp
         src/vlife/Tile.h
+        src/vlife/VLifeMetrics.cpp
+        src/vlife/VLifeMetrics.h
 )
 
 # Link threading library and TBB to GameOfLifeLib
@@ -115,6 +120,12 @@ if(ENABLE_AVX512)
         target_compile_definitions(GameOfLifeLib PRIVATE SIMDE_ENABLE_NATIVE_ALIASES)
         message(STATUS "GameOfLifeLib: Using SIMDE for AVX-512 emulation (correctness testing)")
     endif()
+endif()
+
+# Metrics collection configuration
+if(ENABLE_METRICS)
+    message(STATUS "Metrics collection enabled")
+    target_compile_definitions(GameOfLifeLib PUBLIC VLIFE_METRICS_ENABLED)
 endif()
 
 # Frontend application
@@ -222,6 +233,31 @@ add_custom_target(run_activity_test
     COMMAND VLifeExtendedBenchmark --activity
     DEPENDS VLifeExtendedBenchmark
 )
+
+# Metrics benchmark executable (requires ENABLE_METRICS=ON)
+if(ENABLE_METRICS)
+    add_executable(
+            VLifeMetricsBenchmark
+            tests/benchmark/MetricsBenchmark.cpp
+    )
+
+    target_link_libraries(
+            VLifeMetricsBenchmark
+            PRIVATE
+            GameOfLifeLib
+    )
+
+    target_include_directories(VLifeMetricsBenchmark PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+
+    add_custom_target(run_metrics_benchmark
+        COMMAND VLifeMetricsBenchmark
+        DEPENDS VLifeMetricsBenchmark
+    )
+
+    message(STATUS "Metrics benchmark: 'run_metrics_benchmark' target available.")
+endif()
 
 # Add test-related messages
 message(STATUS "Tests configured. Build 'run_tests' target to execute tests.")

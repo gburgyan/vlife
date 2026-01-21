@@ -14,6 +14,10 @@
 // Forward declaration
 class Tile;
 
+#ifdef VLIFE_METRICS_ENABLED
+class MetricsCollector;
+#endif
+
 // Packed deltas for neighbor count updates when cell pairs change
 // Used by the LUT-based optimization in runGenerationChanges
 struct PackedDeltas {
@@ -78,6 +82,18 @@ public:
     // Returns the current number of tiles
     size_t getTileCount() const { return tiles.size(); }
 
+    // Calculate total live cells across all tiles
+    uint64_t getTotalLiveCells() const;
+
+    // Get board extent (min/max tile coordinates)
+    void getBoardExtent(int32_t& minX, int32_t& maxX, int32_t& minY, int32_t& maxY) const;
+
+#ifdef VLIFE_METRICS_ENABLED
+    // Metrics collection support
+    void setMetricsCollector(MetricsCollector* collector) { metricsCollector = collector; }
+    MetricsCollector* getMetricsCollector() const { return metricsCollector; }
+#endif
+
 private:
     void populateRuleLUT();
     void populateUpdateLUT();
@@ -109,6 +125,13 @@ private:
     // Buffered boundary optimization - accumulates deltas locally then applies them
     // in batch at the end of runGenerationChanges(). Reduces redundant tile lookups.
     bool bufferedBoundaryEnabled = true;
+
+    // Generation counter for metrics
+    uint64_t generationNumber = 0;
+
+#ifdef VLIFE_METRICS_ENABLED
+    MetricsCollector* metricsCollector = nullptr;
+#endif
 
     // Sequential implementation (fallback for small tile counts)
     void runGenerationSequential();

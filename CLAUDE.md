@@ -156,3 +156,44 @@ On actual AVX-512 hardware, the optimization targets the `runGenerationPrepare` 
 - **Overall**: 1.5-2.5x speedup depending on grid density and activity patterns
 
 Note: AVX-512 can cause frequency throttling on some Intel CPUs, which may reduce net benefit.
+
+## Metrics Collection
+
+VLife includes an optional metrics collection system for research and analysis. When enabled, it collects detailed per-generation data to support activity-proportional complexity claims.
+
+### Quick Start
+
+```bash
+# Build with metrics enabled
+cmake -DENABLE_METRICS=ON ..
+make
+
+# Run metrics benchmark
+./VLifeMetricsBenchmark --pattern acorn --generations 5000 --output acorn_data
+```
+
+### Key Metrics
+
+- **k (state changes)**: Cells born + cells died per generation
+- **N (population)**: Total live cells
+- **Activity ratio (k/N)**: Typically 1-10% for most patterns
+- **Boundary crossings**: Cross-tile neighbor updates (~12% of cells)
+- **Timing breakdown**: Phase 1 (rule evaluation) and Phase 2 (neighbor updates)
+
+### Zero Overhead
+
+When `ENABLE_METRICS` is not set, all metrics macros compile to `((void)0)`, ensuring zero runtime overhead in release builds.
+
+### Key Files
+
+- `src/vlife/VLifeMetrics.h`: Metrics structures and zero-overhead macros
+- `src/vlife/VLifeMetrics.cpp`: MetricsCollector implementation with CSV/JSON export
+- `tests/benchmark/MetricsBenchmark.cpp`: Standalone metrics benchmark tool
+- `docs/METRICS.md`: Comprehensive documentation
+
+### Output Formats
+
+- **CSV**: Tabular data with one row per generation (for pandas/R analysis)
+- **JSON**: Structured data with metadata and summary statistics
+
+See `docs/METRICS.md` for complete documentation including file formats, analysis examples, and architecture details.

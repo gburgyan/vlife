@@ -36,6 +36,7 @@ class alignas(64) Tile {
 
     uint64_t cells[TILE_64S]{};
     uint64_t changes[TILE_CHANGE_64S]{};
+    uint64_t changesAccumulator{0};  // OR of all changeBuff values, for quick Phase 2 skip
     uint32_t liveCount; // Tracks the number of live cells in this tile
 
     // Activity tracking for hierarchical skip optimization
