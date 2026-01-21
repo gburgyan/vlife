@@ -651,6 +651,7 @@ static inline void accumulateVerticalDeltasToArrays(int8_t* deltaArray, int base
     }
 }
 
+template<bool UseAtomics>
 void Tile::runGenerationChanges() {
     // Tile-level short-circuit: skip if Phase 1 detected no changes
     if (changesAccumulator == 0) {
@@ -797,7 +798,11 @@ void Tile::runGenerationChanges() {
                     } else {
                         Tile* leftTile = ensureNeighborTile(-1, 0);
                         if (leftTile) {
-                            leftTile->atomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
+                            if constexpr (UseAtomics) {
+                                leftTile->atomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
+                            } else {
+                                leftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
+                            }
                         }
                     }
                 }
@@ -808,7 +813,11 @@ void Tile::runGenerationChanges() {
                     } else {
                         Tile* rightTile = ensureNeighborTile(1, 0);
                         if (rightTile) {
-                            rightTile->atomicApplyDelta(0, localY, deltas.sameRow[1]);
+                            if constexpr (UseAtomics) {
+                                rightTile->atomicApplyDelta(0, localY, deltas.sameRow[1]);
+                            } else {
+                                rightTile->nonAtomicApplyDelta(0, localY, deltas.sameRow[1]);
+                            }
                         }
                     }
                 }
@@ -843,7 +852,7 @@ void Tile::runGenerationChanges() {
                 }
             } else {
                 // Original path: apply all deltas immediately
-                applyDeltasForCellPair(baseX, localY, deltas);
+                applyDeltasForCellPair<UseAtomics>(baseX, localY, deltas);
             }
         }
     }
@@ -854,14 +863,22 @@ void Tile::runGenerationChanges() {
             Tile* upTile = ensureNeighborTile(0, -1);
             if (upTile) {
                 VLIFE_METRICS_INC_BOUNDARY();
-                upTile->atomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
+                if constexpr (UseAtomics) {
+                    upTile->atomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
+                } else {
+                    upTile->nonAtomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
+                }
             }
         }
         if (hasDownDeltas) {
             Tile* downTile = ensureNeighborTile(0, 1);
             if (downTile) {
                 VLIFE_METRICS_INC_BOUNDARY();
-                downTile->atomicAddBoundaryDeltas(0, downNeighborDeltas);
+                if constexpr (UseAtomics) {
+                    downTile->atomicAddBoundaryDeltas(0, downNeighborDeltas);
+                } else {
+                    downTile->nonAtomicAddBoundaryDeltas(0, downNeighborDeltas);
+                }
             }
         }
         // Handle corner deltas (diagonal neighbors)
@@ -870,33 +887,53 @@ void Tile::runGenerationChanges() {
                 Tile* upLeftTile = ensureNeighborTile(-1, -1);
                 if (upLeftTile) {
                     VLIFE_METRICS_INC_BOUNDARY();
-                    upLeftTile->atomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
+                    if constexpr (UseAtomics) {
+                        upLeftTile->atomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
+                    } else {
+                        upLeftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
+                    }
                 }
             }
             if (upRightCornerDelta != 0) {
                 Tile* upRightTile = ensureNeighborTile(1, -1);
                 if (upRightTile) {
                     VLIFE_METRICS_INC_BOUNDARY();
-                    upRightTile->atomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
+                    if constexpr (UseAtomics) {
+                        upRightTile->atomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
+                    } else {
+                        upRightTile->nonAtomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
+                    }
                 }
             }
             if (downLeftCornerDelta != 0) {
                 Tile* downLeftTile = ensureNeighborTile(-1, 1);
                 if (downLeftTile) {
                     VLIFE_METRICS_INC_BOUNDARY();
-                    downLeftTile->atomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
+                    if constexpr (UseAtomics) {
+                        downLeftTile->atomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
+                    } else {
+                        downLeftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
+                    }
                 }
             }
             if (downRightCornerDelta != 0) {
                 Tile* downRightTile = ensureNeighborTile(1, 1);
                 if (downRightTile) {
                     VLIFE_METRICS_INC_BOUNDARY();
-                    downRightTile->atomicApplyDelta(0, 0, downRightCornerDelta);
+                    if constexpr (UseAtomics) {
+                        downRightTile->atomicApplyDelta(0, 0, downRightCornerDelta);
+                    } else {
+                        downRightTile->nonAtomicApplyDelta(0, 0, downRightCornerDelta);
+                    }
                 }
             }
         }
     }
 }
+
+// Explicit template instantiations
+template void Tile::runGenerationChanges<true>();
+template void Tile::runGenerationChanges<false>();
 
 // Apply a single delta to a cell's neighbor count
 // Uses atomic for boundary cells (could race with neighbor tiles in full parallel mode)
@@ -1088,6 +1125,38 @@ void Tile::atomicAddBoundaryDeltas(int y, const int8_t* deltaArray) {
     }
 }
 
+// Non-atomic version of applyDelta for sequential execution
+// Same logic as atomicApplyDelta but uses direct memory access instead of CAS loops
+inline void Tile::nonAtomicApplyDelta(int x, int y, int8_t delta) {
+    if (delta == 0) return;
+
+    uint32_t cellIdx = (y * TILE_WIDTH + x) / 16;
+    uint32_t bitPos = ((y * TILE_WIDTH + x) % 16) * 4;
+
+    uint64_t mask = 0x7ULL << bitPos;
+
+    // Direct read-modify-write (safe in sequential mode, no concurrent access)
+    uint64_t oldVal = cells[cellIdx];
+    int count = (oldVal & mask) >> bitPos;
+    count += delta;
+    cells[cellIdx] = (oldVal & ~mask) | (static_cast<uint64_t>(count & 0x7) << bitPos);
+
+    // Update activity mask directly (non-atomic)
+    uint64_t bit = 1ULL << cellIdx;
+    uint64_t setBit = bit & -static_cast<uint64_t>(cells[cellIdx] != 0);
+    activityMask = (activityMask & ~bit) | setBit;
+}
+
+// Non-atomic version of atomicAddBoundaryDeltas for sequential execution
+void Tile::nonAtomicAddBoundaryDeltas(int y, const int8_t* deltaArray) {
+    for (int x = 0; x < TILE_WIDTH; x++) {
+        int8_t delta = deltaArray[x];
+        if (delta != 0) {
+            nonAtomicApplyDelta(x, y, delta);
+        }
+    }
+}
+
 // Helper to ensure a neighbor tile exists and return it
 // Creates the tile on demand if it doesn't exist
 Tile* Tile::ensureNeighborTile(int dx, int dy) {
@@ -1109,6 +1178,7 @@ Tile* Tile::ensureNeighborTile(int dx, int dy) {
 }
 
 // Apply deltas for a cell pair using LUT
+template<bool UseAtomics>
 void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& deltas) {
     // baseX is the x coordinate of the right cell (even x)
     // The left cell is at baseX+1 (odd x)
@@ -1125,11 +1195,15 @@ void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& del
         if (leftNeighborX >= 0) {
             applyDelta(leftNeighborX, localY, deltas.sameRow[0]);
         } else {
-            // Cross-tile: create tile if needed and use atomic for thread safety
+            // Cross-tile: create tile if needed
             Tile* leftTile = ensureNeighborTile(-1, 0);
             if (leftTile) {
                 VLIFE_METRICS_INC_BOUNDARY();
-                leftTile->atomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
+                if constexpr (UseAtomics) {
+                    leftTile->atomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
+                } else {
+                    leftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
+                }
             }
         }
     }
@@ -1139,11 +1213,15 @@ void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& del
         if (rightNeighborX < TILE_WIDTH) {
             applyDelta(rightNeighborX, localY, deltas.sameRow[1]);
         } else {
-            // Cross-tile: create tile if needed and use atomic for thread safety
+            // Cross-tile: create tile if needed
             Tile* rightTile = ensureNeighborTile(1, 0);
             if (rightTile) {
                 VLIFE_METRICS_INC_BOUNDARY();
-                rightTile->atomicApplyDelta(0, localY, deltas.sameRow[1]);
+                if constexpr (UseAtomics) {
+                    rightTile->atomicApplyDelta(0, localY, deltas.sameRow[1]);
+                } else {
+                    rightTile->nonAtomicApplyDelta(0, localY, deltas.sameRow[1]);
+                }
             }
         }
     }
@@ -1152,11 +1230,21 @@ void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& del
     if (localY > 0) {
         applyVerticalDeltas(baseX, localY - 1, deltas.verticalRow);
     } else {
-        // Cross-tile: create tile if needed and use atomic for thread safety
+        // Cross-tile: create tile if needed
         Tile* upTile = ensureNeighborTile(0, -1);
         if (upTile) {
             VLIFE_METRICS_INC_BOUNDARY();
-            upTile->atomicApplyVerticalDeltas(baseX, TILE_HEIGHT - 1, deltas.verticalRow);
+            if constexpr (UseAtomics) {
+                upTile->atomicApplyVerticalDeltas(baseX, TILE_HEIGHT - 1, deltas.verticalRow);
+            } else {
+                // For non-atomic, apply deltas individually
+                for (int i = 0; i < 4; i++) {
+                    int x = baseX - 1 + i;
+                    if (x >= 0 && x < TILE_WIDTH && deltas.verticalRow[i] != 0) {
+                        upTile->nonAtomicApplyDelta(x, TILE_HEIGHT - 1, deltas.verticalRow[i]);
+                    }
+                }
+            }
         }
     }
 
@@ -1164,14 +1252,28 @@ void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& del
     if (localY < TILE_HEIGHT - 1) {
         applyVerticalDeltas(baseX, localY + 1, deltas.verticalRow);
     } else {
-        // Cross-tile: create tile if needed and use atomic for thread safety
+        // Cross-tile: create tile if needed
         Tile* downTile = ensureNeighborTile(0, 1);
         if (downTile) {
             VLIFE_METRICS_INC_BOUNDARY();
-            downTile->atomicApplyVerticalDeltas(baseX, 0, deltas.verticalRow);
+            if constexpr (UseAtomics) {
+                downTile->atomicApplyVerticalDeltas(baseX, 0, deltas.verticalRow);
+            } else {
+                // For non-atomic, apply deltas individually
+                for (int i = 0; i < 4; i++) {
+                    int x = baseX - 1 + i;
+                    if (x >= 0 && x < TILE_WIDTH && deltas.verticalRow[i] != 0) {
+                        downTile->nonAtomicApplyDelta(x, 0, deltas.verticalRow[i]);
+                    }
+                }
+            }
         }
     }
 }
+
+// Explicit template instantiations for applyDeltasForCellPair
+template void Tile::applyDeltasForCellPair<true>(int, int, const PackedDeltas&);
+template void Tile::applyDeltasForCellPair<false>(int, int, const PackedDeltas&);
 
 void Tile::rebuildActivityMask() {
     // Rebuild the activity mask by scanning all 64-bit words

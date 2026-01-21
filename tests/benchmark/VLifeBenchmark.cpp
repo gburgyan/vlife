@@ -9,9 +9,26 @@
 #include <vector>
 #include <cmath>
 #include <thread>
+#include <cstdint>
 
 #include "../../src/vlife/VLife.h"
 #include "BenchmarkPatterns.h"
+
+// Prime the CPU by running a busy loop until it reaches peak frequency.
+// Apple Silicon needs ~100ms of sustained load to ramp up P-cores.
+// This ensures consistent benchmark results regardless of CPU power state.
+static void primeCPU(int milliseconds = 200) {
+    auto start = std::chrono::high_resolution_clock::now();
+    auto target = start + std::chrono::milliseconds(milliseconds);
+
+    // Busy loop with work that can't be optimized away
+    volatile uint64_t counter = 0;
+    while (std::chrono::high_resolution_clock::now() < target) {
+        for (int i = 0; i < 10000; i++) {
+            counter += i * i;
+        }
+    }
+}
 
 class VLifeBenchmark {
 public:
@@ -141,11 +158,15 @@ int main(int argc, char* argv[]) {
     std::cout << "=======================\n";
     std::cout << "Architecture: " << VLifeBenchmark::getArchitectureInfo() << "\n";
 
-    // Determine if running quick or full benchmark
+    // Parse command line arguments
     bool quickMode = false;
+    bool skipPrime = false;
     for (int i = 1; i < argc; i++) {
-        if (std::string(argv[i]) == "--quick" || std::string(argv[i]) == "-q") {
+        std::string arg = argv[i];
+        if (arg == "--quick" || arg == "-q") {
             quickMode = true;
+        } else if (arg == "--no-prime") {
+            skipPrime = true;
         }
     }
 
@@ -153,6 +174,15 @@ int main(int argc, char* argv[]) {
         std::cout << "Mode: Quick (reduced iterations)\n";
     } else {
         std::cout << "Mode: Full\n";
+    }
+
+    // Prime CPU to ensure consistent benchmark results
+    if (!skipPrime) {
+        std::cout << "Priming CPU (500ms)...\n";
+        primeCPU(5000);
+        std::cout << "CPU primed.\n";
+    } else {
+        std::cout << "CPU priming: skipped (--no-prime)\n";
     }
 
     // Benchmark 1: Glider Guns (sustained activity)

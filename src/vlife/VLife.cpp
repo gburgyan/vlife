@@ -218,8 +218,9 @@ void VLife::runGenerationSequential() {
 #endif
 
     // Second pass: apply the changes
+    // Use non-atomic version since sequential execution has no concurrent access
     for (auto& [coord, tile] : tiles) {
-        tile->runGenerationChanges();
+        tile->runGenerationChanges<false>();
     }
 
 #ifdef VLIFE_METRICS_ENABLED
@@ -327,7 +328,7 @@ void VLife::runGeneration() {
         tbb::blocked_range<size_t>(0, allTiles.size(), phase2GrainSize),
         [&allTiles](const tbb::blocked_range<size_t>& r) {
             for (size_t i = r.begin(); i != r.end(); ++i) {
-                allTiles[i]->runGenerationChanges();
+                allTiles[i]->runGenerationChanges<true>();
             }
         },
         s_affinityPartitioner
