@@ -353,6 +353,7 @@ void Tile::runGenerationPrepare() {
 
 #else
     // Scalar fallback for non-ARM platforms
+
     for (int i = 0; i < TILE_64S; i += 4) {
         // Prefetch next iteration's data
         if (i + 4 < TILE_64S) {

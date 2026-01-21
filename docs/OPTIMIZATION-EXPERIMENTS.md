@@ -91,6 +91,73 @@ The implementation was completed and tested (all tests pass) but reverted due to
 
 ---
 
+## Prefetch Warmup (January 2026)
+
+**Status: Reverted - ~1% performance regression**
+
+### Hypothesis
+
+The prefetch pattern in `runGenerationPrepare()` prefetches n+2 iterations ahead, meaning iterations 0-1 execute with cold cache. Adding warmup prefetches before the loop should eliminate initial cache misses and improve performance.
+
+### Proposed Solution
+
+Two changes were attempted:
+1. Add `PREFETCH(&cells[0])` and `PREFETCH(&cells[4])` before both ARM64 and scalar loops to warm the cache before iteration starts
+2. Change scalar path from n+1 to n+2 prefetch distance (to match ARM64 path for consistency)
+
+### Implementation
+
+Changes were made to `src/vlife/Tile.cpp`:
+
+| Location | Change |
+|----------|--------|
+| ARM64/NEON path (~line 271) | Added warmup prefetches before loop |
+| Scalar fallback (~line 358) | Added warmup prefetches, changed `i+4` to `i+8` |
+
+### Expected Benefits
+
+- Eliminate cache misses for first 1-2 loop iterations
+- Consistent prefetch distance across code paths
+- Estimated 1-2% improvement in Phase 1
+
+### Actual Results
+
+**~1% slower** on Apple Silicon (M-series)
+
+### Analysis
+
+The optimization failed for several interconnected reasons:
+
+1. **Data was already hot**: When `runGenerationPrepare()` is called, the Tile object was just accessed (activity mask check, method dispatch via vtable). The `cells` array is a member of the Tile struct, so `cells[0]` was likely already pulled into L1 cache as part of the object access.
+
+2. **Apple Silicon's hardware prefetcher is excellent**: M-series chips have sophisticated sequential prefetchers that were already handling the access pattern optimally. Manual prefetches can actually interfere with hardware prefetch pattern detection by adding noise to the access pattern.
+
+3. **Prefetch overhead isn't zero**: Even prefetching data that's already cached incurs costs:
+   - Pipeline slots for the prefetch instruction
+   - Memory subsystem bandwidth to check cache tags
+   - Potential L1 TLB pressure
+
+4. **n+2 may be too far for scalar**: The scalar path's original n+1 distance was tuned for its specific loop body timing. Changing to n+2 may cause data to be evicted before use on some cache hierarchies, or simply waste prefetch bandwidth.
+
+### Lessons Learned
+
+1. **Don't prefetch what's already hot**: Before adding prefetches, verify the data isn't already cached from prior access patterns. Object member access often brings in adjacent data.
+
+2. **Trust modern hardware prefetchers**: Apple Silicon (and other modern CPUs) have highly optimized hardware prefetchers for simple sequential access patterns. Manual prefetches should only be added when you have evidence the hardware is missing.
+
+3. **Different prefetch distances for different architectures**: The ARM64 path with NEON can handle n+2 prefetch distances, but scalar code with different loop body timing may work better with n+1.
+
+4. **Measure small optimizations carefully**: A ~1% regression is within noise for many benchmarks. Multiple runs and statistical analysis are needed to confirm such small effects.
+
+### When This Approach Might Work
+
+Warmup prefetches might help when:
+- The loop is entered from a cold path (not immediately after touching the object)
+- Hardware prefetchers are disabled or ineffective (older CPUs, non-sequential patterns)
+- The prefetched data is not part of the recently-accessed object
+
+---
+
 ## Template for Future Experiments
 
 ### [Optimization Name] (Date)
