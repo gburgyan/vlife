@@ -9,24 +9,36 @@
 #include <vector>
 #include <cmath>
 #include <thread>
-#include <cstdint>
+
+#ifdef __APPLE__
+#include <pthread.h>
+#include <sys/qos.h>
+#endif
 
 #include "../../src/vlife/VLife.h"
 #include "BenchmarkPatterns.h"
 
-// Prime the CPU by running a busy loop until it reaches peak frequency.
-// Apple Silicon needs ~100ms of sustained load to ramp up P-cores.
-// This ensures consistent benchmark results regardless of CPU power state.
-static void primeCPU(int milliseconds = 200) {
+// Set thread to high-priority QoS on Apple Silicon to ensure P-core scheduling
+// and aggressive DVFS. No-op on other platforms.
+static void setHighPriorityQoS() {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
+
+// Prime the CPU by running a heavy VLife workload until it reaches peak frequency.
+// Uses a large random soup pattern - this is representative of the actual benchmark
+// instruction mix and memory access patterns.
+static void primeCPU(int milliseconds = 500) {
+    // Use a large random soup - representative of actual VLife workload
+    VLife warmupBoard;
+    BenchmarkPatterns::setupRandomSoup(warmupBoard, 512, 512, 0.3);
+
     auto start = std::chrono::high_resolution_clock::now();
     auto target = start + std::chrono::milliseconds(milliseconds);
 
-    // Busy loop with work that can't be optimized away
-    volatile uint64_t counter = 0;
     while (std::chrono::high_resolution_clock::now() < target) {
-        for (int i = 0; i < 10000; i++) {
-            counter += i * i;
-        }
+        warmupBoard.runGeneration();
     }
 }
 
@@ -154,6 +166,9 @@ void printResult(const std::string& patternName, const VLifeBenchmark::Result& r
 }
 
 int main(int argc, char* argv[]) {
+    // Set high-priority QoS immediately for P-core scheduling on Apple Silicon
+    setHighPriorityQoS();
+
     std::cout << "VLife Benchmark Results\n";
     std::cout << "=======================\n";
     std::cout << "Architecture: " << VLifeBenchmark::getArchitectureInfo() << "\n";
