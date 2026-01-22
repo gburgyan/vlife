@@ -257,9 +257,6 @@ void Tile::runGenerationPrepare() {
     uint64_t modMask = wasModified;
     wasModified = 0;  // Clear for this generation's Phase 2
 
-    // Clear changes array
-    std::memset(changes, 0, sizeof(changes));
-
     // Reset changes accumulator for Phase 2 short-circuit optimization
     changesAccumulator = 0;
 
