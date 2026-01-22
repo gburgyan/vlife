@@ -161,6 +161,12 @@ public:
         return activityRows != 0 || wasModified != 0;
     }
 
+    // Check if the tile has changes to apply in Phase 2
+    // Used for Phase 2 queue optimization to skip tiles with no changes
+    inline bool hasChanges() const {
+        return changesAccumulator != 0;
+    }
+
     // Check if the tile is safe to evict
     // A tile is safe to evict only if: no live cells, no activity, and no pending modifications
     // - active==0 && mod!=0: Phase 2 just changed something, tile is in play

@@ -9,6 +9,7 @@
 #include <vector>
 #include <mutex>
 #include <shared_mutex>
+#include <tbb/concurrent_vector.h>
 #include "../GameOfLife.h"
 
 // Forward declaration
@@ -128,6 +129,11 @@ private:
 
     // Generation counter for metrics
     uint64_t generationNumber = 0;
+
+    // Queue of tiles that had changes in Phase 1, for efficient Phase 2 processing
+    // Using persistent members to amortize allocation across generations
+    tbb::concurrent_vector<Tile*> tilesWithChanges;  // For parallel path
+    std::vector<Tile*> changedTilesSequential;       // For sequential path
 
 #ifdef VLIFE_METRICS_ENABLED
     MetricsCollector* metricsCollector = nullptr;

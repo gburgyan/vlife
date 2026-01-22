@@ -186,6 +186,9 @@ void VLife::runGenerationSequential() {
     size_t activeTilesCount = 0;
 #endif
 
+    // Clear the queue from previous generation (keeps capacity for amortized allocation)
+    changedTilesSequential.clear();
+
     // First pass: prepare all tiles for the generation
     // Tile-level skip optimization: skip tiles with no activity
     for (auto& [coord, tile] : tiles) {
@@ -193,6 +196,9 @@ void VLife::runGenerationSequential() {
         // This includes tiles with activity OR tiles modified by Phase 2
         if (tile->needsPhase1Processing()) {
             tile->runGenerationPrepare();
+            if (tile->hasChanges()) {
+                changedTilesSequential.push_back(tile.get());
+            }
 #ifdef VLIFE_METRICS_ENABLED
             activeTilesCount++;
 #endif
@@ -209,9 +215,9 @@ void VLife::runGenerationSequential() {
     auto phase2Start = std::chrono::high_resolution_clock::now();
 #endif
 
-    // Second pass: apply the changes
+    // Second pass: apply the changes only to tiles that have changes
     // Use non-atomic version since sequential execution has no concurrent access
-    for (auto& [coord, tile] : tiles) {
+    for (Tile* tile : changedTilesSequential) {
         tile->runGenerationChanges<false>();
     }
 
@@ -265,15 +271,21 @@ void VLife::runGeneration() {
     std::atomic<size_t> activeTileCount{0};
 #endif
 
-    // PHASE 1: Parallel iteration with inline filtering
+    // Clear the queue from previous generation (keeps capacity for amortized allocation)
+    tilesWithChanges.clear();
+
+    // PHASE 1: Parallel iteration with inline filtering, collect tiles with changes
     tbb::parallel_for_each(tiles.begin(), tiles.end(),
-        [
+        [this
 #ifdef VLIFE_METRICS_ENABLED
-            &activeTileCount
+            , &activeTileCount
 #endif
         ](auto& pair) {
             if (pair.second->needsPhase1Processing()) {
                 pair.second->runGenerationPrepare();
+                if (pair.second->hasChanges()) {
+                    tilesWithChanges.push_back(pair.second.get());
+                }
 #ifdef VLIFE_METRICS_ENABLED
                 activeTileCount.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -290,10 +302,10 @@ void VLife::runGeneration() {
     auto phase2Start = std::chrono::high_resolution_clock::now();
 #endif
 
-    // PHASE 2: All tiles processed in parallel
-    tbb::parallel_for_each(tiles.begin(), tiles.end(),
-        [](auto& pair) {
-            pair.second->template runGenerationChanges<true>();
+    // PHASE 2: Only process tiles that have changes (collected during Phase 1)
+    tbb::parallel_for_each(tilesWithChanges.begin(), tilesWithChanges.end(),
+        [](Tile* tile) {
+            tile->runGenerationChanges<true>();
         }
     );
 
