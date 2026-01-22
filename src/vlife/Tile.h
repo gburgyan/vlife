@@ -39,11 +39,15 @@ class alignas(64) Tile {
     uint64_t changesAccumulator{0};  // OR of all changeBuff values, for quick Phase 2 skip
     uint32_t liveCount; // Tracks the number of live cells in this tile
 
-    // Activity tracking for hierarchical skip optimization
-    // Each bit in activityMask corresponds to one 64-bit word in cells[]
-    // A word is "active" if it has any non-zero content (live cells or neighbor counts)
-    // This allows skipping dead regions during generation scan
-    uint64_t activityMask{};
+    // Activity tracking for tile-level skip optimization
+    // True if the tile has any non-zero content (live cells or neighbor counts)
+    // This allows skipping completely dead tiles during generation scan
+    bool hasAnyActivity{false};
+
+    // Block-level modification tracking (64 bits = 8x8 blocks of 4x4 cells each)
+    // Bit index: ((y & 0x1C) << 1) | (x >> 2)
+    // Set in Phase 2 when neighbor counts updated; cleared at Phase 1 start
+    uint64_t wasModified{~0ULL};  // Initialize to all-modified for first gen
 
     // Cooldown counter for tile eviction - prevents flapping
     // Tiles must remain inactive for TILE_COOLDOWN_GENERATIONS before being evicted
@@ -135,30 +139,100 @@ public:
     // Getter for the number of live cells
     uint32_t getLiveCount() const { return liveCount; }
 
-    // Activity mask methods for hierarchical skip optimization
-    inline void markWordActive(uint32_t wordIdx) {
-        activityMask |= (1ULL << wordIdx);
+    // Activity tracking methods for tile-level skip optimization
+    inline void markWordActive(uint32_t) {
+        hasAnyActivity = true;
     }
 
     // Check if the tile has any potential activity (live cells or neighbor counts)
     // Used for tile-level skip optimization
     inline bool hasActivity() const {
-        return activityMask != 0;
+        return hasAnyActivity;
     }
 
-    // Get the number of active word groups (for profiling/debugging)
-    inline int getActiveWordCount() const {
-        return __builtin_popcountll(activityMask);
+    // Block modification tracking methods (64 bits = 8x8 blocks of 4x4 cells)
+    // Mark block containing (x,y) as modified
+    inline void markBlockModified(int x, int y) {
+        int blockIdx = ((y & 0x1C) << 1) | (x >> 2);
+        wasModified |= (1ULL << blockIdx);
     }
 
-    // Estimate the amount of work for this tile (higher = more work)
-    // Used for work-weighted scheduling to put heavy tiles first
-    inline uint32_t estimateWork() const {
-        return __builtin_popcountll(activityMask);
+    // Atomic version for cross-tile updates
+    inline void atomicMarkBlockModified(int x, int y) {
+        int blockIdx = ((y & 0x1C) << 1) | (x >> 2);
+        __atomic_fetch_or(&wasModified, 1ULL << blockIdx, __ATOMIC_RELAXED);
     }
 
-    // Rebuild the activity mask by scanning all words
-    void rebuildActivityMask();
+    // Mark the 4 corner blocks of a cell's 3x3 affected area
+    // Optimized to check boundaries once and batch interior updates
+    inline void markChangeCorners(int x, int y) {
+        // Check boundaries once
+        bool leftOut = (x - 1) < 0;
+        bool rightOut = (x + 1) >= TILE_WIDTH;
+        bool topOut = (y - 1) < 0;
+        bool bottomOut = (y + 1) >= TILE_HEIGHT;
+
+        // Fast path: all corners interior (most common case)
+        if (!leftOut && !rightOut && !topOut && !bottomOut) {
+            // Compute all 4 block indices and OR together
+            int ul = (((y - 1) & 0x1C) << 1) | ((x - 1) >> 2);
+            int ur = (((y - 1) & 0x1C) << 1) | ((x + 1) >> 2);
+            int ll = (((y + 1) & 0x1C) << 1) | ((x - 1) >> 2);
+            int lr = (((y + 1) & 0x1C) << 1) | ((x + 1) >> 2);
+            wasModified |= (1ULL << ul) | (1ULL << ur) | (1ULL << ll) | (1ULL << lr);
+            return;
+        }
+
+        // Compute adjusted coordinates for each boundary case
+        int leftX = leftOut ? TILE_WIDTH - 1 : x - 1;
+        int rightX = rightOut ? 0 : x + 1;
+        int topY = topOut ? TILE_HEIGHT - 1 : y - 1;
+        int bottomY = bottomOut ? 0 : y + 1;
+
+        // Upper-left corner
+        if (topOut && leftOut) {
+            if (upLeft) upLeft->atomicMarkBlockModified(leftX, topY);
+        } else if (topOut) {
+            if (up) up->atomicMarkBlockModified(leftX, topY);
+        } else if (leftOut) {
+            if (left) left->atomicMarkBlockModified(leftX, topY);
+        } else {
+            markBlockModified(leftX, topY);
+        }
+
+        // Upper-right corner
+        if (topOut && rightOut) {
+            if (upRight) upRight->atomicMarkBlockModified(rightX, topY);
+        } else if (topOut) {
+            if (up) up->atomicMarkBlockModified(rightX, topY);
+        } else if (rightOut) {
+            if (right) right->atomicMarkBlockModified(rightX, topY);
+        } else {
+            markBlockModified(rightX, topY);
+        }
+
+        // Lower-left corner
+        if (bottomOut && leftOut) {
+            if (downLeft) downLeft->atomicMarkBlockModified(leftX, bottomY);
+        } else if (bottomOut) {
+            if (down) down->atomicMarkBlockModified(leftX, bottomY);
+        } else if (leftOut) {
+            if (left) left->atomicMarkBlockModified(leftX, bottomY);
+        } else {
+            markBlockModified(leftX, bottomY);
+        }
+
+        // Lower-right corner
+        if (bottomOut && rightOut) {
+            if (downRight) downRight->atomicMarkBlockModified(rightX, bottomY);
+        } else if (bottomOut) {
+            if (down) down->atomicMarkBlockModified(rightX, bottomY);
+        } else if (rightOut) {
+            if (right) right->atomicMarkBlockModified(rightX, bottomY);
+        } else {
+            markBlockModified(rightX, bottomY);
+        }
+    }
 
     // Cooldown methods for tile eviction management
     // Reset cooldown counter when tile becomes active

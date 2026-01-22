@@ -196,13 +196,12 @@ void VLife::runGenerationSequential() {
     // Tile-level skip optimization: skip tiles with no activity
     for (auto& [coord, tile] : tiles) {
         // Only process tiles that have potential activity
-        // A tile with activityMask == 0 has no live cells and no neighbor counts,
+        // A tile with no activity has no live cells and no neighbor counts,
         // so it cannot produce any changes
         if (tile->hasActivity()) {
             tile->runGenerationPrepare();
 #ifdef VLIFE_METRICS_ENABLED
             activeTilesCount++;
-            VLIFE_METRICS_ADD_ACTIVE_WORDS(tile->getActiveWordCount());
 #endif
         }
     }
@@ -285,13 +284,6 @@ void VLife::runGeneration() {
     }
 
 #ifdef VLIFE_METRICS_ENABLED
-    // Accumulate active words before parallel phase
-    for (Tile* tile : activeTiles) {
-        VLIFE_METRICS_ADD_ACTIVE_WORDS(tile->getActiveWordCount());
-    }
-    if (metricsCollector) {
-        VLIFE_METRICS_MERGE_TL(*metricsCollector);
-    }
     auto phase1Start = std::chrono::high_resolution_clock::now();
 #endif
 

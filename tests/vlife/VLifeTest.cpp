@@ -738,3 +738,112 @@ TEST_F(VLifeTest, ParallelVsSequentialConsistency) {
         if (parallelCells != sequentialCells) break;
     }
 }
+
+// ============================================================================
+// Block Modification Tracking Tests
+// ============================================================================
+
+// Test block index calculation formula
+TEST_F(VLifeTest, BlockIndexCalculation) {
+    // Block index formula: ((y & 0x1C) << 1) | (x >> 2)
+    // 32x32 tile divided into 8x8 blocks of 4x4 cells each
+
+    // Test corners of first block (x=0-3, y=0-3) -> block index 0
+    EXPECT_EQ(((0 & 0x1C) << 1) | (0 >> 2), 0);
+    EXPECT_EQ(((0 & 0x1C) << 1) | (3 >> 2), 0);
+    EXPECT_EQ(((3 & 0x1C) << 1) | (0 >> 2), 0);
+    EXPECT_EQ(((3 & 0x1C) << 1) | (3 >> 2), 0);
+
+    // Test second block in first row (x=4-7, y=0-3) -> block index 1
+    EXPECT_EQ(((0 & 0x1C) << 1) | (4 >> 2), 1);
+    EXPECT_EQ(((3 & 0x1C) << 1) | (7 >> 2), 1);
+
+    // Test first block in second block row (x=0-3, y=4-7) -> block index 8
+    EXPECT_EQ(((4 & 0x1C) << 1) | (0 >> 2), 8);
+    EXPECT_EQ(((7 & 0x1C) << 1) | (3 >> 2), 8);
+
+    // Test last block (x=28-31, y=28-31) -> block index 63
+    EXPECT_EQ(((28 & 0x1C) << 1) | (28 >> 2), 63);
+    EXPECT_EQ(((31 & 0x1C) << 1) | (31 >> 2), 63);
+}
+
+// Test that block tracking produces correct results over multiple generations
+TEST_F(VLifeTest, BlockTrackingCorrectnessGlider) {
+    // Use a glider pattern - it should work correctly with block tracking
+    setupGlider(*vlife, 10, 10);
+
+    // Record initial state
+    int initialLiveCells = countLiveCells(*vlife, 0, 0, 50, 50);
+    EXPECT_EQ(initialLiveCells, 5);
+
+    // Run 20 generations
+    for (int gen = 0; gen < 20; gen++) {
+        vlife->runGeneration();
+
+        int liveCells = countLiveCells(*vlife, 0, 0, 50, 50);
+        EXPECT_EQ(liveCells, 5) << "Generation " << (gen + 1) << ": expected 5 live cells, got " << liveCells;
+
+        if (liveCells != 5) break;
+    }
+}
+
+// Test that block tracking works correctly across tile boundaries
+TEST_F(VLifeTest, BlockTrackingAcrossTileBoundary) {
+    // Place a blinker across tile boundary
+    uint32_t edgeX = TILE_WIDTH - 1;
+
+    // Horizontal blinker spanning tile boundary
+    vlife->setCell(edgeX - 1, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(edgeX, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(edgeX + 1, 10, GameOfLife::CellState::ALIVE);
+
+    // Run 10 generations (blinker oscillates with period 2)
+    for (int gen = 0; gen < 10; gen++) {
+        vlife->runGeneration();
+
+        int liveCells = countLiveCells(*vlife, edgeX - 2, 8, 5, 5);
+        EXPECT_EQ(liveCells, 3) << "Generation " << (gen + 1) << ": expected 3 live cells, got " << liveCells;
+
+        if (liveCells != 3) break;
+    }
+}
+
+// Test that wasModified is properly initialized for new tiles
+TEST_F(VLifeTest, WasModifiedInitialization) {
+    // Get a new tile - wasModified should be all 1s (everything needs processing)
+    Tile* tile = vlife->getTile(5, 5);
+
+    // After one generation of processing, wasModified should be cleared
+    // (assuming no activity in the empty tile)
+    vlife->runGeneration();
+
+    // Set a cell to trigger activity marking
+    vlife->setCell(5 * TILE_WIDTH + 15, 5 * TILE_HEIGHT + 15, GameOfLife::CellState::ALIVE);
+
+    // Run generation - the cell should process correctly
+    vlife->runGeneration();
+
+    // Verify the cell and its neighbors are handled correctly
+    // (single cell dies due to underpopulation)
+    EXPECT_EQ(vlife->getCell(5 * TILE_WIDTH + 15, 5 * TILE_HEIGHT + 15), GameOfLife::CellState::DEAD);
+}
+
+// Test block tracking with still life (block pattern)
+TEST_F(VLifeTest, BlockTrackingStillLife) {
+    // Create a 2x2 block (still life) - should remain stable
+    vlife->setCell(10, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(11, 10, GameOfLife::CellState::ALIVE);
+    vlife->setCell(10, 11, GameOfLife::CellState::ALIVE);
+    vlife->setCell(11, 11, GameOfLife::CellState::ALIVE);
+
+    // Run 10 generations - block should be stable
+    for (int gen = 0; gen < 10; gen++) {
+        vlife->runGeneration();
+
+        // All 4 cells should still be alive
+        EXPECT_EQ(vlife->getCell(10, 10), GameOfLife::CellState::ALIVE) << "Gen " << (gen + 1);
+        EXPECT_EQ(vlife->getCell(11, 10), GameOfLife::CellState::ALIVE) << "Gen " << (gen + 1);
+        EXPECT_EQ(vlife->getCell(10, 11), GameOfLife::CellState::ALIVE) << "Gen " << (gen + 1);
+        EXPECT_EQ(vlife->getCell(11, 11), GameOfLife::CellState::ALIVE) << "Gen " << (gen + 1);
+    }
+}

@@ -50,7 +50,6 @@ void MetricsCollector::endPhase2(size_t allTiles, uint64_t timeMicros) {
 void MetricsCollector::mergeThreadLocalCounters(const ThreadLocalCounters& counters) {
     currentMetrics.cellsBorn += counters.cellsBorn;
     currentMetrics.cellsDied += counters.cellsDied;
-    currentMetrics.activeWords += counters.activeWords;
     currentMetrics.boundaryCrossings += counters.boundaryCrossings;
     currentMetrics.atomicOperations += counters.atomicOperations;
 }
@@ -106,7 +105,7 @@ void MetricsCollector::exportCSV(const std::string& filename) const {
         << "phase1_active_tiles,phase2_all_tiles,total_tiles,tiles_created,tiles_evicted,"
         << "min_tile_x,max_tile_x,min_tile_y,max_tile_y,extent_area,spatial_density,"
         << "phase1_time_us,phase2_time_us,total_time_us,"
-        << "active_words,boundary_crossings,atomic_operations\n";
+        << "boundary_crossings,atomic_operations\n";
 
     // Data rows
     out << std::fixed << std::setprecision(6);
@@ -135,7 +134,6 @@ void MetricsCollector::exportCSV(const std::string& filename) const {
             << m.phase1TimeMicros << ","
             << m.phase2TimeMicros << ","
             << m.totalTimeMicros << ","
-            << m.activeWords << ","
             << m.boundaryCrossings << ","
             << m.atomicOperations << "\n";
     }
@@ -209,7 +207,6 @@ void MetricsCollector::exportJSON(const std::string& filename,
         out << "        \"total\": " << m.totalTimeMicros << "\n";
         out << "      },\n";
         out << "      \"optimization_metrics\": {\n";
-        out << "        \"active_words\": " << m.activeWords << ",\n";
         out << "        \"boundary_crossings\": " << m.boundaryCrossings << ",\n";
         out << "        \"atomic_operations\": " << m.atomicOperations << "\n";
         out << "      }\n";

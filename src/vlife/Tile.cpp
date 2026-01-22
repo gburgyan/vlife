@@ -33,7 +33,7 @@
 
 Tile::Tile(VLife *board, int32_t tileX, int32_t tileY) :
     board(board), tileX(tileX), tileY(tileY), left(nullptr), right(nullptr), up(nullptr), down(nullptr),
-    upLeft(nullptr), upRight(nullptr), downLeft(nullptr), downRight(nullptr), liveCount(0), activityMask(0) {
+    upLeft(nullptr), upRight(nullptr), downLeft(nullptr), downRight(nullptr), liveCount(0), hasAnyActivity(false) {
     // Initialize all cells to zero (dead)
     std::memset(cells, 0, sizeof(cells));
     std::memset(changes, 0, sizeof(changes));
@@ -252,15 +252,25 @@ void Tile::runGenerationPrepare() {
     }
 #endif
 
+    // Consume modification mask (no expansion needed - markChangeCorners already
+    // marks all affected blocks during Phase 2)
+    uint64_t modMask = wasModified;
+    wasModified = 0;  // Clear for this generation's Phase 2
+
     // Clear changes array
     std::memset(changes, 0, sizeof(changes));
 
-    // Rebuild activity mask while processing
-    // This allows us to skip dead regions efficiently
-    activityMask = 0;
-
     // Reset changes accumulator for Phase 2 short-circuit optimization
     changesAccumulator = 0;
+
+    // Quick exit if nothing modified - preserve hasAnyActivity as-is
+    // (tile is unchanged, so previous activity state is still valid)
+    if (modMask == 0) {
+        return;
+    }
+
+    // Reset activity tracking for this scan - we'll set true if we find content
+    hasAnyActivity = false;
 
     auto ruleLUT = board->ruleLUT;
 
@@ -269,167 +279,303 @@ void Tile::runGenerationPrepare() {
     // Uses scalar LUT lookups (cache-efficient) with direct result accumulation
     const uint8_t* __restrict ruleLUT_u8 = reinterpret_cast<const uint8_t*>(ruleLUT);
 
-    for (int i = 0; i < TILE_64S; i += 4) {
-        // Prefetch 2 iterations ahead for better memory pipeline utilization
-        if (i + 8 < TILE_64S) {
-            PREFETCH(&cells[i + 8]);
-        }
-
-        // Quick check: skip if all 4 words are zero
-        uint64_t combined = cells[i] | cells[i + 1] | cells[i + 2] | cells[i + 3];
-        if (__builtin_expect(combined == 0, 0)) {
+    // Process at block row granularity (8 words = 4 cell rows = 1 block row)
+    for (int blockRow = 0; blockRow < 8; blockRow++) {
+        // Check if this block row has any modifications
+        uint8_t rowMask = (modMask >> (blockRow * 8)) & 0xFF;
+        if (rowMask == 0) {
+            // Skip 8 words (4 cell rows) - changes[] stays zero from memset
             continue;
         }
 
-        // Update activity mask branchlessly - convert non-zero to 1, then shift
-        // This avoids 4 unpredictable branches per iteration
-        activityMask |= (static_cast<uint64_t>(cells[i] != 0) << i) |
-                        (static_cast<uint64_t>(cells[i + 1] != 0) << (i + 1)) |
-                        (static_cast<uint64_t>(cells[i + 2] != 0) << (i + 2)) |
-                        (static_cast<uint64_t>(cells[i + 3] != 0) << (i + 3));
+        // Process 8 words for this block row (2 iterations of 4 words each)
+        int baseIdx = blockRow * 8;
+        for (int iter = 0; iter < 2; iter++) {
+            int i = baseIdx + iter * 4;
 
-        uint64_t changeBuff = 0;
+            // Prefetch 2 iterations ahead for better memory pipeline utilization
+            if (i + 8 < TILE_64S) {
+                PREFETCH(&cells[i + 8]);
+            }
 
-        // Process word 0 - only if non-zero
-        uint64_t slice = cells[i];
-        if (slice != 0) {
-            // Pack 8 LUT results directly into 16 bits (bits 63:48)
-            uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
-                          (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
-                          (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
-                          ruleLUT_u8[(slice >> 32) & 0xFF];
-            uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
-                          (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
-                          (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
-                          ruleLUT_u8[slice & 0xFF];
-            changeBuff |= (static_cast<uint64_t>(p0) << 56) | (static_cast<uint64_t>(p1) << 48);
-        }
+            // Quick check: skip if all 4 words are zero
+            if (!(cells[i] || cells[i + 1] || cells[i + 2] || cells[i + 3])) {
+                continue;
+            }
 
-        // Process word 1
-        slice = cells[i + 1];
-        if (slice != 0) {
-            uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
-                          (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
-                          (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
-                          ruleLUT_u8[(slice >> 32) & 0xFF];
-            uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
-                          (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
-                          (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
-                          ruleLUT_u8[slice & 0xFF];
-            changeBuff |= (static_cast<uint64_t>(p0) << 40) | (static_cast<uint64_t>(p1) << 32);
-        }
+            // Mark tile as having activity since we found non-zero cells
+            hasAnyActivity = true;
 
-        // Process word 2
-        slice = cells[i + 2];
-        if (slice != 0) {
-            uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
-                          (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
-                          (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
-                          ruleLUT_u8[(slice >> 32) & 0xFF];
-            uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
-                          (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
-                          (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
-                          ruleLUT_u8[slice & 0xFF];
-            changeBuff |= (static_cast<uint64_t>(p0) << 24) | (static_cast<uint64_t>(p1) << 16);
-        }
+            uint64_t changeBuff = 0;
 
-        // Process word 3
-        slice = cells[i + 3];
-        if (slice != 0) {
-            uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
-                          (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
-                          (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
-                          ruleLUT_u8[(slice >> 32) & 0xFF];
-            uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
-                          (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
-                          (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
-                          ruleLUT_u8[slice & 0xFF];
-            changeBuff |= (static_cast<uint64_t>(p0) << 8) | static_cast<uint64_t>(p1);
-        }
+            // Fast path: if all blocks in row are modified, skip the per-word checks
+            if (rowMask == 0xFF) {
+                // Process word 0
+                uint64_t slice = cells[i];
+                if (slice != 0) {
+                    uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
+                                  (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
+                                  ruleLUT_u8[(slice >> 32) & 0xFF];
+                    uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
+                                  (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
+                                  ruleLUT_u8[slice & 0xFF];
+                    changeBuff |= (static_cast<uint64_t>(p0) << 56) | (static_cast<uint64_t>(p1) << 48);
+                }
+                // Process word 1
+                slice = cells[i + 1];
+                if (slice != 0) {
+                    uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
+                                  (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
+                                  ruleLUT_u8[(slice >> 32) & 0xFF];
+                    uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
+                                  (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
+                                  ruleLUT_u8[slice & 0xFF];
+                    changeBuff |= (static_cast<uint64_t>(p0) << 40) | (static_cast<uint64_t>(p1) << 32);
+                }
+                // Process word 2
+                slice = cells[i + 2];
+                if (slice != 0) {
+                    uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
+                                  (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
+                                  ruleLUT_u8[(slice >> 32) & 0xFF];
+                    uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
+                                  (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
+                                  ruleLUT_u8[slice & 0xFF];
+                    changeBuff |= (static_cast<uint64_t>(p0) << 24) | (static_cast<uint64_t>(p1) << 16);
+                }
+                // Process word 3
+                slice = cells[i + 3];
+                if (slice != 0) {
+                    uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
+                                  (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
+                                  ruleLUT_u8[(slice >> 32) & 0xFF];
+                    uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
+                                  (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
+                                  ruleLUT_u8[slice & 0xFF];
+                    changeBuff |= (static_cast<uint64_t>(p0) << 8) | static_cast<uint64_t>(p1);
+                }
+            } else {
+                // Slow path: check per-word block masks for partial row activity
+                // Even words (0,2) cover cells 0-15 → blocks 0-3 (bits 0-3 of rowMask)
+                // Odd words (1,3) cover cells 16-31 → blocks 4-7 (bits 4-7 of rowMask)
+                bool evenBlocksModified = (rowMask & 0x0F) != 0;
+                bool oddBlocksModified = (rowMask & 0xF0) != 0;
 
-        changesAccumulator |= changeBuff;
-        changes[i >> 2] = changeBuff;
-    }
+                // Process word 0 (even) - check blocks 0-3
+                uint64_t slice = cells[i];
+                if (slice != 0 && evenBlocksModified) {
+                    uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
+                                  (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
+                                  ruleLUT_u8[(slice >> 32) & 0xFF];
+                    uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
+                                  (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
+                                  ruleLUT_u8[slice & 0xFF];
+                    changeBuff |= (static_cast<uint64_t>(p0) << 56) | (static_cast<uint64_t>(p1) << 48);
+                }
+
+                // Process word 1 (odd) - check blocks 4-7
+                slice = cells[i + 1];
+                if (slice != 0 && oddBlocksModified) {
+                    uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
+                                  (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
+                                  ruleLUT_u8[(slice >> 32) & 0xFF];
+                    uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
+                                  (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
+                                  ruleLUT_u8[slice & 0xFF];
+                    changeBuff |= (static_cast<uint64_t>(p0) << 40) | (static_cast<uint64_t>(p1) << 32);
+                }
+
+                // Process word 2 (even) - check blocks 0-3
+                slice = cells[i + 2];
+                if (slice != 0 && evenBlocksModified) {
+                    uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
+                                  (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
+                                  ruleLUT_u8[(slice >> 32) & 0xFF];
+                    uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
+                                  (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
+                                  ruleLUT_u8[slice & 0xFF];
+                    changeBuff |= (static_cast<uint64_t>(p0) << 24) | (static_cast<uint64_t>(p1) << 16);
+                }
+
+                // Process word 3 (odd) - check blocks 4-7
+                slice = cells[i + 3];
+                if (slice != 0 && oddBlocksModified) {
+                    uint32_t p0 = (ruleLUT_u8[slice >> 56] << 6) |
+                                  (ruleLUT_u8[(slice >> 48) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 40) & 0xFF] << 2) |
+                                  ruleLUT_u8[(slice >> 32) & 0xFF];
+                    uint32_t p1 = (ruleLUT_u8[(slice >> 24) & 0xFF] << 6) |
+                                  (ruleLUT_u8[(slice >> 16) & 0xFF] << 4) |
+                                  (ruleLUT_u8[(slice >> 8) & 0xFF] << 2) |
+                                  ruleLUT_u8[slice & 0xFF];
+                    changeBuff |= (static_cast<uint64_t>(p0) << 8) | static_cast<uint64_t>(p1);
+                }
+            }
+
+            changesAccumulator |= changeBuff;
+            changes[i >> 2] = changeBuff;
+        }  // end iter loop
+    }  // end blockRow loop
 
 #else
     // Scalar fallback for non-ARM platforms
-
-    for (int i = 0; i < TILE_64S; i += 4) {
-        // Prefetch next iteration's data
-        if (i + 4 < TILE_64S) {
-            PREFETCH(&cells[i + 4]);
+    // Process at block row granularity (8 words = 4 cell rows = 1 block row)
+    for (int blockRow = 0; blockRow < 8; blockRow++) {
+        // Check if this block row has any modifications
+        uint8_t rowMask = (modMask >> (blockRow * 8)) & 0xFF;
+        if (rowMask == 0) {
+            // Skip 8 words (4 cell rows) - changes[] stays zero from memset
+            continue;
         }
 
-        // Quick check: skip if all 4 words are zero (no live cells, no neighbor counts)
-        // This is the hierarchical skip optimization - skip dead regions
-        uint64_t combined = cells[i] | cells[i + 1] | cells[i + 2] | cells[i + 3];
-        if (combined == 0) {
-            continue;  // Skip this group entirely - no activity possible
-        }
+        // Process 8 words for this block row (2 iterations of 4 words each)
+        int baseIdx = blockRow * 8;
+        for (int iter = 0; iter < 2; iter++) {
+            int i = baseIdx + iter * 4;
 
-        // Update activity mask branchlessly - convert non-zero to 1, then shift
-        // This avoids 4 unpredictable branches per iteration
-        activityMask |= (static_cast<uint64_t>(cells[i] != 0) << i) |
-                        (static_cast<uint64_t>(cells[i + 1] != 0) << (i + 1)) |
-                        (static_cast<uint64_t>(cells[i + 2] != 0) << (i + 2)) |
-                        (static_cast<uint64_t>(cells[i + 3] != 0) << (i + 3));
+            // Prefetch next iteration's data
+            if (i + 4 < TILE_64S) {
+                PREFETCH(&cells[i + 4]);
+            }
 
-        // Process word 0
-        uint64_t changeBuff = 0;
-        uint64_t slice = cells[i];
-        if (slice != 0) {
-            changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 62;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 60;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 58;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 56;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 54;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 52;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 50;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 48;
-        }
+            // Quick check: skip if all 4 words are zero (no live cells, no neighbor counts)
+            // This is the hierarchical skip optimization - skip dead regions
+            uint64_t combined = cells[i] | cells[i + 1] | cells[i + 2] | cells[i + 3];
+            if (combined == 0) {
+                continue;  // Skip this group entirely - no activity possible
+            }
 
-        // Process word 1
-        slice = cells[i + 1];
-        if (slice != 0) {
-            changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 46;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 44;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 42;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 40;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 38;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 36;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 34;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 32;
-        }
+            // Mark tile as having activity since we found non-zero cells
+            hasAnyActivity = true;
 
-        // Process word 2
-        slice = cells[i + 2];
-        if (slice != 0) {
-            changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 30;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 28;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 26;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 24;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 22;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 20;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 18;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 16;
-        }
+            uint64_t changeBuff = 0;
 
-        // Process word 3
-        slice = cells[i + 3];
-        if (slice != 0) {
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 56) & 0xFF)]) << 14;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 12;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 10;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 8;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 6;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 4;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 2;
-            changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]);
-        }
+            // Fast path: if all blocks in row are modified, skip the per-word checks
+            if (rowMask == 0xFF) {
+                // Process word 0
+                uint64_t slice = cells[i];
+                if (slice != 0) {
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 62;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 60;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 58;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 56;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 54;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 52;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 50;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 48;
+                }
+                // Process word 1
+                slice = cells[i + 1];
+                if (slice != 0) {
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 46;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 44;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 42;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 40;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 38;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 36;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 34;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 32;
+                }
+                // Process word 2
+                slice = cells[i + 2];
+                if (slice != 0) {
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 30;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 28;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 26;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 24;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 22;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 20;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 18;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 16;
+                }
+                // Process word 3
+                slice = cells[i + 3];
+                if (slice != 0) {
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 56) & 0xFF)]) << 14;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 12;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 10;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 8;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 6;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 4;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 2;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]);
+                }
+            } else {
+                // Slow path: check per-word block masks for partial row activity
+                bool evenBlocksModified = (rowMask & 0x0F) != 0;
+                bool oddBlocksModified = (rowMask & 0xF0) != 0;
 
-        changesAccumulator |= changeBuff;
-        changes[i >> 2] = changeBuff;
-    }
+                // Process word 0 (even) - check blocks 0-3
+                uint64_t slice = cells[i];
+                if (slice != 0 && evenBlocksModified) {
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 62;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 60;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 58;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 56;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 54;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 52;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 50;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 48;
+                }
+
+                // Process word 1 (odd) - check blocks 4-7
+                slice = cells[i + 1];
+                if (slice != 0 && oddBlocksModified) {
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 46;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 44;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 42;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 40;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 38;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 36;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 34;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 32;
+                }
+
+                // Process word 2 (even) - check blocks 0-3
+                slice = cells[i + 2];
+                if (slice != 0 && evenBlocksModified) {
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[(slice >> 56)]) << 30;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 28;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 26;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 24;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 22;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 20;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 18;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]) << 16;
+                }
+
+                // Process word 3 (odd) - check blocks 4-7
+                slice = cells[i + 3];
+                if (slice != 0 && oddBlocksModified) {
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 56) & 0xFF)]) << 14;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 48) & 0xFF)]) << 12;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 40) & 0xFF)]) << 10;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 32) & 0xFF)]) << 8;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 24) & 0xFF)]) << 6;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 16) & 0xFF)]) << 4;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice >> 8) & 0xFF)]) << 2;
+                    changeBuff |= static_cast<uint64_t>(ruleLUT[((slice) & 0xFF)]);
+                }
+            }
+
+            changesAccumulator |= changeBuff;
+            changes[i >> 2] = changeBuff;
+        }  // end iter loop
+    }  // end blockRow loop
 #endif
 }
 
@@ -446,14 +592,25 @@ void Tile::runGenerationPrepare() {
 //
 // The true neighbor count = stored count + paired cell's alive state
 void Tile::runGenerationPrepare_AVX512() {
+    // Consume modification mask (no expansion needed - markChangeCorners already
+    // marks all affected blocks during Phase 2)
+    uint64_t modMask = wasModified;
+    wasModified = 0;  // Clear for this generation's Phase 2
+
     // Clear changes array
     std::memset(changes, 0, sizeof(changes));
 
-    // Rebuild activity mask while processing
-    activityMask = 0;
-
     // Reset changes accumulator for Phase 2 short-circuit optimization
     changesAccumulator = 0;
+
+    // Quick exit if nothing modified - preserve hasAnyActivity as-is
+    // (tile is unchanged, so previous activity state is still valid)
+    if (modMask == 0) {
+        return;
+    }
+
+    // Reset activity tracking for this scan - we'll set true if we find content
+    hasAnyActivity = false;
 
     // Constants for byte-level operations
     // Note: AVX-512 doesn't have byte-level shifts, so we use masks and comparisons
@@ -471,10 +628,18 @@ void Tile::runGenerationPrepare_AVX512() {
     const __m512i threes = _mm512_set1_epi8(3);
     const __m512i ones = _mm512_set1_epi8(1);
 
-    // Process 64 bytes at a time (64 cell pairs, 8 uint64_t words)
+    // Process 64 bytes at a time (64 cell pairs, 8 uint64_t words = 1 block row)
     const uint8_t* cellBytes = reinterpret_cast<const uint8_t*>(cells);
 
     for (int byteOffset = 0; byteOffset < TILE_BYTES; byteOffset += 64) {
+        // Check if this block row has any modifications
+        int blockRow = byteOffset / 64;
+        uint8_t rowMask = (modMask >> (blockRow * 8)) & 0xFF;
+        if (rowMask == 0) {
+            // Skip this block row - changes[] stays zero from memset
+            continue;
+        }
+
         // Load 64 bytes (64 cell pairs)
         __m512i data = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(cellBytes + byteOffset));
 
@@ -484,14 +649,8 @@ void Tile::runGenerationPrepare_AVX512() {
             continue;
         }
 
-        // Update activity mask for these 8 words
-        int baseWordIdx = byteOffset / 8;
-        for (int w = 0; w < 8; w++) {
-            uint8_t wordMaskBits = (nonZeroMask >> (w * 8)) & 0xFF;
-            if (wordMaskBits != 0) {
-                activityMask |= (1ULL << (baseWordIdx + w));
-            }
-        }
+        // Mark tile as having activity since we found non-zero cells
+        hasAnyActivity = true;
 
         // Extract components using masks (no shifts needed for detection)
         // Left cell alive: bit 7 set
@@ -777,6 +936,15 @@ void Tile::runGenerationChanges() {
             VLIFE_METRICS_INC_DIED(leftDied + rightDied);
 #endif
 
+            // Mark 4x4 block corners for next generation's Phase 1 skipping
+            // Left cell is at (baseX+1, localY), right cell is at (baseX, localY)
+            if (leftChanged) {
+                markChangeCorners(baseX + 1, localY);
+            }
+            if (rightChanged) {
+                markChangeCorners(baseX, localY);
+            }
+
             // Build LUT index and apply deltas
             int lutIndex = (leftState << 2) | rightState;
             const PackedDeltas& deltas = deltaLUT[lutIndex];
@@ -962,10 +1130,8 @@ inline void Tile::applyDelta(int x, int y, int8_t delta) {
     // Update the neighbor count (mask to 3 bits to prevent corruption from negative values)
     cells[cellIdx] = (cells[cellIdx] & ~mask) | (static_cast<uint64_t>(newCount & 0x7) << bitPos);
 
-    // Update activity mask branchlessly: clear bit, then conditionally set it
-    uint64_t bit = 1ULL << cellIdx;
-    uint64_t setBit = bit & -static_cast<uint64_t>(cells[cellIdx] != 0);
-    activityMask = (activityMask & ~bit) | setBit;
+    // Mark tile as having activity if cell is non-zero
+    if (cells[cellIdx] != 0) hasAnyActivity = true;
 }
 
 // Apply vertical deltas to 4 consecutive cells in a row (x-1, x, x+1, x+2)
@@ -1015,10 +1181,8 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
                (static_cast<uint64_t>(c3 & 0x7) << (baseBitPos + 12));
 
         cells[cellIdx] = word;
-        // Update activity mask branchlessly: clear bit, then conditionally set it
-        uint64_t bit = 1ULL << cellIdx;
-        uint64_t setBit = bit & -static_cast<uint64_t>(word != 0);
-        activityMask = (activityMask & ~bit) | setBit;
+        // Mark tile as having activity if word is non-zero
+        if (word != 0) hasAnyActivity = true;
     } else {
         // Slow path: handle boundaries individually
         // Uses applyDelta which routes boundary cells through atomicApplyDelta
@@ -1079,8 +1243,8 @@ void Tile::atomicApplyDelta(int x, int y, int8_t delta) {
     } while (!__atomic_compare_exchange_n(&cells[cellIdx], &oldVal, newVal,
                                            false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
 
-    // Atomically update activity mask
-    __atomic_fetch_or(&activityMask, 1ULL << cellIdx, __ATOMIC_RELAXED);
+    // Atomically set activity flag
+    __atomic_store_n(&hasAnyActivity, true, __ATOMIC_RELAXED);
 }
 
 // Atomically apply vertical deltas to 4 consecutive cells in a row
@@ -1142,10 +1306,8 @@ inline void Tile::nonAtomicApplyDelta(int x, int y, int8_t delta) {
     count += delta;
     cells[cellIdx] = (oldVal & ~mask) | (static_cast<uint64_t>(count & 0x7) << bitPos);
 
-    // Update activity mask directly (non-atomic)
-    uint64_t bit = 1ULL << cellIdx;
-    uint64_t setBit = bit & -static_cast<uint64_t>(cells[cellIdx] != 0);
-    activityMask = (activityMask & ~bit) | setBit;
+    // Mark tile as having activity if cell is non-zero
+    if (cells[cellIdx] != 0) hasAnyActivity = true;
 }
 
 // Non-atomic version of atomicAddBoundaryDeltas for sequential execution
@@ -1275,14 +1437,3 @@ void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& del
 // Explicit template instantiations for applyDeltasForCellPair
 template void Tile::applyDeltasForCellPair<true>(int, int, const PackedDeltas&);
 template void Tile::applyDeltasForCellPair<false>(int, int, const PackedDeltas&);
-
-void Tile::rebuildActivityMask() {
-    // Rebuild the activity mask by scanning all 64-bit words
-    // A word is active if it contains any non-zero content
-    activityMask = 0;
-    for (int i = 0; i < TILE_64S; i++) {
-        if (cells[i] != 0) {
-            activityMask |= (1ULL << i);
-        }
-    }
-}

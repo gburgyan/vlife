@@ -25,14 +25,12 @@ class VLife;
 struct ThreadLocalCounters {
     uint64_t cellsBorn = 0;
     uint64_t cellsDied = 0;
-    uint64_t activeWords = 0;
     uint64_t boundaryCrossings = 0;
     uint64_t atomicOperations = 0;
 
     void reset() {
         cellsBorn = 0;
         cellsDied = 0;
-        activeWords = 0;
         boundaryCrossings = 0;
         atomicOperations = 0;
     }
@@ -40,7 +38,6 @@ struct ThreadLocalCounters {
     void merge(const ThreadLocalCounters& other) {
         cellsBorn += other.cellsBorn;
         cellsDied += other.cellsDied;
-        activeWords += other.activeWords;
         boundaryCrossings += other.boundaryCrossings;
         atomicOperations += other.atomicOperations;
     }
@@ -96,7 +93,6 @@ struct GenerationMetrics {
     uint64_t totalTimeMicros = 0;    // Full generation time
 
     // Skip/Boundary metrics (proving optimizations work)
-    uint64_t activeWords = 0;        // Non-zero 64-bit words processed
     uint64_t boundaryCrossings = 0;  // Cross-tile neighbor updates
     uint64_t atomicOperations = 0;   // CAS operations performed
 
@@ -184,9 +180,6 @@ private:
 #define VLIFE_METRICS_INC_DIED(n) \
     MetricsCollector::tlCounters.cellsDied += (n)
 
-#define VLIFE_METRICS_ADD_ACTIVE_WORDS(n) \
-    MetricsCollector::tlCounters.activeWords += (n)
-
 #define VLIFE_METRICS_INC_BOUNDARY() \
     MetricsCollector::tlCounters.boundaryCrossings++
 
@@ -226,7 +219,6 @@ private:
 
 #define VLIFE_METRICS_INC_BORN(n) ((void)0)
 #define VLIFE_METRICS_INC_DIED(n) ((void)0)
-#define VLIFE_METRICS_ADD_ACTIVE_WORDS(n) ((void)0)
 #define VLIFE_METRICS_INC_BOUNDARY() ((void)0)
 #define VLIFE_METRICS_INC_ATOMIC() ((void)0)
 

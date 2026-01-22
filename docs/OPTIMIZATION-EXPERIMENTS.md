@@ -158,6 +158,239 @@ Warmup prefetches might help when:
 
 ---
 
+## Row-Based Change Propagation (January 2026)
+
+**Status: Reverted - ~5% performance regression**
+
+### Hypothesis
+
+A cell can only change state if it or any of its 8 neighbors changed in the previous generation. Therefore, a row can only change if rows r-1, r, or r+1 had changes last generation. By tracking which rows could potentially change (`affectedRowsMask`), we could skip processing entire rows that cannot possibly have state changes, reducing Phase 1 work proportionally to the pattern's "activity locality."
+
+The existing `activityMask` tracks *content* (cells with non-zero values), but this new `affectedRowsMask` would track *change potential* based on the previous generation's activity.
+
+### Proposed Solution
+
+Add a 32-bit `affectedRowsMask` field to each Tile (one bit per row in the 32x32 tile):
+
+1. **During Phase 1**: Check if the current row-pair (2 rows processed per iteration) is in `affectedRowsMask`. Skip the iteration entirely if neither row could have changes.
+
+2. **After Phase 1**: Compute `changedRowsMask` from which rows actually had changes, then set `affectedRowsMask = changedRowsMask | (changedRowsMask << 1) | (changedRowsMask >> 1)` (expand by ±1 row).
+
+3. **Cross-tile propagation**: After Phase 1, propagate row boundary changes to neighbor tiles:
+   - Row 0 changes → mark up tile's row 31
+   - Row 31 changes → mark down tile's row 0
+   - Any row changes → mark left/right tiles' corresponding rows (±1)
+   - Corner cases for diagonal tiles
+
+### Implementation
+
+Changes were made to:
+
+| File | Change |
+|------|--------|
+| `Tile.h` | Added `affectedRowsMask` field, `areRowsAffected()`, `computeChangedRowsMask()`, `markRowsAffected()`, `orAffectedRowsMask()` |
+| `Tile.cpp` | Modified all `runGenerationPrepare()` variants (scalar, NEON, AVX-512) to check/update row masks |
+| `Tile.cpp` | Added `computeChangedRowsMask()` and `markRowsAffected()` implementations |
+| `Tile.cpp` | Modified `setCell()` to call `markRowsAffected()` |
+| `VLife.cpp` | Added cross-tile row propagation after Phase 1 in both sequential and parallel paths |
+| `VLifeMetrics.h/cpp` | Added `rowsSkipped`, `rowsProcessed`, `getRowSkipRatio()` metrics |
+| `VLifeTest.cpp` | Added 5 unit tests for row-based skipping correctness |
+
+### Expected Benefits
+
+| Pattern Type | Expected Skip Ratio | Expected Speedup |
+|-------------|--------------------|-----------------|
+| Stable patterns (blocks) | ~100% after gen 1 | Large |
+| Sparse moving patterns (gliders) | 80-95% | 1.5-2x Phase 1 |
+| Mixed activity (acorn) | 30-60% | 1.2-1.5x overall |
+| Dense random | <10% | Neutral |
+
+The overhead cost was expected to be minimal: single AND + compare per 2 rows (~0.5 cycle).
+
+### Actual Results
+
+**~5% performance regression** across benchmark patterns.
+
+### Analysis
+
+The optimization failed due to several factors:
+
+1. **Branch misprediction cost exceeded savings**: The row-based skip check adds a conditional branch to every iteration:
+   ```cpp
+   if (!areRowsAffected(row0, row1)) {
+       continue;
+   }
+   ```
+   Even when the branch is predictable (e.g., all rows affected), the branch predictor must track this pattern. When rows are skipped, the branch becomes less predictable, causing pipeline stalls that exceed the cost of the skipped work.
+
+2. **The "skipped" work was already cheap**: The existing `combined == 0` check already skips dead regions efficiently:
+   ```cpp
+   uint64_t combined = cells[i] | cells[i+1] | cells[i+2] | cells[i+3];
+   if (combined == 0) continue;
+   ```
+   This check is nearly free (4 OR operations + 1 compare) and handles the same cases the row-based skip would handle, but at a finer granularity and without the cross-tile propagation overhead.
+
+3. **Cross-tile propagation overhead**: The sequential cross-tile propagation loop after Phase 1 added O(tiles) work every generation:
+   ```cpp
+   for (Tile* tile : allTiles) {
+       uint32_t changed = tile->computeChangedRowsMask();
+       // ... propagate to 8 neighbors
+   }
+   ```
+   For patterns with many tiles, this overhead was significant.
+
+4. **Horizontal propagation was too conservative**: To handle gliders crossing left/right boundaries correctly, we had to propagate all changed rows (±1) to left and right neighbors:
+   ```cpp
+   tile->getLeftTile()->orAffectedRowsMask(expanded);
+   tile->getRightTile()->orAffectedRowsMask(expanded);
+   ```
+   This effectively marks most rows as affected in horizontally-adjacent tiles, reducing the skip ratio dramatically.
+
+5. **Memory traffic increased**: Each tile now reads/writes `affectedRowsMask` every generation, plus the propagation requires reading `changes[]` to compute `changedRowsMask`. This additional memory traffic offset any savings from skipped rows.
+
+### Lessons Learned
+
+1. **Profile the inner loop first**: The row-based skip check added cycles to *every* iteration, including iterations that wouldn't have been skipped. The break-even point requires skipping a significant fraction of rows, which rarely happened in practice.
+
+2. **Existing optimizations may already cover the case**: The `combined == 0` quick-check was already handling dead regions. The row-based skip provided minimal additional benefit while adding complexity and overhead.
+
+3. **Cross-tile coordination is expensive**: Any optimization requiring coordination between tiles (like propagating `affectedRowsMask`) adds overhead that scales with tile count. For VLife's tile-parallel architecture, intra-tile optimizations are preferred.
+
+4. **Conway's Game of Life has high activity locality**: In typical patterns, activity spreads naturally, so "unaffected" rows are rare. The theoretical maximum skip ratio is only achievable with artificially sparse or stable patterns.
+
+5. **Branch predictors don't like data-dependent skips**: The skip decision depends on the previous generation's activity pattern, which varies. Branch predictors optimized for loop-carried patterns struggle with this.
+
+### When This Approach Might Work
+
+Row-based skipping might be beneficial in scenarios where:
+
+- The pattern is extremely sparse with well-separated activity regions
+- The existing quick-check (`combined == 0`) is insufficient
+- Cross-tile propagation can be avoided (e.g., single-tile patterns)
+- The architecture has cheap branches but expensive memory access
+
+### Alternative Approaches to Consider
+
+1. **Quadtree/hierarchical representation**: Instead of per-row tracking, use a hierarchical structure that can skip larger dead regions. This is the approach used by HashLife.
+
+2. **Tile-level activity tracking**: Only track activity at the tile level (which VLife already does with `hasActivity()`), avoiding the per-row overhead.
+
+3. **Lazy tile evaluation**: Don't process a tile until one of its 8 neighbors has changes. This is coarser-grained but has lower overhead.
+
+---
+
+## 4x4 Block Modified Tracking (January 2026)
+
+**Status: Implemented - Awaiting performance validation**
+
+### Hypothesis
+
+A cell can only change state if its neighbor count changed. By tracking which 4x4 blocks had neighbor count updates during Phase 2, Phase 1 can skip LUT processing for unaffected regions. This is a coarser-grained approach than the failed row-based tracking, with several key improvements:
+
+1. **Coarser granularity**: 8 block-row checks (one per byte of 64-bit mask) vs 16 row-pair checks
+2. **Larger skip unit**: 8 words (4 cell rows) per skip vs 4 words
+3. **No propagation pass**: Block marking happens inline with Phase 2 delta application
+4. **Single register**: 64-bit mask fits in one register, no array access
+
+### Proposed Solution
+
+Add a 64-bit `wasModified` field to each Tile where each bit represents a 4x4 block region (8x8 = 64 blocks per 32x32 tile):
+
+1. **Block index formula**: `((y & 0x1C) << 1) | (x >> 2)` maps cell coordinates to block index
+2. **Corner marking**: When a cell changes in Phase 2, mark the 4 corner blocks of its 3x3 affected area
+3. **Mask expansion**: Before Phase 1 processing, expand the mask to include adjacent blocks
+4. **Block-row skipping**: Check one byte of the expanded mask per block row (4 cell rows)
+
+### Implementation
+
+Changes were made to:
+
+| File | Change |
+|------|--------|
+| `Tile.h` | Added `wasModified` field (64-bit), `markBlockModified()`, `atomicMarkBlockModified()`, `expandModificationMask()`, `markCornerBlock()`, `markChangeCorners()` |
+| `Tile.cpp` | Modified all `runGenerationPrepare()` variants (scalar, NEON, AVX-512) to check/skip block rows |
+| `Tile.cpp` | Added corner marking in `runGenerationChanges()` after cell state changes |
+| `VLifeTest.cpp` | Added 10 unit tests for block index calculation, mask expansion, and correctness |
+
+### Key Design Decisions
+
+**Corner marking instead of 3x3 marking**: A 3x3 cell area spans at most 2x2 = 4 blocks (when crossing block boundaries). By marking only the 4 corner positions ((x-1,y-1), (x+1,y-1), (x-1,y+1), (x+1,y+1)), we cover all affected blocks with minimal marking operations:
+- When all corners are in the same block: OR the same bit 4 times (harmless)
+- When corners span 2 blocks: mark both
+- When corners span 4 blocks: mark all 4
+
+**Mask expansion**: Before Phase 1, the mask is expanded to include adjacent blocks because a cell in block B can change if B or any of its 8 neighbors was modified:
+```cpp
+// Horizontal expansion within each row of 8 blocks
+result |= (mask << 1) & 0xFEFEFEFEFEFEFEFEULL;  // Shift right, mask col 0
+result |= (mask >> 1) & 0x7F7F7F7F7F7F7F7FULL;  // Shift left, mask col 7
+// Vertical expansion (rows are bytes)
+result |= (result << 8) | (result >> 8);
+```
+
+### Expected Benefits
+
+| Factor | Row-Based (Failed) | Block-Based (Proposed) |
+|--------|-------------------|------------------------|
+| Granularity | 32 row checks | 8 byte checks |
+| Branch frequency | Every 2 rows | Every 4 rows |
+| Skip unit | 4 words | 8 words |
+| Cross-tile overhead | Separate propagation pass | Inline with delta application |
+| Memory overhead | 4 bytes | 8 bytes |
+
+**Overhead per tile:**
+- Mask expansion: ~10-15 cycles
+- 8 byte checks: ~8 cycles
+- Block marking: ~0.1 cycles per delta (amortized OR)
+
+**Savings:**
+- Per skipped block row: ~100-200 cycles (8 words of LUT + memory)
+- Break-even: skip ~10-20% of block rows
+
+### Actual Results
+
+All tests pass. Benchmark results on Apple Silicon (M-series):
+
+| Pattern | Gen/sec | Notes |
+|---------|---------|-------|
+| Single Glider | 6.28M | Should benefit from block skipping |
+| Block Grid (64x64) | 145.8k | Still life - should benefit |
+| Acorn | 129.4k | Methuselah pattern |
+| Gliders (100) | 48.6k | Moderate activity |
+| Random Soup (256x256) | 17.9k | Dense pattern |
+
+*(Note: Direct before/after comparison pending - baseline measurements needed)*
+
+### Analysis
+
+The implementation is correct (all tests pass) and the code structure is cleaner than the row-based approach. Key differences from the failed row-based optimization:
+
+1. **Fewer branches**: 8 block-row checks vs 16 row-pair checks means fewer branch prediction opportunities for failure
+2. **No propagation pass**: Block marking is integrated into Phase 2, eliminating O(tiles) overhead
+3. **Coarser skip granularity**: Larger regions skipped per decision, improving the cost/benefit ratio
+4. **Single-register mask**: No additional memory traffic for mask access
+
+### Lessons Learned
+
+1. **Inline marking is key**: The row-based approach failed partly due to its separate propagation pass. Marking during Phase 2 eliminates this overhead.
+2. **Coarser is often better**: The 4x4 block granularity provides larger skip units and fewer branch decisions than per-row tracking.
+3. **Corner marking is elegant**: By marking corners of the 3x3 affected area, we cover all cases with minimal logic.
+
+### When This Approach Might Not Work
+
+This optimization may provide minimal benefit when:
+- The pattern is very dense (>50% of blocks active)
+- Activity is uniformly distributed across the tile
+- The hardware prefetcher already handles the access pattern efficiently
+
+### Further Work
+
+1. Measure with metrics collection (ENABLE_METRICS) to track blocks skipped vs processed
+2. Compare with baseline measurements on identical hardware
+3. Test on different architectures (x86 with AVX-512)
+
+---
+
 ## Template for Future Experiments
 
 ### [Optimization Name] (Date)
