@@ -8,13 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <thread>
-#include <tbb/parallel_for.h>
-#include <tbb/blocked_range.h>
-#include <tbb/partitioner.h>
-
-// File-scoped static affinity partitioner for better thread-to-tile mapping
-// Persists across runGeneration calls so TBB can learn optimal affinity
-static tbb::affinity_partitioner s_affinityPartitioner;
+#include <tbb/parallel_for_each.h>
 
 VLife::VLife() {
     resetBoard();
@@ -266,63 +260,41 @@ void VLife::runGeneration() {
         return;
     }
 
-    // Build vector of all tiles for parallel iteration
-    std::vector<Tile*> allTiles;
-    allTiles.reserve(tiles.size());
-    for (auto& [coord, tile] : tiles) {
-        allTiles.push_back(tile.get());
-    }
-
-    // Collect tiles that need Phase 1 processing
-    std::vector<Tile*> activeTiles;
-    activeTiles.reserve(tiles.size());
-    for (Tile* tile : allTiles) {
-        if (tile->needsPhase1Processing()) {
-            activeTiles.push_back(tile);
-        }
-    }
-
 #ifdef VLIFE_METRICS_ENABLED
     auto phase1Start = std::chrono::high_resolution_clock::now();
+    std::atomic<size_t> activeTileCount{0};
 #endif
 
-    // PHASE 1: Fully parallel (no dependencies between tiles)
-    // Each tile only writes to its own changes[] array
-    // TBB's work-stealing scheduler handles load balancing automatically
-    // Use explicit grain size for optimal task granularity
-    size_t grainSize = std::max(size_t(1), activeTiles.size() / (4 * std::thread::hardware_concurrency()));
-    tbb::parallel_for(
-        tbb::blocked_range<size_t>(0, activeTiles.size(), grainSize),
-        [&activeTiles](const tbb::blocked_range<size_t>& r) {
-            for (size_t i = r.begin(); i != r.end(); ++i) {
-                activeTiles[i]->runGenerationPrepare();
+    // PHASE 1: Parallel iteration with inline filtering
+    tbb::parallel_for_each(tiles.begin(), tiles.end(),
+        [
+#ifdef VLIFE_METRICS_ENABLED
+            &activeTileCount
+#endif
+        ](auto& pair) {
+            if (pair.second->needsPhase1Processing()) {
+                pair.second->runGenerationPrepare();
+#ifdef VLIFE_METRICS_ENABLED
+                activeTileCount.fetch_add(1, std::memory_order_relaxed);
+#endif
             }
-        },
-        s_affinityPartitioner
+        }
     );
 
 #ifdef VLIFE_METRICS_ENABLED
     auto phase1End = std::chrono::high_resolution_clock::now();
     uint64_t phase1Time = std::chrono::duration_cast<std::chrono::microseconds>(phase1End - phase1Start).count();
     if (metricsCollector) {
-        VLIFE_METRICS_END_PHASE1(*metricsCollector, activeTiles.size(), phase1Time);
+        VLIFE_METRICS_END_PHASE1(*metricsCollector, activeTileCount.load(), phase1Time);
     }
     auto phase2Start = std::chrono::high_resolution_clock::now();
 #endif
 
-    // PHASE 2: Fully parallel with boundary-only atomics
-    // All tiles are processed in parallel. Race conditions are prevented by:
-    // - Interior cells (88% of tile): only updated by own tile, non-atomic
-    // - Boundary cells (12% of tile): use atomic operations since neighbor tiles may also update
-    size_t phase2GrainSize = std::max(size_t(1), allTiles.size() / (4 * std::thread::hardware_concurrency()));
-    tbb::parallel_for(
-        tbb::blocked_range<size_t>(0, allTiles.size(), phase2GrainSize),
-        [&allTiles](const tbb::blocked_range<size_t>& r) {
-            for (size_t i = r.begin(); i != r.end(); ++i) {
-                allTiles[i]->runGenerationChanges<true>();
-            }
-        },
-        s_affinityPartitioner
+    // PHASE 2: All tiles processed in parallel
+    tbb::parallel_for_each(tiles.begin(), tiles.end(),
+        [](auto& pair) {
+            pair.second->template runGenerationChanges<true>();
+        }
     );
 
 #ifdef VLIFE_METRICS_ENABLED
@@ -331,7 +303,7 @@ void VLife::runGeneration() {
     size_t tilesCreated = tiles.size() > initialTileCount ? tiles.size() - initialTileCount : 0;
     size_t preEvictCount = tiles.size();
     if (metricsCollector) {
-        VLIFE_METRICS_END_PHASE2(*metricsCollector, allTiles.size(), phase2Time);
+        VLIFE_METRICS_END_PHASE2(*metricsCollector, tiles.size(), phase2Time);
     }
 #endif
 
