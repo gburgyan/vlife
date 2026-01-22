@@ -33,7 +33,7 @@
 
 Tile::Tile(VLife *board, int32_t tileX, int32_t tileY) :
     board(board), tileX(tileX), tileY(tileY), left(nullptr), right(nullptr), up(nullptr), down(nullptr),
-    upLeft(nullptr), upRight(nullptr), downLeft(nullptr), downRight(nullptr), liveCount(0), hasAnyActivity(false) {
+    upLeft(nullptr), upRight(nullptr), downLeft(nullptr), downRight(nullptr), liveCount(0), activityRows(0) {
     // Initialize all cells to zero (dead)
     std::memset(cells, 0, sizeof(cells));
     std::memset(changes, 0, sizeof(changes));
@@ -263,14 +263,21 @@ void Tile::runGenerationPrepare() {
     // Reset changes accumulator for Phase 2 short-circuit optimization
     changesAccumulator = 0;
 
-    // Quick exit if nothing modified - preserve hasAnyActivity as-is
-    // (tile is unchanged, so previous activity state is still valid)
-    if (modMask == 0) {
+    // Quick exit if nothing modified AND no activity
+    // If activityRows != 0, we need to scan to detect rule changes
+    // (e.g., setCell called between generations sets activityRows but not wasModified)
+    if (modMask == 0 && activityRows == 0) {
         return;
     }
 
-    // Reset activity tracking for this scan - we'll set true if we find content
-    hasAnyActivity = false;
+    // If modMask == 0 but activityRows != 0, force a full scan
+    // This handles the case where setCell was called after wasModified was cleared
+    if (modMask == 0) {
+        modMask = ~0ULL;
+    }
+
+    // Note: activityRows is preserved for unscanned rows (rowMask == 0)
+    // and updated only for rows we actually scan (rowMask != 0)
 
     auto ruleLUT = board->ruleLUT;
 
@@ -285,8 +292,13 @@ void Tile::runGenerationPrepare() {
         uint8_t rowMask = (modMask >> (blockRow * 8)) & 0xFF;
         if (rowMask == 0) {
             // Skip 8 words (4 cell rows) - changes[] stays zero from memset
+            // Preserve this row's activity bit - row content is unchanged
             continue;
         }
+
+        // Clear this row's activity bit since we're scanning it
+        // Will be set if we find any content
+        activityRows &= ~(1 << blockRow);
 
         // Process 8 words for this block row (2 iterations of 4 words each)
         int baseIdx = blockRow * 8;
@@ -303,8 +315,8 @@ void Tile::runGenerationPrepare() {
                 continue;
             }
 
-            // Mark tile as having activity since we found non-zero cells
-            hasAnyActivity = true;
+            // Mark this block row as having activity since we found non-zero cells
+            activityRows |= (1 << blockRow);
 
             uint64_t changeBuff = 0;
 
@@ -439,8 +451,13 @@ void Tile::runGenerationPrepare() {
         uint8_t rowMask = (modMask >> (blockRow * 8)) & 0xFF;
         if (rowMask == 0) {
             // Skip 8 words (4 cell rows) - changes[] stays zero from memset
+            // Preserve this row's activity bit - row content is unchanged
             continue;
         }
+
+        // Clear this row's activity bit since we're scanning it
+        // Will be set if we find any content
+        activityRows &= ~(1 << blockRow);
 
         // Process 8 words for this block row (2 iterations of 4 words each)
         int baseIdx = blockRow * 8;
@@ -459,8 +476,8 @@ void Tile::runGenerationPrepare() {
                 continue;  // Skip this group entirely - no activity possible
             }
 
-            // Mark tile as having activity since we found non-zero cells
-            hasAnyActivity = true;
+            // Mark this block row as having activity since we found non-zero cells
+            activityRows |= (1 << blockRow);
 
             uint64_t changeBuff = 0;
 
@@ -603,14 +620,21 @@ void Tile::runGenerationPrepare_AVX512() {
     // Reset changes accumulator for Phase 2 short-circuit optimization
     changesAccumulator = 0;
 
-    // Quick exit if nothing modified - preserve hasAnyActivity as-is
-    // (tile is unchanged, so previous activity state is still valid)
-    if (modMask == 0) {
+    // Quick exit if nothing modified AND no activity
+    // If activityRows != 0, we need to scan to detect rule changes
+    // (e.g., setCell called between generations sets activityRows but not wasModified)
+    if (modMask == 0 && activityRows == 0) {
         return;
     }
 
-    // Reset activity tracking for this scan - we'll set true if we find content
-    hasAnyActivity = false;
+    // If modMask == 0 but activityRows != 0, force a full scan
+    // This handles the case where setCell was called after wasModified was cleared
+    if (modMask == 0) {
+        modMask = ~0ULL;
+    }
+
+    // Note: activityRows is preserved for unscanned rows (rowMask == 0)
+    // and updated only for rows we actually scan (rowMask != 0)
 
     // Constants for byte-level operations
     // Note: AVX-512 doesn't have byte-level shifts, so we use masks and comparisons
@@ -637,8 +661,13 @@ void Tile::runGenerationPrepare_AVX512() {
         uint8_t rowMask = (modMask >> (blockRow * 8)) & 0xFF;
         if (rowMask == 0) {
             // Skip this block row - changes[] stays zero from memset
+            // Preserve this row's activity bit - row content is unchanged
             continue;
         }
+
+        // Clear this row's activity bit since we're scanning it
+        // Will be set if we find any content
+        activityRows &= ~(1 << blockRow);
 
         // Load 64 bytes (64 cell pairs)
         __m512i data = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(cellBytes + byteOffset));
@@ -649,8 +678,8 @@ void Tile::runGenerationPrepare_AVX512() {
             continue;
         }
 
-        // Mark tile as having activity since we found non-zero cells
-        hasAnyActivity = true;
+        // Mark this block row as having activity since we found non-zero cells
+        activityRows |= (1 << blockRow);
 
         // Extract components using masks (no shifts needed for detection)
         // Left cell alive: bit 7 set
@@ -1129,9 +1158,6 @@ inline void Tile::applyDelta(int x, int y, int8_t delta) {
 
     // Update the neighbor count (mask to 3 bits to prevent corruption from negative values)
     cells[cellIdx] = (cells[cellIdx] & ~mask) | (static_cast<uint64_t>(newCount & 0x7) << bitPos);
-
-    // Mark tile as having activity if cell is non-zero
-    if (cells[cellIdx] != 0) hasAnyActivity = true;
 }
 
 // Apply vertical deltas to 4 consecutive cells in a row (x-1, x, x+1, x+2)
@@ -1181,8 +1207,6 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
                (static_cast<uint64_t>(c3 & 0x7) << (baseBitPos + 12));
 
         cells[cellIdx] = word;
-        // Mark tile as having activity if word is non-zero
-        if (word != 0) hasAnyActivity = true;
     } else {
         // Slow path: handle boundaries individually
         // Uses applyDelta which routes boundary cells through atomicApplyDelta
@@ -1242,9 +1266,6 @@ void Tile::atomicApplyDelta(int x, int y, int8_t delta) {
 
     } while (!__atomic_compare_exchange_n(&cells[cellIdx], &oldVal, newVal,
                                            false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
-
-    // Atomically set activity flag
-    __atomic_store_n(&hasAnyActivity, true, __ATOMIC_RELAXED);
 }
 
 // Atomically apply vertical deltas to 4 consecutive cells in a row
@@ -1305,9 +1326,6 @@ inline void Tile::nonAtomicApplyDelta(int x, int y, int8_t delta) {
     int count = (oldVal & mask) >> bitPos;
     count += delta;
     cells[cellIdx] = (oldVal & ~mask) | (static_cast<uint64_t>(count & 0x7) << bitPos);
-
-    // Mark tile as having activity if cell is non-zero
-    if (cells[cellIdx] != 0) hasAnyActivity = true;
 }
 
 // Non-atomic version of atomicAddBoundaryDeltas for sequential execution

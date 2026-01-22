@@ -16,6 +16,7 @@
 
 // Number of generations a dead tile must remain inactive before being evicted
 // This prevents "flapping" (tiles being repeatedly created and destroyed)
+// Safety is ensured by isSafeToEvict() checking liveCount, activityRows, AND wasModified
 static constexpr uint8_t TILE_COOLDOWN_GENERATIONS = 4;
 
 // Align Tile to 64-byte cache line boundaries to prevent false sharing
@@ -39,10 +40,10 @@ class alignas(64) Tile {
     uint64_t changesAccumulator{0};  // OR of all changeBuff values, for quick Phase 2 skip
     uint32_t liveCount; // Tracks the number of live cells in this tile
 
-    // Activity tracking for tile-level skip optimization
-    // True if the tile has any non-zero content (live cells or neighbor counts)
-    // This allows skipping completely dead tiles during generation scan
-    bool hasAnyActivity{false};
+    // Per-row activity tracking for tile eviction (8 bits = 8 block rows)
+    // Bit is set when content found during Phase 1 scan
+    // Rows with rowMask == 0 preserve their activity bit (content unchanged)
+    uint8_t activityRows{0};
 
     // Block-level modification tracking (64 bits = 8x8 blocks of 4x4 cells each)
     // Bit index: ((y & 0x1C) << 1) | (x >> 2)
@@ -140,14 +141,32 @@ public:
     uint32_t getLiveCount() const { return liveCount; }
 
     // Activity tracking methods for tile-level skip optimization
-    inline void markWordActive(uint32_t) {
-        hasAnyActivity = true;
+    // Mark the block row containing this word as having activity
+    // Called by setCell/updateNeighborCount to ensure new content is processed
+    inline void markWordActive(uint32_t wordIdx) {
+        // Each block row has 8 words (64-bit values)
+        int blockRow = wordIdx / 8;
+        activityRows |= (1 << blockRow);
     }
 
     // Check if the tile has any potential activity (live cells or neighbor counts)
     // Used for tile-level skip optimization
     inline bool hasActivity() const {
-        return hasAnyActivity;
+        return activityRows != 0;
+    }
+
+    // Check if the tile needs Phase 1 processing
+    // A tile needs processing if it has activity OR was modified by Phase 2
+    inline bool needsPhase1Processing() const {
+        return activityRows != 0 || wasModified != 0;
+    }
+
+    // Check if the tile is safe to evict
+    // A tile is safe to evict only if: no live cells, no activity, and no pending modifications
+    // - active==0 && mod!=0: Phase 2 just changed something, tile is in play
+    // - active!=0 && mod==0: Static pattern (e.g., block) - has content but no pending changes
+    inline bool isSafeToEvict() const {
+        return liveCount == 0 && activityRows == 0 && wasModified == 0;
     }
 
     // Block modification tracking methods (64 bits = 8x8 blocks of 4x4 cells)

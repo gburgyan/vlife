@@ -195,10 +195,9 @@ void VLife::runGenerationSequential() {
     // First pass: prepare all tiles for the generation
     // Tile-level skip optimization: skip tiles with no activity
     for (auto& [coord, tile] : tiles) {
-        // Only process tiles that have potential activity
-        // A tile with no activity has no live cells and no neighbor counts,
-        // so it cannot produce any changes
-        if (tile->hasActivity()) {
+        // Only process tiles that need Phase 1 processing
+        // This includes tiles with activity OR tiles modified by Phase 2
+        if (tile->needsPhase1Processing()) {
             tile->runGenerationPrepare();
 #ifdef VLIFE_METRICS_ENABLED
             activeTilesCount++;
@@ -274,11 +273,11 @@ void VLife::runGeneration() {
         allTiles.push_back(tile.get());
     }
 
-    // Collect active tiles for Phase 1
+    // Collect tiles that need Phase 1 processing
     std::vector<Tile*> activeTiles;
     activeTiles.reserve(tiles.size());
     for (Tile* tile : allTiles) {
-        if (tile->hasActivity()) {
+        if (tile->needsPhase1Processing()) {
             activeTiles.push_back(tile);
         }
     }
@@ -408,19 +407,15 @@ void VLife::evictDeadTiles() {
     std::vector<TileCoord> deadTiles;
 
     for (auto& [coord, tile] : tiles) {
-        if (tile->getLiveCount() == 0) {
-            if (!tile->hasActivity()) {
-                // Tile is completely inactive - decrement cooldown
-                if (tile->decrementCooldown()) {
-                    // Cooldown expired, mark for eviction
-                    deadTiles.push_back(coord);
-                }
-            } else {
-                // Tile has neighbor counts but no live cells - reset cooldown
-                tile->resetCooldown();
+        if (tile->isSafeToEvict()) {
+            // Tile is completely inactive (no cells, no activity, no pending mods)
+            // Decrement cooldown
+            if (tile->decrementCooldown()) {
+                // Cooldown expired, mark for eviction
+                deadTiles.push_back(coord);
             }
         } else {
-            // Tile has live cells - reset cooldown
+            // Tile has content or pending work - reset cooldown
             tile->resetCooldown();
         }
     }
