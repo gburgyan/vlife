@@ -263,13 +263,6 @@ void Tile::runGenerationPrepare() {
     // Reset changes accumulator for Phase 2 short-circuit optimization
     changesAccumulator = 0;
 
-    // Quick exit if nothing modified AND no activity
-    // If activityRows != 0, we need to scan to detect rule changes
-    // (e.g., setCell called between generations sets activityRows but not wasModified)
-    if (modMask == 0 && activityRows == 0) {
-        return;
-    }
-
     // If modMask == 0 but activityRows != 0, force a full scan
     // This handles the case where setCell was called after wasModified was cleared
     if (modMask == 0) {
@@ -619,13 +612,6 @@ void Tile::runGenerationPrepare_AVX512() {
 
     // Reset changes accumulator for Phase 2 short-circuit optimization
     changesAccumulator = 0;
-
-    // Quick exit if nothing modified AND no activity
-    // If activityRows != 0, we need to scan to detect rule changes
-    // (e.g., setCell called between generations sets activityRows but not wasModified)
-    if (modMask == 0 && activityRows == 0) {
-        return;
-    }
 
     // If modMask == 0 but activityRows != 0, force a full scan
     // This handles the case where setCell was called after wasModified was cleared
