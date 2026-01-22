@@ -85,9 +85,9 @@
     \begin{abstract}
         We present VLife, a Conway's Game of Life implementation where computational cost scales with \emph{activity} (the number of state changes per generation) rather than population or grid size. The key insight is that neighbor counting---traditionally requiring $O(8N)$ operations per generation where $N$ is the population---can be replaced with incremental maintenance costing only $O(8k)$ where $k$ is the number of cells that actually change state. Since $k \ll N$ for most patterns (typically 1--10\% of population), this yields substantial performance improvements.
 
-        VLife achieves this through a novel nibble-packed cell representation storing both cell liveness and neighbor counts in 4 bits per cell, enabling $O(1)$ rule evaluation. Fixed $32 \times 32$ tiles provide cache-efficient processing and natural parallelization boundaries. Lookup tables eliminate conditional branches, and hierarchical activity masking enables $O(1)$ skipping of inactive regions. Boundary-aware parallelism achieves full parallel execution with atomic operations only for the $\sim$12\% of cells on tile boundaries.
+        VLife achieves this through a novel nibble-packed cell representation storing both cell liveness and neighbor counts in 4 bits per cell, enabling $O(1)$ rule evaluation. Fixed $32 \times 32$ tiles provide cache-efficient processing and natural parallelization boundaries. Lookup tables eliminate conditional branches, and hierarchical activity masking---including block-level modification tracking via 64-bit masks---enables $O(1)$ skipping of inactive regions. Boundary-aware parallelism achieves full parallel execution with atomic operations only for the $\sim$12\% of cells on tile boundaries. Optional AVX-512 SIMD optimization replaces lookup tables with direct computation for additional throughput on supported hardware.
 
-        Benchmark results demonstrate the activity-proportional property: a single glider processes at 6.17M generations/second while random $256^2$ soup processes at 17.7K gen/sec---a 350$\times$ ratio closely matching the activity ratio. Dense $1024^2$ patterns achieve $\sim$1.4 billion cell-updates per second. Unlike HashLife, which excels on self-similar patterns but struggles with chaos, VLife provides \emph{predictable, bounded} performance across all pattern types, making it suitable for real-time visualization and chaotic pattern exploration.
+        Benchmark results demonstrate the activity-proportional property: a single glider processes at 6.17M generations/second while random $256^2$ soup processes at 17.7K gen/sec---a 350$\times$ ratio closely matching the activity ratio. Dense $1024^2$ patterns achieve $\sim$1.4 billion cell-updates per second. An optional metrics collection system with zero runtime overhead validates the $O(k)$ complexity claim empirically. Unlike HashLife, which excels on self-similar patterns but struggles with chaos, VLife provides \emph{predictable, bounded} performance across all pattern types, making it suitable for real-time visualization and chaotic pattern exploration.
 
         The techniques presented---incremental neighbor tracking, implicit neighbor relationships via cell pairing, and boundary-aware parallelism---are applicable to other cellular automata and grid-based simulations.
     \end{abstract}
@@ -113,9 +113,10 @@
         \item \textbf{Nibble-packed cell representation}: A 4-bit encoding storing cell liveness (1 bit) and partial neighbor count (3 bits), enabling implicit neighbor relationships between paired cells
         \item \textbf{Fixed-size tile organization}: $32 \times 32$ cell tiles providing predictable memory layout and cache-efficient processing
         \item \textbf{Lookup table rule evaluation}: 256-entry pre-computed tables eliminating conditional branches during rule application
-        \item \textbf{Hierarchical skip optimization}: Activity masking at word and tile levels to bypass dead regions
+        \item \textbf{Hierarchical skip optimization}: Block-level modification tracking (64-bit mask for 8$\times$8 blocks) combined with activity row masking to bypass dead regions
         \item \textbf{Boundary-aware parallelism}: Full parallel execution with atomic operations only for boundary cells ($\sim$12\% of tile)
-        \item \textbf{Platform-specific SIMD}: ARM NEON optimization with prefetching for modern processors
+        \item \textbf{Platform-specific SIMD}: ARM NEON optimization with prefetching, optional AVX-512 direct computation path
+        \item \textbf{Zero-overhead metrics}: Optional instrumentation system for empirical $O(k)$ validation
     \end{enumerate}
 
     \section{Background}
@@ -225,7 +226,7 @@
         Each tile consists of:
         \begin{itemize}
             \item Cell data: 1024 cells $\times$ 4 bits = 512 bytes
-            \item Changes array: 1024 cells $\times$ 2 bits / 64 = 128 bytes
+            \item Changes array: 512 cell pairs $\times$ 2 bits = 1024 bits = 128 bytes
             \item Activity mask: 8 bytes
             \item Neighbor pointers: $8 \times 8$ bytes = 64 bytes
             \item Metadata (coordinates, live count, etc.): $\sim$32 bytes
@@ -248,7 +249,7 @@
 
         For typical Game of Life patterns:
         \begin{itemize}
-            \item Still lifes: $k = 0$, ratio $\to \infty$ (effectively free after initial setup)
+            \item Still lifes: $k = 0$, neighbor updates eliminated but Phase 1 tile checking remains $O(T)$
             \item Oscillators: $k/N \approx 0.1$--$0.5$ depending on period, ratio = 2--10$\times$
             \item Spaceships: $k/N \approx 0.25$ (glider changes $\sim$1 cell/generation on average), ratio $\approx 4\times$
             \item Random soup: $k/N \approx 0.05$--$0.20$ depending on density, ratio = 5--20$\times$
@@ -351,6 +352,8 @@ int rightAlive = (i >> 3) & 1;       // Paired
 leftNeighbors += rightAlive;         // True count
     \end{lstlisting}
 
+    This byte-level encoding enables the rule LUT to process \emph{two cells simultaneously} with a single table lookup. The 256-entry LUT is indexed by the full byte value, and the paired cell's contribution to each neighbor count is handled implicitly within the table---no explicit addition is required at runtime. This doubles throughput compared to per-cell evaluation while maintaining the implicit neighbor relationship.
+
     \subsection{Tile-Based Spatial Organization}
 
     VLife organizes cells into $32 \times 32$ tiles (1024 cells, 512 bytes per tile). The tile dimensions provide:
@@ -373,11 +376,52 @@ leftNeighbors += rightAlive;         // True count
 
     \subsection{Activity Masking}
 
-    VLife implements hierarchical activity tracking at two levels:
+    VLife implements hierarchical activity tracking at multiple levels to minimize unnecessary computation.
 
-    \textbf{Word-Level:} Each tile maintains a 64-bit activity mask where each bit corresponds to one 64-bit word in the cells array. Dead words (containing no live cells and no non-zero neighbor counts) are skipped entirely.
+    \subsubsection{Activity Row Tracking}
 
-    \textbf{Tile-Level:} Completely inactive tiles (activityMask == 0) are excluded from generation processing.
+    Each tile maintains an 8-bit \texttt{activityRows} mask where each bit corresponds to one block row (8 words, covering 4 cell rows). This mask is updated during Phase 1 scanning and cell modifications:
+
+    \begin{lstlisting}
+inline void markWordActive(uint32_t wordIdx) {
+    int blockRow = wordIdx / 8;
+    activityRows |= (1 << blockRow);
+}
+    \end{lstlisting}
+
+    Rows with zero activity bits are skipped during Phase 1, while rows that weren't scanned preserve their activity bits to ensure content isn't lost.
+
+    \textbf{Tile-Level:} Completely inactive tiles (\texttt{activityRows == 0}) are excluded from generation processing entirely.
+
+    \subsubsection{Block-Level Modification Tracking}
+
+    A 64-bit \texttt{wasModified} mask tracks which 4$\times$4 cell blocks had neighbor counts updated during Phase 2. The tile is divided into an 8$\times$8 grid of blocks, with each bit representing one block:
+
+    \begin{verbatim}
+Block index formula: ((y & 0x1C) << 1) | (x >> 2)
+
+Block layout (8x8 = 64 blocks in 32x32 tile):
++----+----+----+----+----+----+----+----+
+|  0 |  1 |  2 |  3 |  4 |  5 |  6 |  7 | Row 0 (cells 0-3)
++----+----+----+----+----+----+----+----+
+|  8 |  9 | 10 | 11 | 12 | 13 | 14 | 15 | Row 1 (cells 4-7)
++----+----+----+----+----+----+----+----+
+  ...                                       ...
++----+----+----+----+----+----+----+----+
+| 56 | 57 | 58 | 59 | 60 | 61 | 62 | 63 | Row 7 (cells 28-31)
++----+----+----+----+----+----+----+----+
+    \end{verbatim}
+
+    When a cell changes state in Phase 2, the four corner blocks of its 3$\times$3 affected area are marked via \texttt{markChangeCorners()}. This ensures all cells that could potentially change (due to neighbor count updates) are re-evaluated in the next Phase 1.
+
+    \textbf{Three-Level Skip Hierarchy:} Phase 1 processing uses a hierarchical skip strategy:
+    \begin{enumerate}
+        \item \textbf{Block-row level:} If no blocks in a row were modified, skip 8 words (4 cell rows)
+        \item \textbf{4-word OR:} If \texttt{cells[i] | cells[i+1] | cells[i+2] | cells[i+3] == 0}, skip the group
+        \item \textbf{Individual word:} Process only non-zero words within active groups
+    \end{enumerate}
+
+    This hierarchical approach was developed after failed experiments with per-row tracking (5\% regression) and per-cell tracking, which added branch misprediction overhead exceeding the savings. Finer granularity also increases memory usage for tracking masks, consuming additional bandwidth and cache capacity. The 4$\times$4 block granularity provides the optimal balance between skip granularity, decision overhead, and memory efficiency.
 
     \subsection{Two-Phase Generation Processing}
 
@@ -399,6 +443,145 @@ leftNeighbors += rightAlive;         // True count
     \subsection{Thread-Safe Cross-Tile Updates}
 
     When cell changes occur near tile boundaries, VLife uses atomic compare-and-swap operations with relaxed memory ordering. A buffered boundary optimization accumulates deltas in stack-local arrays and batch-applies them, reducing the number of atomic operations.
+
+    \subsection{Tile Lifecycle Management}
+
+    \subsubsection{Three-Factor Eviction Safety}
+
+    Tiles are dynamically created when cells are set and must be safely evicted when no longer needed to prevent unbounded memory growth. The \texttt{isSafeToEvict()} predicate requires all three conditions:
+
+    \begin{lstlisting}
+bool isSafeToEvict() const {
+    return liveCount == 0 &&
+           activityRows == 0 &&
+           wasModified == 0;
+}
+    \end{lstlisting}
+
+    Each factor protects against a distinct edge case:
+    \begin{itemize}
+        \item \texttt{liveCount == 0}: No live cells remain (obvious requirement)
+        \item \texttt{activityRows == 0}: No non-zero neighbor counts that could trigger births
+        \item \texttt{wasModified == 0}: No pending Phase 2 changes propagated from neighbors
+    \end{itemize}
+
+    The combination handles subtle scenarios: a tile with \texttt{activityRows != 0} but \texttt{wasModified == 0} contains static content (e.g., a still life's neighbor counts), while a tile with \texttt{activityRows == 0} but \texttt{wasModified != 0} just received neighbor updates and must be processed next generation.
+
+    \subsubsection{Cooldown-Based Eviction}
+
+    To prevent ``flapping'' (tiles being repeatedly created and destroyed at oscillating boundaries), tiles must remain inactive for a cooldown period before eviction:
+
+    \begin{lstlisting}
+static constexpr uint8_t TILE_COOLDOWN_GENERATIONS = 4;
+
+bool decrementCooldown() {
+    if (cooldownCounter == 0) {
+        cooldownCounter = TILE_COOLDOWN_GENERATIONS;
+        return false;  // First time inactive, start cooldown
+    }
+    return --cooldownCounter == 0;  // Evict when counter reaches 0
+}
+    \end{lstlisting}
+
+    This hysteresis prevents performance degradation from patterns that oscillate near tile boundaries. A glider crossing a tile edge, for example, briefly activates the destination tile; the cooldown ensures the source tile isn't evicted before the glider fully departs.
+
+    \subsection{AVX-512 SIMD Optimization}
+
+    VLife includes an optional AVX-512 optimization for Phase 1 that replaces the 256-entry lookup table with direct SIMD computation.
+
+    \subsubsection{Motivation}
+
+    The standard implementation uses a LUT indexed by a byte (representing two cells):
+
+    \begin{lstlisting}
+changeBuff |= ruleLUT[(slice >> 56)] << 62;
+changeBuff |= ruleLUT[(slice >> 48) & 0xFF] << 60;
+// ... 8 lookups per 64-bit word
+    \end{lstlisting}
+
+    While cache-efficient for hot data, LUT lookups incur unpredictable memory access patterns that limit instruction-level parallelism. AVX-512's 512-bit registers can process 64 cell pairs simultaneously using pure computation.
+
+    \subsubsection{Implementation}
+
+    The AVX-512 path applies Conway's rules directly using mask operations:
+
+    \begin{lstlisting}
+// Load 64 bytes (64 cell pairs)
+__m512i data = _mm512_loadu_si512(cellBytes + offset);
+
+// Extract alive flags
+__mmask64 left_alive = _mm512_test_epi8_mask(data, mask_left_alive);
+__mmask64 right_alive = _mm512_test_epi8_mask(data, mask_right_alive);
+
+// Compute survival: alive AND neighbors in {2,3}
+// Compute birth: !alive AND neighbors == 3
+// Account for paired cell contribution to neighbor count
+__mmask64 left_changes = (left_alive & ~left_survive) |
+                          (~left_alive & left_birth);
+    \end{lstlisting}
+
+    \subsubsection{Build Configuration}
+
+    AVX-512 support is controlled by CMake options:
+
+    \begin{itemize}
+        \item \texttt{-DENABLE\_AVX512=ON}: Enables AVX-512 via SIMDE (portable emulation layer). Works on any CPU for testing.
+        \item \texttt{-DAVX512\_NATIVE=ON}: Uses native intrinsics. Requires AVX-512 hardware (Intel Ice Lake+, AMD Zen 4+).
+    \end{itemize}
+
+    Runtime dispatch via \texttt{CpuFeatures::hasAVX512Support()} selects the appropriate code path.
+
+    \subsubsection{Expected Performance}
+
+    On AVX-512-capable hardware:
+    \begin{itemize}
+        \item \textbf{Phase 1}: 2--4$\times$ speedup from eliminating LUT random access
+        \item \textbf{Overall}: 1.5--2.5$\times$ speedup (Phase 1 accounts for $\sim$60\% of execution)
+    \end{itemize}
+
+    Note: Some Intel CPUs throttle frequency during heavy AVX-512 workloads, which may reduce net benefit.
+
+    \subsection{Parallel Processing Architecture}
+
+    VLife uses Intel TBB for parallel tile processing with a design optimized for minimal synchronization.
+
+    \subsubsection{Parallel Iteration}
+
+    Generation processing uses \texttt{tbb::parallel\_for\_each} with inline activity filtering:
+
+    \begin{lstlisting}
+// Phase 1: Parallel with inline skip
+tbb::parallel_for_each(tiles.begin(), tiles.end(),
+    [](auto& pair) {
+        if (pair.second->needsPhase1Processing()) {
+            pair.second->runGenerationPrepare();
+        }
+    }
+);
+
+// Phase 2: All tiles in parallel
+tbb::parallel_for_each(tiles.begin(), tiles.end(),
+    [](auto& pair) {
+        pair.second->runGenerationChanges<true>();
+    }
+);
+    \end{lstlisting}
+
+    \subsubsection{Atomic vs Non-Atomic Paths}
+
+    The \texttt{runGenerationChanges} method is templated on atomicity:
+
+    \begin{lstlisting}
+template<bool UseAtomics = true>
+void runGenerationChanges();
+    \end{lstlisting}
+
+    \begin{itemize}
+        \item \texttt{UseAtomics=true}: CAS loops for boundary cell updates (required for parallel)
+        \item \texttt{UseAtomics=false}: Direct writes (10--20\% faster, used in sequential mode)
+    \end{itemize}
+
+    This eliminates atomic overhead when running single-threaded (e.g., for small tile counts or benchmarking).
 
     \section{Comparative Analysis}
 
@@ -514,16 +697,73 @@ leftNeighbors += rightAlive;         // True count
         \end{tabular}
     \end{table}
 
+    \section{Metrics Collection System}
+
+    VLife includes an optional instrumentation system for validating the activity-proportional complexity claims empirically.
+
+    \subsection{Zero-Overhead Design}
+
+    When \texttt{VLIFE\_METRICS\_ENABLED} is not defined at compile time, all metrics macros expand to no-ops:
+
+    \begin{lstlisting}
+#ifdef VLIFE_METRICS_ENABLED
+    #define VLIFE_METRICS_INC_BORN(n) \
+        MetricsCollector::tlCounters.cellsBorn += (n)
+#else
+    #define VLIFE_METRICS_INC_BORN(n) ((void)0)
+#endif
+    \end{lstlisting}
+
+    This ensures zero runtime overhead in production builds while enabling detailed analysis during research.
+
+    \subsection{Key Metrics}
+
+    The system tracks per-generation metrics supporting the $O(k)$ complexity analysis:
+
+    \begin{itemize}
+        \item \textbf{$k$ (state changes)}: \texttt{cellsBorn + cellsDied} per generation
+        \item \textbf{$N$ (population)}: Total live cells at generation end
+        \item \textbf{Activity ratio ($k/N$)}: Core metric validating $O(k)$ vs $O(N)$ scaling
+        \item \textbf{Boundary crossings}: Cross-tile neighbor updates ($\sim$12\% of cells)
+        \item \textbf{Atomic operations}: CAS operations performed during Phase 2
+        \item \textbf{Timing breakdown}: Phase 1 (rule evaluation) and Phase 2 (neighbor updates) in microseconds
+    \end{itemize}
+
+    \subsection{Thread-Local Accumulation}
+
+    To avoid atomic contention during parallel processing, counters use thread-local storage:
+
+    \begin{lstlisting}
+struct ThreadLocalCounters {
+    uint64_t cellsBorn = 0;
+    uint64_t cellsDied = 0;
+    uint64_t boundaryCrossings = 0;
+    uint64_t atomicOperations = 0;
+};
+
+static thread_local ThreadLocalCounters tlCounters;
+    \end{lstlisting}
+
+    Thread-local counters are merged at phase boundaries via \texttt{VLIFE\_METRICS\_MERGE\_TL()}.
+
+    \subsection{Export Formats}
+
+    Collected metrics can be exported for analysis:
+
+    \begin{itemize}
+        \item \textbf{CSV}: Tabular format with one row per generation (pandas/R compatible)
+        \item \textbf{JSON}: Structured data with metadata and summary statistics
+    \end{itemize}
+
     \section{Future Work}
 
     Several avenues exist for further optimization:
 
     \begin{itemize}
-        \item \textbf{AVX-512 Vectorization}: 512-bit SIMD registers could process 64 cells simultaneously
         \item \textbf{GPU Hybrid Approach}: Offload dense tile regions to GPU while maintaining CPU processing for sparse boundaries
-        \item \textbf{Hierarchical Tiling}: $256 \times 256$ super-tiles could improve skip optimization for very sparse regions
-        \item \textbf{Rule Generalization}: Extend LUT generation to support arbitrary birth/survival rules
-        \item \textbf{Distributed Computing}: Tile-based architecture is amenable to message-passing distributed execution
+        \item \textbf{Hierarchical Super-Tiling}: $256 \times 256$ super-tiles could improve skip optimization for very sparse regions
+        \item \textbf{Rule Generalization}: Extend LUT generation to support arbitrary birth/survival rules (e.g., B36/S23)
+        \item \textbf{Distributed Computing}: Tile-based architecture is amenable to message-passing distributed execution across multiple nodes
     \end{itemize}
 
     \section{Conclusion}
@@ -533,9 +773,10 @@ leftNeighbors += rightAlive;         // True count
     The key contributions are:
 
     \begin{enumerate}
-        \item \textbf{Activity-proportional complexity}: Formal proof that neighbor updates cost $O(8k)$ where $k \ll N$ for typical patterns, yielding order-of-magnitude improvements over population-proportional approaches
+        \item \textbf{Activity-proportional complexity}: Formal proof that neighbor updates cost $O(8k)$ where $k \ll N$ for typical patterns, yielding order-of-magnitude improvements over population-proportional approaches. An optional zero-overhead metrics system enables empirical validation.
         \item \textbf{Nibble-packed paired cells}: Novel 4-bit cell encoding with implicit neighbor relationships enabling single-lookup rule evaluation while maintaining incremental updates
-        \item \textbf{Boundary-aware parallelism}: Full parallel execution without synchronization barriers, using atomic operations only for the $\sim$12\% of cells on tile boundaries
+        \item \textbf{Hierarchical skip optimization}: Block-level modification tracking via 64-bit masks enables $O(1)$ skipping of unmodified regions, with three-level hierarchy (block-row, 4-word OR, individual word) minimizing branch overhead
+        \item \textbf{Boundary-aware parallelism}: Full parallel execution without synchronization barriers, using atomic operations only for the $\sim$12\% of cells on tile boundaries. Template-based atomic/non-atomic paths provide 10--20\% speedup for sequential execution.
         \item \textbf{Predictable, bounded performance}: Unlike HashLife which can exhibit 1000$\times$ variation depending on pattern regularity, VLife provides consistent performance across all pattern types
     \end{enumerate}
 
@@ -543,7 +784,7 @@ leftNeighbors += rightAlive;         // True count
 
     While HashLife achieves exponential speedup on self-similar patterns through memoization, VLife fills a distinct niche: \textbf{predictable, bounded performance for chaotic patterns and real-time applications} where latency consistency matters more than best-case throughput.
 
-    The techniques presented---incremental neighbor tracking, implicit neighbor relationships via cell pairing, hierarchical activity masking, and boundary-aware parallelism---are applicable beyond Game of Life to other cellular automata, lattice-based simulations, and grid computations where change locality can be exploited.
+    The techniques presented---incremental neighbor tracking, implicit neighbor relationships via cell pairing, block-level modification tracking, cooldown-based tile lifecycle management, and boundary-aware parallelism---are applicable beyond Game of Life to other cellular automata, lattice-based simulations, and grid computations where change locality can be exploited.
 
     \begin{thebibliography}{9}
 
@@ -598,6 +839,15 @@ struct PackedDeltas {
     int8_t sameRow[2];     // Horizontal neighbors
     int8_t verticalRow[4]; // Vertical row neighbors
 };
+
+// Activity and modification tracking
+uint8_t activityRows;      // 8 bits: per-row activity
+uint64_t wasModified;      // 64 bits: per-block modification
+uint8_t cooldownCounter;   // Eviction cooldown (0-4)
+
+// Block index calculation for wasModified mask
+// Maps cell (x,y) to one of 64 4x4 blocks
+int blockIdx = ((y & 0x1C) << 1) | (x >> 2);
 
 // Cell nibble layout
 // Bit 3: ALIVE flag
