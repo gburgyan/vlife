@@ -17,13 +17,20 @@ VLife::VLife() {
 }
 
 VLife::~VLife() {
-    // Clear all tiles
+    // Deallocate all tiles back to the pool
+    for (auto& [coord, tile] : tiles) {
+        tilePool.deallocate(tile);
+    }
     tiles.clear();
 }
 
 void VLife::resetBoard() {
-    // Clear all existing tiles
+    // Deallocate all tiles back to the pool
+    for (auto& [coord, tile] : tiles) {
+        tilePool.deallocate(tile);
+    }
     tiles.clear();
+    tilePool.recycle();
 }
 
 Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
@@ -34,7 +41,7 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
         std::shared_lock<std::shared_mutex> readLock(tilesMutex);
         auto it = tiles.find(coord);
         if (it != tiles.end()) {
-            return it->second.get();
+            return it->second;
         }
     }
 
@@ -44,13 +51,12 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
     // Re-check after acquiring exclusive lock (another thread may have created it)
     auto it = tiles.find(coord);
     if (it != tiles.end()) {
-        return it->second.get();
+        return it->second;
     }
 
-    // Create a new tile
-    auto newTile = std::make_unique<Tile>(this, tileX, tileY);
-    Tile *tilePtr = newTile.get();
-    tiles[coord] = std::move(newTile);
+    // Create a new tile using the pool
+    Tile *tilePtr = tilePool.allocate(tileX, tileY);
+    tiles[coord] = tilePtr;
 
     // Connect to neighboring tiles if they exist (already under exclusive lock)
     // We link all 8 neighbors (orthogonal and diagonal) here.
@@ -58,43 +64,43 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
     // Check left (-1, 0)
     auto leftIt = tiles.find(TileCoord{tileX - 1, tileY});
     if (leftIt != tiles.end()) {
-        tilePtr->setNeighbor(leftIt->second.get(), -1, 0);
+        tilePtr->setNeighbor(leftIt->second, -1, 0);
     }
 
     // Check right (1, 0)
     auto rightIt = tiles.find(TileCoord{tileX + 1, tileY});
     if (rightIt != tiles.end()) {
-        tilePtr->setNeighbor(rightIt->second.get(), 1, 0);
+        tilePtr->setNeighbor(rightIt->second, 1, 0);
     }
 
     // Check up (0, -1)
     auto upIt = tiles.find(TileCoord{tileX, tileY - 1});
     if (upIt != tiles.end()) {
-        tilePtr->setNeighbor(upIt->second.get(), 0, -1);
+        tilePtr->setNeighbor(upIt->second, 0, -1);
     }
 
     // Check down (0, 1)
     auto downIt = tiles.find(TileCoord{tileX, tileY + 1});
     if (downIt != tiles.end()) {
-        tilePtr->setNeighbor(downIt->second.get(), 0, 1);
+        tilePtr->setNeighbor(downIt->second, 0, 1);
     }
 
     // Check diagonal neighbors
     auto upLeftIt = tiles.find(TileCoord{tileX - 1, tileY - 1});
     if (upLeftIt != tiles.end()) {
-        tilePtr->setNeighbor(upLeftIt->second.get(), -1, -1);
+        tilePtr->setNeighbor(upLeftIt->second, -1, -1);
     }
     auto upRightIt = tiles.find(TileCoord{tileX + 1, tileY - 1});
     if (upRightIt != tiles.end()) {
-        tilePtr->setNeighbor(upRightIt->second.get(), 1, -1);
+        tilePtr->setNeighbor(upRightIt->second, 1, -1);
     }
     auto downLeftIt = tiles.find(TileCoord{tileX - 1, tileY + 1});
     if (downLeftIt != tiles.end()) {
-        tilePtr->setNeighbor(downLeftIt->second.get(), -1, 1);
+        tilePtr->setNeighbor(downLeftIt->second, -1, 1);
     }
     auto downRightIt = tiles.find(TileCoord{tileX + 1, tileY + 1});
     if (downRightIt != tiles.end()) {
-        tilePtr->setNeighbor(downRightIt->second.get(), 1, 1);
+        tilePtr->setNeighbor(downRightIt->second, 1, 1);
     }
 
     return tilePtr;
@@ -107,7 +113,7 @@ Tile *VLife::getTileIfExists(int32_t tileX, int32_t tileY) {
     TileCoord coord{tileX, tileY};
     auto it = tiles.find(coord);
     if (it != tiles.end()) {
-        return it->second.get();
+        return it->second;
     }
     return nullptr;
 }
@@ -194,7 +200,7 @@ void VLife::runGenerationSequential() {
         if (tile->needsPhase1Processing()) {
             tile->runGenerationPrepare();
             if (tile->hasChanges()) {
-                changedTilesSequential.push_back(tile.get());
+                changedTilesSequential.push_back(tile);
             }
 #ifdef VLIFE_METRICS_ENABLED
             activeTilesCount++;
@@ -278,7 +284,7 @@ void VLife::runGeneration() {
             , &activeTileCount
 #endif
         ](const auto& pair) {
-            Tile* tile = pair.second.get();
+            Tile* tile = pair.second;
             if (tile->needsPhase1Processing()) {
                 tile->runGenerationPrepare();
                 if (tile->hasChanges()) {
@@ -349,7 +355,7 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
         return; // Tile doesn't exist
     }
 
-    Tile *tile = it->second.get();
+    Tile *tile = it->second;
 
     // Unlink from neighbors
     if (tile->left) {
@@ -379,7 +385,8 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
     }
 #endif
 
-    // Remove the tile from the map
+    // Deallocate tile and remove from map
+    tilePool.deallocate(tile);
     tiles.erase(it);
 }
 
@@ -392,7 +399,7 @@ void VLife::evictDeadTiles() {
     uint8_t currentGen = static_cast<uint8_t>(generationNumber);
 
     for (auto it = tiles.begin(); it != tiles.end(); ) {
-        Tile* tile = it->second.get();
+        Tile* tile = it->second;
         if (tile->isSafeToEvict()) {
             // Use modular arithmetic for age calculation (handles wrap-around)
             uint8_t age = currentGen - tile->getLastModifiedGeneration();
@@ -407,6 +414,7 @@ void VLife::evictDeadTiles() {
                 if (tile->downLeft) tile->downLeft->upRight = nullptr;
                 if (tile->downRight) tile->downRight->upLeft = nullptr;
 
+                tilePool.deallocate(tile);
                 it = tiles.erase(it);
                 continue;
             }

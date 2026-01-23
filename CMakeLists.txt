@@ -98,12 +98,14 @@ add_library(
         src/vlife/VLife.h
         src/vlife/Tile.cpp
         src/vlife/Tile.h
+        src/vlife/TilePool.cpp
+        src/vlife/TilePool.h
         src/vlife/VLifeMetrics.cpp
         src/vlife/VLifeMetrics.h
 )
 
-# Link threading library and TBB to GameOfLifeLib
-target_link_libraries(GameOfLifeLib PUBLIC Threads::Threads TBB::tbb)
+# Link threading library and TBB (with malloc for memory_pool) to GameOfLifeLib
+target_link_libraries(GameOfLifeLib PUBLIC Threads::Threads TBB::tbb TBB::tbbmalloc)
 
 # AVX-512 configuration for GameOfLifeLib
 if(ENABLE_AVX512)

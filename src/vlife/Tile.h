@@ -14,10 +14,10 @@
 #define TILE_64S_WIDTH TILE_WIDTH / 64
 #define TILE_64S_HEIGHT TILE_HEIGHT / 64
 
-// Eviction optimization: only check tiles periodically, not every generation
+// Eviction optimization: periodic scan with age threshold
 // EVICTION_CHECK_INTERVAL must be a power of 2 for fast modulo via bitmask
 static constexpr size_t EVICTION_CHECK_INTERVAL = 16;  // Check every N generations
-static constexpr uint8_t EVICTION_AGE_THRESHOLD = 8;   // Evict if unchanged for N generations
+static constexpr uint8_t EVICTION_AGE_THRESHOLD = 4;   // Evict if empty for N generations
 
 // Align Tile to 64-byte cache line boundaries to prevent false sharing
 // when multiple threads update adjacent tiles in parallel

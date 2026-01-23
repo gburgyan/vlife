@@ -4,13 +4,13 @@
 
 #pragma once
 
-#include <memory>
 #include <unordered_map>
 #include <vector>
 #include <mutex>
 #include <shared_mutex>
 #include <tbb/concurrent_vector.h>
 #include "../GameOfLife.h"
+#include "TilePool.h"
 
 // Forward declaration
 class Tile;
@@ -119,8 +119,11 @@ private:
         }
     };
 
-    // Map to store tiles
-    std::unordered_map<TileCoord, std::unique_ptr<Tile>, TileCoordHash> tiles;
+    // Map to store tiles (pool manages lifetime)
+    std::unordered_map<TileCoord, Tile*, TileCoordHash> tiles;
+
+    // Tile pool allocator for efficient allocation/deallocation
+    TilePool tilePool{this};
 
     // Mutex for thread-safe tile creation during parallel processing
     // Uses shared_mutex for reader-writer locking: multiple readers (tile lookups)
