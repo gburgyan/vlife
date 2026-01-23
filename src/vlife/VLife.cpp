@@ -189,11 +189,8 @@ void VLife::runGenerationSequential() {
     // Clear the queue from previous generation (keeps capacity for amortized allocation)
     changedTilesSequential.clear();
 
-    // First pass: prepare all tiles for the generation
-    // Tile-level skip optimization: skip tiles with no activity
-    for (auto& [coord, tile] : tiles) {
-        // Only process tiles that need Phase 1 processing
-        // This includes tiles with activity OR tiles modified by Phase 2
+    // First pass: iterate all tiles, check needsPhase1Processing(), prepare
+    for (const auto& [coord, tile] : tiles) {
         if (tile->needsPhase1Processing()) {
             tile->runGenerationPrepare();
             if (tile->hasChanges()) {
@@ -250,6 +247,7 @@ void VLife::runGeneration() {
 #endif
 
         evictDeadTiles();
+        generationNumber++;
 
 #ifdef VLIFE_METRICS_ENABLED
         size_t tilesEvicted = preEvictCount > tiles.size() ? preEvictCount - tiles.size() : 0;
@@ -261,7 +259,6 @@ void VLife::runGeneration() {
             VLIFE_METRICS_END_GEN(*metricsCollector, getTotalLiveCells(), tiles.size(),
                                    minX, maxX, minY, maxY, totalTime, tilesCreated, tilesEvicted);
         }
-        generationNumber++;
 #endif
         return;
     }
@@ -274,17 +271,18 @@ void VLife::runGeneration() {
     // Clear the queue from previous generation (keeps capacity for amortized allocation)
     tilesWithChanges.clear();
 
-    // PHASE 1: Parallel iteration with inline filtering, collect tiles with changes
+    // PHASE 1: Parallel iteration over ALL tiles, check needsPhase1Processing(), collect tiles with changes
     tbb::parallel_for_each(tiles.begin(), tiles.end(),
         [this
 #ifdef VLIFE_METRICS_ENABLED
             , &activeTileCount
 #endif
-        ](auto& pair) {
-            if (pair.second->needsPhase1Processing()) {
-                pair.second->runGenerationPrepare();
-                if (pair.second->hasChanges()) {
-                    tilesWithChanges.push_back(pair.second.get());
+        ](const auto& pair) {
+            Tile* tile = pair.second.get();
+            if (tile->needsPhase1Processing()) {
+                tile->runGenerationPrepare();
+                if (tile->hasChanges()) {
+                    tilesWithChanges.push_back(tile);
                 }
 #ifdef VLIFE_METRICS_ENABLED
                 activeTileCount.fetch_add(1, std::memory_order_relaxed);
@@ -321,6 +319,7 @@ void VLife::runGeneration() {
 
     // Evict dead tiles to prevent memory growth
     evictDeadTiles();
+    generationNumber++;
 
 #ifdef VLIFE_METRICS_ENABLED
     size_t tilesEvicted = preEvictCount > tiles.size() ? preEvictCount - tiles.size() : 0;
@@ -332,7 +331,6 @@ void VLife::runGeneration() {
         VLIFE_METRICS_END_GEN(*metricsCollector, getTotalLiveCells(), tiles.size(),
                                minX, maxX, minY, maxY, totalTime, tilesCreated, tilesEvicted);
     }
-    generationNumber++;
 #endif
 }
 
@@ -386,27 +384,34 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
 }
 
 void VLife::evictDeadTiles() {
-    // Collect dead tiles using cooldown-based eviction to prevent flapping
-    // Tiles must remain inactive for TILE_COOLDOWN_GENERATIONS before being evicted
-    std::vector<TileCoord> deadTiles;
-
-    for (auto& [coord, tile] : tiles) {
-        if (tile->isSafeToEvict()) {
-            // Tile is completely inactive (no cells, no activity, no pending mods)
-            // Decrement cooldown
-            if (tile->decrementCooldown()) {
-                // Cooldown expired, mark for eviction
-                deadTiles.push_back(coord);
-            }
-        } else {
-            // Tile has content or pending work - reset cooldown
-            tile->resetCooldown();
-        }
+    // Only check periodically (power of 2 interval for fast modulo via bitmask)
+    if ((generationNumber & (EVICTION_CHECK_INTERVAL - 1)) != 0) {
+        return;
     }
 
-    // Remove dead tiles
-    for (const auto& coord : deadTiles) {
-        removeTile(coord.x, coord.y);
+    uint8_t currentGen = static_cast<uint8_t>(generationNumber);
+
+    for (auto it = tiles.begin(); it != tiles.end(); ) {
+        Tile* tile = it->second.get();
+        if (tile->isSafeToEvict()) {
+            // Use modular arithmetic for age calculation (handles wrap-around)
+            uint8_t age = currentGen - tile->getLastModifiedGeneration();
+            if (age >= EVICTION_AGE_THRESHOLD) {
+                // Unlink from neighbors (inline from removeTile)
+                if (tile->left) tile->left->right = nullptr;
+                if (tile->right) tile->right->left = nullptr;
+                if (tile->up) tile->up->down = nullptr;
+                if (tile->down) tile->down->up = nullptr;
+                if (tile->upLeft) tile->upLeft->downRight = nullptr;
+                if (tile->upRight) tile->upRight->downLeft = nullptr;
+                if (tile->downLeft) tile->downLeft->upRight = nullptr;
+                if (tile->downRight) tile->downRight->upLeft = nullptr;
+
+                it = tiles.erase(it);
+                continue;
+            }
+        }
+        ++it;
     }
 }
 

@@ -14,10 +14,10 @@
 #define TILE_64S_WIDTH TILE_WIDTH / 64
 #define TILE_64S_HEIGHT TILE_HEIGHT / 64
 
-// Number of generations a dead tile must remain inactive before being evicted
-// This prevents "flapping" (tiles being repeatedly created and destroyed)
-// Safety is ensured by isSafeToEvict() checking liveCount, activityRows, AND wasModified
-static constexpr uint8_t TILE_COOLDOWN_GENERATIONS = 4;
+// Eviction optimization: only check tiles periodically, not every generation
+// EVICTION_CHECK_INTERVAL must be a power of 2 for fast modulo via bitmask
+static constexpr size_t EVICTION_CHECK_INTERVAL = 16;  // Check every N generations
+static constexpr uint8_t EVICTION_AGE_THRESHOLD = 8;   // Evict if unchanged for N generations
 
 // Align Tile to 64-byte cache line boundaries to prevent false sharing
 // when multiple threads update adjacent tiles in parallel
@@ -50,9 +50,9 @@ class alignas(64) Tile {
     // Set in Phase 2 when neighbor counts updated; cleared at Phase 1 start
     uint64_t wasModified{~0ULL};  // Initialize to all-modified for first gen
 
-    // Cooldown counter for tile eviction - prevents flapping
-    // Tiles must remain inactive for TILE_COOLDOWN_GENERATIONS before being evicted
-    size_t cooldownCounter{TILE_COOLDOWN_GENERATIONS};
+    // Generation timestamp for eviction optimization
+    // Tracks when the tile was last modified (wraps at 256, uses modular arithmetic)
+    uint8_t lastModifiedGeneration{0};
 
     std::mutex tileMutex;
 
@@ -177,12 +177,14 @@ public:
 
     // Block modification tracking methods (64 bits = 8x8 blocks of 4x4 cells)
     // Mark block containing (x,y) as modified
+    // NOTE: Does NOT queue for Phase 1 - caller is responsible for batching queue calls
     inline void markBlockModified(int x, int y) {
         int blockIdx = ((y & 0x1C) << 1) | (x >> 2);
         wasModified |= (1ULL << blockIdx);
     }
 
     // Atomic version for cross-tile updates
+    // NOTE: Does NOT queue for Phase 1 - caller is responsible for batching queue calls
     inline void atomicMarkBlockModified(int x, int y) {
         int blockIdx = ((y & 0x1C) << 1) | (x >> 2);
         __atomic_fetch_or(&wasModified, 1ULL << blockIdx, __ATOMIC_RELAXED);
@@ -208,6 +210,7 @@ public:
             return;
         }
 
+        // Slow path: handle boundaries
         // Compute adjusted coordinates for each boundary case
         int leftX = leftOut ? TILE_WIDTH - 1 : x - 1;
         int rightX = rightOut ? 0 : x + 1;
@@ -216,61 +219,54 @@ public:
 
         // Upper-left corner
         if (topOut && leftOut) {
-            if (upLeft) upLeft->atomicMarkBlockModified(leftX, topY);
+            if (upLeft) { upLeft->atomicMarkBlockModified(leftX, topY); }
         } else if (topOut) {
-            if (up) up->atomicMarkBlockModified(leftX, topY);
+            if (up) { up->atomicMarkBlockModified(leftX, topY); }
         } else if (leftOut) {
-            if (left) left->atomicMarkBlockModified(leftX, topY);
+            if (left) { left->atomicMarkBlockModified(leftX, topY); }
         } else {
             markBlockModified(leftX, topY);
         }
 
         // Upper-right corner
         if (topOut && rightOut) {
-            if (upRight) upRight->atomicMarkBlockModified(rightX, topY);
+            if (upRight) { upRight->atomicMarkBlockModified(rightX, topY); }
         } else if (topOut) {
-            if (up) up->atomicMarkBlockModified(rightX, topY);
+            if (up) { up->atomicMarkBlockModified(rightX, topY); }
         } else if (rightOut) {
-            if (right) right->atomicMarkBlockModified(rightX, topY);
+            if (right) { right->atomicMarkBlockModified(rightX, topY); }
         } else {
             markBlockModified(rightX, topY);
         }
 
         // Lower-left corner
         if (bottomOut && leftOut) {
-            if (downLeft) downLeft->atomicMarkBlockModified(leftX, bottomY);
+            if (downLeft) { downLeft->atomicMarkBlockModified(leftX, bottomY); }
         } else if (bottomOut) {
-            if (down) down->atomicMarkBlockModified(leftX, bottomY);
+            if (down) { down->atomicMarkBlockModified(leftX, bottomY); }
         } else if (leftOut) {
-            if (left) left->atomicMarkBlockModified(leftX, bottomY);
+            if (left) { left->atomicMarkBlockModified(leftX, bottomY); }
         } else {
             markBlockModified(leftX, bottomY);
         }
 
         // Lower-right corner
         if (bottomOut && rightOut) {
-            if (downRight) downRight->atomicMarkBlockModified(rightX, bottomY);
+            if (downRight) { downRight->atomicMarkBlockModified(rightX, bottomY); }
         } else if (bottomOut) {
-            if (down) down->atomicMarkBlockModified(rightX, bottomY);
+            if (down) { down->atomicMarkBlockModified(rightX, bottomY); }
         } else if (rightOut) {
-            if (right) right->atomicMarkBlockModified(rightX, bottomY);
+            if (right) { right->atomicMarkBlockModified(rightX, bottomY); }
         } else {
             markBlockModified(rightX, bottomY);
         }
     }
 
-    // Cooldown methods for tile eviction management
-    // Reset cooldown counter when tile becomes active
-    void resetCooldown() { cooldownCounter = TILE_COOLDOWN_GENERATIONS; }
+    // Getter for last modified generation (for eviction logic)
+    uint8_t getLastModifiedGeneration() const { return lastModifiedGeneration; }
 
-    // Decrement cooldown, returns true when tile should be evicted
-    bool decrementCooldown() {
-        if (cooldownCounter == 0) {
-            cooldownCounter = TILE_COOLDOWN_GENERATIONS;
-            return false;  // First time inactive, start cooldown
-        }
-        return --cooldownCounter == 0;  // Evict when counter reaches 0
-    }
+    // Update the last modified generation timestamp
+    void updateLastModified(uint8_t currentGen) { lastModifiedGeneration = currentGen; }
 
     // Friend declarations to allow access to private members
     friend class VLife;

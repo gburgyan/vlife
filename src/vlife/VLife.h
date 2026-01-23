@@ -89,6 +89,11 @@ public:
     // Get board extent (min/max tile coordinates)
     void getBoardExtent(int32_t& minX, int32_t& maxX, int32_t& minY, int32_t& maxY) const;
 
+    // Get current generation number mod 256 for tile eviction timestamps
+    uint8_t getCurrentGenerationMod256() const {
+        return static_cast<uint8_t>(generationNumber);
+    }
+
 #ifdef VLIFE_METRICS_ENABLED
     // Metrics collection support
     void setMetricsCollector(MetricsCollector* collector) { metricsCollector = collector; }

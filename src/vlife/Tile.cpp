@@ -112,7 +112,7 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
 
     // Mark this word as active in the activity mask
     markWordActive(cellIdx);
-    
+
     // Calculate the positions of the 8 neighbors
     // Note: dx[3]=(-1,0)=left neighbor, dx[4]=(1,0)=right neighbor
     int dx[] = {-1, 0, 1, -1, 1, -1, 0, 1};
@@ -170,53 +170,60 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
                     adjTile = board->getTile(tileX - 1, tileY);
                     left = adjTile;
                 }
+                adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             } else if (tileOffsetX == 1 && tileOffsetY == 0) {
                 adjTile = right;
                 if (!adjTile) {
                     adjTile = board->getTile(tileX + 1, tileY);
                     right = adjTile;
                 }
+                adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             } else if (tileOffsetX == 0 && tileOffsetY == -1) {
                 adjTile = up;
                 if (!adjTile) {
                     adjTile = board->getTile(tileX, tileY - 1);
                     up = adjTile;
                 }
+                adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             } else if (tileOffsetX == 0 && tileOffsetY == 1) {
                 adjTile = down;
                 if (!adjTile) {
                     adjTile = board->getTile(tileX, tileY + 1);
                     down = adjTile;
                 }
+                adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             } else if (tileOffsetX == -1 && tileOffsetY == -1) {
                 adjTile = upLeft;
                 if (!adjTile) {
                     adjTile = board->getTile(tileX - 1, tileY - 1);
                     upLeft = adjTile;
                 }
+                adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             } else if (tileOffsetX == 1 && tileOffsetY == -1) {
                 adjTile = upRight;
                 if (!adjTile) {
                     adjTile = board->getTile(tileX + 1, tileY - 1);
                     upRight = adjTile;
                 }
+                adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             } else if (tileOffsetX == -1 && tileOffsetY == 1) {
                 adjTile = downLeft;
                 if (!adjTile) {
                     adjTile = board->getTile(tileX - 1, tileY + 1);
                     downLeft = adjTile;
                 }
+                adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             } else if (tileOffsetX == 1 && tileOffsetY == 1) {
                 adjTile = downRight;
                 if (!adjTile) {
                     adjTile = board->getTile(tileX + 1, tileY + 1);
                     downRight = adjTile;
                 }
+                adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             }
-
-            adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
         }
     }
+
 }
 
 // Helper method to update the neighbor count of a cell
@@ -829,6 +836,9 @@ void Tile::runGenerationChanges() {
     if (changesAccumulator == 0) {
         return;
     }
+
+    // Update the last modified timestamp for eviction tracking
+    lastModifiedGeneration = board->getCurrentGenerationMod256();
 
     // Process the changes array to find cells that need to toggle.
     // Uses LUT-based optimization to handle cell pairs together.
