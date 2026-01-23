@@ -54,6 +54,11 @@ class alignas(64) Tile {
     // Tracks when the tile was last modified (wraps at 256, uses modular arithmetic)
     uint8_t lastModifiedGeneration{0};
 
+    // Activity state for linked list optimization (single byte)
+    // Set at start of Phase 1 processing; used to detect transitions
+    // Only move tiles when activity state changes, not every generation
+    bool wasActiveLastGeneration{true};  // New tiles are considered "active"
+
     // Intrusive linked list pointers for activity-based ordering
     // Most recently active tiles are near the head, inactive tiles near the tail
     Tile* listPrev{nullptr};
@@ -228,44 +233,44 @@ public:
 
         // Upper-left corner
         if (topOut && leftOut) {
-            if (upLeft) { upLeft->atomicMarkBlockModified(leftX, topY); upLeft->queueForProcessing(); }
+            if (upLeft) { upLeft->atomicMarkBlockModified(leftX, topY); upLeft->ensureProcessedNextGeneration(); }
         } else if (topOut) {
-            if (up) { up->atomicMarkBlockModified(leftX, topY); up->queueForProcessing(); }
+            if (up) { up->atomicMarkBlockModified(leftX, topY); up->ensureProcessedNextGeneration(); }
         } else if (leftOut) {
-            if (left) { left->atomicMarkBlockModified(leftX, topY); left->queueForProcessing(); }
+            if (left) { left->atomicMarkBlockModified(leftX, topY); left->ensureProcessedNextGeneration(); }
         } else {
             markBlockModified(leftX, topY);
         }
 
         // Upper-right corner
         if (topOut && rightOut) {
-            if (upRight) { upRight->atomicMarkBlockModified(rightX, topY); upRight->queueForProcessing(); }
+            if (upRight) { upRight->atomicMarkBlockModified(rightX, topY); upRight->ensureProcessedNextGeneration(); }
         } else if (topOut) {
-            if (up) { up->atomicMarkBlockModified(rightX, topY); up->queueForProcessing(); }
+            if (up) { up->atomicMarkBlockModified(rightX, topY); up->ensureProcessedNextGeneration(); }
         } else if (rightOut) {
-            if (right) { right->atomicMarkBlockModified(rightX, topY); right->queueForProcessing(); }
+            if (right) { right->atomicMarkBlockModified(rightX, topY); right->ensureProcessedNextGeneration(); }
         } else {
             markBlockModified(rightX, topY);
         }
 
         // Lower-left corner
         if (bottomOut && leftOut) {
-            if (downLeft) { downLeft->atomicMarkBlockModified(leftX, bottomY); downLeft->queueForProcessing(); }
+            if (downLeft) { downLeft->atomicMarkBlockModified(leftX, bottomY); downLeft->ensureProcessedNextGeneration(); }
         } else if (bottomOut) {
-            if (down) { down->atomicMarkBlockModified(leftX, bottomY); down->queueForProcessing(); }
+            if (down) { down->atomicMarkBlockModified(leftX, bottomY); down->ensureProcessedNextGeneration(); }
         } else if (leftOut) {
-            if (left) { left->atomicMarkBlockModified(leftX, bottomY); left->queueForProcessing(); }
+            if (left) { left->atomicMarkBlockModified(leftX, bottomY); left->ensureProcessedNextGeneration(); }
         } else {
             markBlockModified(leftX, bottomY);
         }
 
         // Lower-right corner
         if (bottomOut && rightOut) {
-            if (downRight) { downRight->atomicMarkBlockModified(rightX, bottomY); downRight->queueForProcessing(); }
+            if (downRight) { downRight->atomicMarkBlockModified(rightX, bottomY); downRight->ensureProcessedNextGeneration(); }
         } else if (bottomOut) {
-            if (down) { down->atomicMarkBlockModified(rightX, bottomY); down->queueForProcessing(); }
+            if (down) { down->atomicMarkBlockModified(rightX, bottomY); down->ensureProcessedNextGeneration(); }
         } else if (rightOut) {
-            if (right) { right->atomicMarkBlockModified(rightX, bottomY); right->queueForProcessing(); }
+            if (right) { right->atomicMarkBlockModified(rightX, bottomY); right->ensureProcessedNextGeneration(); }
         } else {
             markBlockModified(rightX, bottomY);
         }
@@ -276,6 +281,11 @@ public:
 
     // Update the last modified generation timestamp
     void updateLastModified(uint8_t currentGen) { lastModifiedGeneration = currentGen; }
+
+    // Activity state accessors for linked list optimization
+    // Used to detect activity transitions and minimize list churn
+    bool getWasActiveLastGeneration() const { return wasActiveLastGeneration; }
+    void setWasActiveLastGeneration(bool active) { wasActiveLastGeneration = active; }
 
     // Linked list accessors for activity-based ordering
     Tile* getListPrev() const { return listPrev; }
@@ -294,10 +304,28 @@ public:
 
     // Queue this tile for processing in the next generation
     // Does the flag check locally, only calls VLife if needed
+    // Uses state-transition-based movement to reduce list churn:
+    //   - Inactive -> Active: Move to head (keeps active tiles at front)
+    //   - Active -> Active: Leave in place (the key optimization)
     inline void queueForProcessing() {
         if (trySetNeedsProcessing()) {
-            board->moveToHead(this);
+            // Only move to head on inactive->active transition
+            // Active tiles stay in place, reducing O(active_tiles) to O(state_transitions)
+            if (!wasActiveLastGeneration) {
+                board->moveToHead(this);
+            }
         }
+    }
+
+    // Ensure this tile will be processed next generation (fast path for boundary updates)
+    // If already queued, this is a noop - avoids atomic CAS overhead
+    inline void ensureProcessedNextGeneration() {
+        // Fast path: already queued, nothing to do
+        if (needsProcessing.load(std::memory_order_acquire)) {
+            return;
+        }
+        // Slow path: need to queue
+        queueForProcessing();
     }
 
     // Friend declarations to allow access to private members

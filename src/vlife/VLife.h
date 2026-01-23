@@ -168,6 +168,9 @@ public:
     // Move tile to head of activity list (flag check done by caller via Tile::queueForProcessing)
     void moveToHead(Tile* tile);
 
+    // Move tile to tail of activity list (for active->inactive transitions)
+    void moveToTail(Tile* tile);
+
 private:
 
 public:

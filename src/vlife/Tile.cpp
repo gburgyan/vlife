@@ -1063,7 +1063,7 @@ void Tile::runGenerationChanges() {
                 } else {
                     upTile->nonAtomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
                 }
-                upTile->queueForProcessing();
+                upTile->ensureProcessedNextGeneration();
             }
         }
         if (hasDownDeltas) {
@@ -1075,7 +1075,7 @@ void Tile::runGenerationChanges() {
                 } else {
                     downTile->nonAtomicAddBoundaryDeltas(0, downNeighborDeltas);
                 }
-                downTile->queueForProcessing();
+                downTile->ensureProcessedNextGeneration();
             }
         }
         // Handle corner deltas (diagonal neighbors)
@@ -1089,7 +1089,7 @@ void Tile::runGenerationChanges() {
                     } else {
                         upLeftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
                     }
-                    upLeftTile->queueForProcessing();
+                    upLeftTile->ensureProcessedNextGeneration();
                 }
             }
             if (upRightCornerDelta != 0) {
@@ -1101,7 +1101,7 @@ void Tile::runGenerationChanges() {
                     } else {
                         upRightTile->nonAtomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
                     }
-                    upRightTile->queueForProcessing();
+                    upRightTile->ensureProcessedNextGeneration();
                 }
             }
             if (downLeftCornerDelta != 0) {
@@ -1113,7 +1113,7 @@ void Tile::runGenerationChanges() {
                     } else {
                         downLeftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
                     }
-                    downLeftTile->queueForProcessing();
+                    downLeftTile->ensureProcessedNextGeneration();
                 }
             }
             if (downRightCornerDelta != 0) {
@@ -1125,7 +1125,7 @@ void Tile::runGenerationChanges() {
                     } else {
                         downRightTile->nonAtomicApplyDelta(0, 0, downRightCornerDelta);
                     }
-                    downRightTile->queueForProcessing();
+                    downRightTile->ensureProcessedNextGeneration();
                 }
             }
         }
@@ -1228,7 +1228,7 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
                 if (leftTile) {
                     VLIFE_METRICS_INC_BOUNDARY();
                     leftTile->atomicApplyDelta(TILE_WIDTH - 1, y, delta);
-                    leftTile->queueForProcessing();
+                    leftTile->ensureProcessedNextGeneration();
                 }
             } else {
                 // Right tile boundary - create tile if needed, use atomic for safety
@@ -1236,7 +1236,7 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
                 if (rightTile) {
                     VLIFE_METRICS_INC_BOUNDARY();
                     rightTile->atomicApplyDelta(0, y, delta);
-                    rightTile->queueForProcessing();
+                    rightTile->ensureProcessedNextGeneration();
                 }
             }
         }
@@ -1294,14 +1294,14 @@ void Tile::atomicApplyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
             Tile* leftTile = ensureNeighborTile(-1, 0);
             if (leftTile) {
                 leftTile->atomicApplyDelta(TILE_WIDTH - 1, y, delta);
-                leftTile->queueForProcessing();
+                leftTile->ensureProcessedNextGeneration();
             }
         } else {
             // Right tile boundary - create tile if needed
             Tile* rightTile = ensureNeighborTile(1, 0);
             if (rightTile) {
                 rightTile->atomicApplyDelta(0, y, delta);
-                rightTile->queueForProcessing();
+                rightTile->ensureProcessedNextGeneration();
             }
         }
     }
@@ -1392,7 +1392,7 @@ void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& del
                 } else {
                     leftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
                 }
-                leftTile->queueForProcessing();
+                leftTile->ensureProcessedNextGeneration();
             }
         }
     }
@@ -1411,7 +1411,7 @@ void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& del
                 } else {
                     rightTile->nonAtomicApplyDelta(0, localY, deltas.sameRow[1]);
                 }
-                rightTile->queueForProcessing();
+                rightTile->ensureProcessedNextGeneration();
             }
         }
     }
@@ -1435,7 +1435,7 @@ void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& del
                     }
                 }
             }
-            upTile->queueForProcessing();
+            upTile->ensureProcessedNextGeneration();
         }
     }
 
@@ -1458,7 +1458,7 @@ void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& del
                     }
                 }
             }
-            downTile->queueForProcessing();
+            downTile->ensureProcessedNextGeneration();
         }
     }
 }

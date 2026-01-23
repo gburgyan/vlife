@@ -58,9 +58,11 @@ void VLife::removeTileFromList(Tile* tile) {
 }
 
 void VLife::moveToHead(Tile* tile) {
-    // Flag check already done by Tile::queueForProcessing()
-    std::lock_guard<std::mutex> lock(listMutex);
+    // Quick check before acquiring lock (common case: already at head)
     if (tile == listHead) return;
+
+    std::lock_guard<std::mutex> lock(listMutex);
+    if (tile == listHead) return;  // Re-check after lock
 
     // Unlink from current position
     Tile* prev = tile->getListPrev();
@@ -74,6 +76,28 @@ void VLife::moveToHead(Tile* tile) {
     tile->setListNext(listHead);
     if (listHead) listHead->setListPrev(tile);
     listHead = tile;
+}
+
+void VLife::moveToTail(Tile* tile) {
+    // Quick check before acquiring lock
+    if (tile == listTail) return;
+
+    std::lock_guard<std::mutex> lock(listMutex);
+    if (tile == listTail) return;  // Re-check after lock
+
+    // Unlink from current position
+    Tile* prev = tile->getListPrev();
+    Tile* next = tile->getListNext();
+    if (prev) prev->setListNext(next);
+    else listHead = next;
+    if (next) next->setListPrev(prev);
+
+    // Link at tail
+    tile->setListNext(nullptr);
+    tile->setListPrev(listTail);
+    if (listTail) listTail->setListNext(tile);
+    listTail = tile;
+    if (!listHead) listHead = tile;
 }
 
 Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
@@ -245,6 +269,8 @@ void VLife::runGenerationSequential() {
     // Tiles are moved to head during Phase 2 when they receive neighbor updates
     Tile* tile = listHead;
     while (tile && tile->getNeedsProcessing()) {
+        // Mark as active BEFORE clearing flag for next-gen transition detection
+        tile->setWasActiveLastGeneration(true);
         tile->clearNeedsProcessing();
         Tile* next = tile->getListNext();  // Save before potential list modification
 
@@ -284,6 +310,40 @@ void VLife::runGenerationSequential() {
         VLIFE_METRICS_END_PHASE2(*metricsCollector, tiles.size(), phase2Time);
     }
 #endif
+
+    // Move newly-inactive tiles to tail (active->inactive transitions)
+    // These tiles had wasActiveLastGeneration=true but weren't re-queued in Phase 2
+    // Batch move with single lock acquisition to reduce contention
+    {
+        std::vector<Tile*> tilesToMoveTail;
+        Tile* tile = listHead;
+        while (tile) {
+            Tile* next = tile->getListNext();
+            if (tile->getWasActiveLastGeneration() && !tile->getNeedsProcessing()) {
+                tile->setWasActiveLastGeneration(false);
+                tilesToMoveTail.push_back(tile);
+            }
+            tile = next;
+        }
+        // Batch move to reduce lock contention
+        if (!tilesToMoveTail.empty()) {
+            std::lock_guard<std::mutex> lock(listMutex);
+            for (Tile* t : tilesToMoveTail) {
+                // Inline unlink and link-at-tail to avoid repeated lock acquisition
+                if (t == listTail) continue;
+                Tile* prev = t->getListPrev();
+                Tile* next = t->getListNext();
+                if (prev) prev->setListNext(next);
+                else listHead = next;
+                if (next) next->setListPrev(prev);
+
+                t->setListNext(nullptr);
+                t->setListPrev(listTail);
+                if (listTail) listTail->setListNext(t);
+                listTail = t;
+            }
+        }
+    }
 }
 
 void VLife::runGeneration() {
@@ -336,6 +396,8 @@ void VLife::runGeneration() {
     {
         Tile* tile = listHead;
         while (tile && tile->getNeedsProcessing()) {
+            // Mark as active BEFORE clearing flag for next-gen transition detection
+            tile->setWasActiveLastGeneration(true);
             tile->clearNeedsProcessing();
             if (tile->needsPhase1Processing()) {
                 tilesToProcess.push_back(tile);
@@ -386,6 +448,40 @@ void VLife::runGeneration() {
         VLIFE_METRICS_END_PHASE2(*metricsCollector, tiles.size(), phase2Time);
     }
 #endif
+
+    // Move newly-inactive tiles to tail (active->inactive transitions)
+    // These tiles had wasActiveLastGeneration=true but weren't re-queued in Phase 2
+    // Batch move with single lock acquisition to reduce contention
+    {
+        std::vector<Tile*> tilesToMoveTail;
+        Tile* tile = listHead;
+        while (tile) {
+            Tile* next = tile->getListNext();
+            if (tile->getWasActiveLastGeneration() && !tile->getNeedsProcessing()) {
+                tile->setWasActiveLastGeneration(false);
+                tilesToMoveTail.push_back(tile);
+            }
+            tile = next;
+        }
+        // Batch move to reduce lock contention
+        if (!tilesToMoveTail.empty()) {
+            std::lock_guard<std::mutex> lock(listMutex);
+            for (Tile* t : tilesToMoveTail) {
+                // Inline unlink and link-at-tail to avoid repeated lock acquisition
+                if (t == listTail) continue;
+                Tile* prev = t->getListPrev();
+                Tile* next = t->getListNext();
+                if (prev) prev->setListNext(next);
+                else listHead = next;
+                if (next) next->setListPrev(prev);
+
+                t->setListNext(nullptr);
+                t->setListPrev(listTail);
+                if (listTail) listTail->setListNext(t);
+                listTail = t;
+            }
+        }
+    }
 
     // Evict dead tiles to prevent memory growth
     evictDeadTiles();
@@ -465,8 +561,18 @@ void VLife::evictDeadTiles() {
 
     uint8_t currentGen = static_cast<uint8_t>(generationNumber);
 
-    for (auto it = tiles.begin(); it != tiles.end(); ) {
-        Tile* tile = it->second;
+    // Scan from tail backwards - inactive tiles cluster at tail due to state-transition-based movement
+    // Stop when hitting active tiles for O(inactive) complexity instead of O(all_tiles)
+    Tile* tile = listTail;
+    while (tile) {
+        Tile* prev = tile->getListPrev();
+
+        // Stop at active region (tiles with needsProcessing or recently active)
+        // Active tiles are near the head, so hitting one means we've scanned all inactive tiles
+        if (tile->getNeedsProcessing() || tile->getWasActiveLastGeneration()) {
+            break;
+        }
+
         if (tile->isSafeToEvict()) {
             // Use modular arithmetic for age calculation (handles wrap-around)
             uint8_t age = currentGen - tile->getLastModifiedGeneration();
@@ -484,12 +590,12 @@ void VLife::evictDeadTiles() {
                 if (tile->downLeft) tile->downLeft->upRight = nullptr;
                 if (tile->downRight) tile->downRight->upLeft = nullptr;
 
+                TileCoord coord{tile->getTileX(), tile->getTileY()};
                 tilePool.deallocate(tile);
-                it = tiles.erase(it);
-                continue;
+                tiles.erase(coord);
             }
         }
-        ++it;
+        tile = prev;
     }
 }
 
