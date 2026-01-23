@@ -113,6 +113,9 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
     // Mark this word as active in the activity mask
     markWordActive(cellIdx);
 
+    // Mark this block as modified for Phase 1 processing
+    markBlockModified(localX, localY);
+
     // Calculate the positions of the 8 neighbors
     // Note: dx[3]=(-1,0)=left neighbor, dx[4]=(1,0)=right neighbor
     int dx[] = {-1, 0, 1, -1, 1, -1, 0, 1};
@@ -267,10 +270,9 @@ void Tile::runGenerationPrepare() {
     // Reset changes accumulator for Phase 2 short-circuit optimization
     changesAccumulator = 0;
 
-    // If modMask == 0 but activityRows != 0, force a full scan
-    // This handles the case where setCell was called after wasModified was cleared
+    // Nothing modified - nothing to scan
     if (modMask == 0) {
-        modMask = ~0ULL;
+        return;
     }
 
     // Note: activityRows is preserved for unscanned rows (rowMask == 0)
@@ -617,10 +619,9 @@ void Tile::runGenerationPrepare_AVX512() {
     // Reset changes accumulator for Phase 2 short-circuit optimization
     changesAccumulator = 0;
 
-    // If modMask == 0 but activityRows != 0, force a full scan
-    // This handles the case where setCell was called after wasModified was cleared
+    // Nothing modified - nothing to scan
     if (modMask == 0) {
-        modMask = ~0ULL;
+        return;
     }
 
     // Note: activityRows is preserved for unscanned rows (rowMask == 0)
