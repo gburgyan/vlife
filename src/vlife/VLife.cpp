@@ -31,6 +31,49 @@ void VLife::resetBoard() {
     }
     tiles.clear();
     tilePool.recycle();
+
+    // Reset linked list pointers
+    listHead = nullptr;
+    listTail = nullptr;
+}
+
+void VLife::addTileToListHead(Tile* tile) {
+    // Called during tile creation (already under tilesMutex)
+    tile->setListPrev(nullptr);
+    tile->setListNext(listHead);
+    if (listHead) listHead->setListPrev(tile);
+    listHead = tile;
+    if (!listTail) listTail = tile;
+}
+
+void VLife::removeTileFromList(Tile* tile) {
+    Tile* prev = tile->getListPrev();
+    Tile* next = tile->getListNext();
+    if (prev) prev->setListNext(next);
+    else listHead = next;
+    if (next) next->setListPrev(prev);
+    else listTail = prev;
+    tile->setListPrev(nullptr);
+    tile->setListNext(nullptr);
+}
+
+void VLife::moveToHead(Tile* tile) {
+    // Flag check already done by Tile::queueForProcessing()
+    std::lock_guard<std::mutex> lock(listMutex);
+    if (tile == listHead) return;
+
+    // Unlink from current position
+    Tile* prev = tile->getListPrev();
+    Tile* next = tile->getListNext();
+    if (prev) prev->setListNext(next);
+    if (next) next->setListPrev(prev);
+    else listTail = prev;
+
+    // Link at head
+    tile->setListPrev(nullptr);
+    tile->setListNext(listHead);
+    if (listHead) listHead->setListPrev(tile);
+    listHead = tile;
 }
 
 Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
@@ -57,6 +100,9 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
     // Create a new tile using the pool
     Tile *tilePtr = tilePool.allocate(tileX, tileY);
     tiles[coord] = tilePtr;
+
+    // Add to linked list (already under exclusive lock, so no separate lock needed)
+    addTileToListHead(tilePtr);
 
     // Connect to neighboring tiles if they exist (already under exclusive lock)
     // We link all 8 neighbors (orthogonal and diagonal) here.
@@ -195,8 +241,13 @@ void VLife::runGenerationSequential() {
     // Clear the queue from previous generation (keeps capacity for amortized allocation)
     changedTilesSequential.clear();
 
-    // First pass: iterate all tiles, check needsPhase1Processing(), prepare
-    for (const auto& [coord, tile] : tiles) {
+    // Phase 1: Traverse linked list from head, process tiles with needsProcessing flag
+    // Tiles are moved to head during Phase 2 when they receive neighbor updates
+    Tile* tile = listHead;
+    while (tile && tile->getNeedsProcessing()) {
+        tile->clearNeedsProcessing();
+        Tile* next = tile->getListNext();  // Save before potential list modification
+
         if (tile->needsPhase1Processing()) {
             tile->runGenerationPrepare();
             if (tile->hasChanges()) {
@@ -206,6 +257,7 @@ void VLife::runGenerationSequential() {
             activeTilesCount++;
 #endif
         }
+        tile = next;
     }
 
 #ifdef VLIFE_METRICS_ENABLED
@@ -220,8 +272,8 @@ void VLife::runGenerationSequential() {
 
     // Second pass: apply the changes only to tiles that have changes
     // Use non-atomic version since sequential execution has no concurrent access
-    for (Tile* tile : changedTilesSequential) {
-        tile->runGenerationChanges<false>();
+    for (Tile* t : changedTilesSequential) {
+        t->runGenerationChanges<false>();
     }
 
 #ifdef VLIFE_METRICS_ENABLED
@@ -277,23 +329,35 @@ void VLife::runGeneration() {
     // Clear the queue from previous generation (keeps capacity for amortized allocation)
     tilesWithChanges.clear();
 
-    // PHASE 1: Parallel iteration over ALL tiles, check needsPhase1Processing(), collect tiles with changes
-    tbb::parallel_for_each(tiles.begin(), tiles.end(),
+    // Build vector of tiles to process from linked list
+    // Tiles are moved to head during Phase 2 when they receive neighbor updates
+    std::vector<Tile*> tilesToProcess;
+    tilesToProcess.reserve(tiles.size());
+    {
+        Tile* tile = listHead;
+        while (tile && tile->getNeedsProcessing()) {
+            tile->clearNeedsProcessing();
+            if (tile->needsPhase1Processing()) {
+                tilesToProcess.push_back(tile);
+            }
+            tile = tile->getListNext();
+        }
+    }
+
+    // PHASE 1: Parallel preparation on tiles that need processing
+    tbb::parallel_for_each(tilesToProcess.begin(), tilesToProcess.end(),
         [this
 #ifdef VLIFE_METRICS_ENABLED
             , &activeTileCount
 #endif
-        ](const auto& pair) {
-            Tile* tile = pair.second;
-            if (tile->needsPhase1Processing()) {
-                tile->runGenerationPrepare();
-                if (tile->hasChanges()) {
-                    tilesWithChanges.push_back(tile);
-                }
-#ifdef VLIFE_METRICS_ENABLED
-                activeTileCount.fetch_add(1, std::memory_order_relaxed);
-#endif
+        ](Tile* tile) {
+            tile->runGenerationPrepare();
+            if (tile->hasChanges()) {
+                tilesWithChanges.push_back(tile);
             }
+#ifdef VLIFE_METRICS_ENABLED
+            activeTileCount.fetch_add(1, std::memory_order_relaxed);
+#endif
         }
     );
 
@@ -385,6 +449,9 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
     }
 #endif
 
+    // Remove from linked list before deallocating
+    removeTileFromList(tile);
+
     // Deallocate tile and remove from map
     tilePool.deallocate(tile);
     tiles.erase(it);
@@ -404,6 +471,9 @@ void VLife::evictDeadTiles() {
             // Use modular arithmetic for age calculation (handles wrap-around)
             uint8_t age = currentGen - tile->getLastModifiedGeneration();
             if (age >= EVICTION_AGE_THRESHOLD) {
+                // Remove from linked list
+                removeTileFromList(tile);
+
                 // Unlink from neighbors (inline from removeTile)
                 if (tile->left) tile->left->right = nullptr;
                 if (tile->right) tile->right->left = nullptr;

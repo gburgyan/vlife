@@ -54,6 +54,15 @@ class alignas(64) Tile {
     // Tracks when the tile was last modified (wraps at 256, uses modular arithmetic)
     uint8_t lastModifiedGeneration{0};
 
+    // Intrusive linked list pointers for activity-based ordering
+    // Most recently active tiles are near the head, inactive tiles near the tail
+    Tile* listPrev{nullptr};
+    Tile* listNext{nullptr};
+
+    // Processing flag: set when marked for processing, cleared at Phase 1 start
+    // Guards against redundant move-to-head operations
+    std::atomic<bool> needsProcessing{true};  // New tiles need processing
+
     std::mutex tileMutex;
 
 public:
@@ -219,44 +228,44 @@ public:
 
         // Upper-left corner
         if (topOut && leftOut) {
-            if (upLeft) { upLeft->atomicMarkBlockModified(leftX, topY); }
+            if (upLeft) { upLeft->atomicMarkBlockModified(leftX, topY); upLeft->queueForProcessing(); }
         } else if (topOut) {
-            if (up) { up->atomicMarkBlockModified(leftX, topY); }
+            if (up) { up->atomicMarkBlockModified(leftX, topY); up->queueForProcessing(); }
         } else if (leftOut) {
-            if (left) { left->atomicMarkBlockModified(leftX, topY); }
+            if (left) { left->atomicMarkBlockModified(leftX, topY); left->queueForProcessing(); }
         } else {
             markBlockModified(leftX, topY);
         }
 
         // Upper-right corner
         if (topOut && rightOut) {
-            if (upRight) { upRight->atomicMarkBlockModified(rightX, topY); }
+            if (upRight) { upRight->atomicMarkBlockModified(rightX, topY); upRight->queueForProcessing(); }
         } else if (topOut) {
-            if (up) { up->atomicMarkBlockModified(rightX, topY); }
+            if (up) { up->atomicMarkBlockModified(rightX, topY); up->queueForProcessing(); }
         } else if (rightOut) {
-            if (right) { right->atomicMarkBlockModified(rightX, topY); }
+            if (right) { right->atomicMarkBlockModified(rightX, topY); right->queueForProcessing(); }
         } else {
             markBlockModified(rightX, topY);
         }
 
         // Lower-left corner
         if (bottomOut && leftOut) {
-            if (downLeft) { downLeft->atomicMarkBlockModified(leftX, bottomY); }
+            if (downLeft) { downLeft->atomicMarkBlockModified(leftX, bottomY); downLeft->queueForProcessing(); }
         } else if (bottomOut) {
-            if (down) { down->atomicMarkBlockModified(leftX, bottomY); }
+            if (down) { down->atomicMarkBlockModified(leftX, bottomY); down->queueForProcessing(); }
         } else if (leftOut) {
-            if (left) { left->atomicMarkBlockModified(leftX, bottomY); }
+            if (left) { left->atomicMarkBlockModified(leftX, bottomY); left->queueForProcessing(); }
         } else {
             markBlockModified(leftX, bottomY);
         }
 
         // Lower-right corner
         if (bottomOut && rightOut) {
-            if (downRight) { downRight->atomicMarkBlockModified(rightX, bottomY); }
+            if (downRight) { downRight->atomicMarkBlockModified(rightX, bottomY); downRight->queueForProcessing(); }
         } else if (bottomOut) {
-            if (down) { down->atomicMarkBlockModified(rightX, bottomY); }
+            if (down) { down->atomicMarkBlockModified(rightX, bottomY); down->queueForProcessing(); }
         } else if (rightOut) {
-            if (right) { right->atomicMarkBlockModified(rightX, bottomY); }
+            if (right) { right->atomicMarkBlockModified(rightX, bottomY); right->queueForProcessing(); }
         } else {
             markBlockModified(rightX, bottomY);
         }
@@ -267,6 +276,29 @@ public:
 
     // Update the last modified generation timestamp
     void updateLastModified(uint8_t currentGen) { lastModifiedGeneration = currentGen; }
+
+    // Linked list accessors for activity-based ordering
+    Tile* getListPrev() const { return listPrev; }
+    Tile* getListNext() const { return listNext; }
+    void setListPrev(Tile* t) { listPrev = t; }
+    void setListNext(Tile* t) { listNext = t; }
+
+    // Processing flag - returns true if successfully set (was false)
+    bool trySetNeedsProcessing() {
+        bool expected = false;
+        return needsProcessing.compare_exchange_strong(expected, true,
+            std::memory_order_acq_rel, std::memory_order_relaxed);
+    }
+    void clearNeedsProcessing() { needsProcessing.store(false, std::memory_order_release); }
+    bool getNeedsProcessing() const { return needsProcessing.load(std::memory_order_acquire); }
+
+    // Queue this tile for processing in the next generation
+    // Does the flag check locally, only calls VLife if needed
+    inline void queueForProcessing() {
+        if (trySetNeedsProcessing()) {
+            board->moveToHead(this);
+        }
+    }
 
     // Friend declarations to allow access to private members
     friend class VLife;

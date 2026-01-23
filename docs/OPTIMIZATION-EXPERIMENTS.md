@@ -391,6 +391,113 @@ This optimization may provide minimal benefit when:
 
 ---
 
+## Move Flag Check to Tile (January 2026)
+
+**Status: Implemented - Minor optimization**
+
+### Hypothesis
+
+The `board->moveToHeadIfNeeded(tile)` pattern was being called from many places in `Tile.cpp` and `Tile.h` to queue tiles for processing in the next generation. This pattern required:
+
+1. Dereferencing the `board` pointer to call into VLife
+2. VLife dereferencing the `tile` pointer to check its atomic `needsProcessing` flag
+3. Only then performing the list manipulation (if flag check passed)
+
+This extra indirection seemed unnecessary - the flag check could be done locally in Tile since it's checking `this->needsProcessing`, eliminating one level of pointer chasing.
+
+### Proposed Solution
+
+Add a `queueForProcessing()` inline method to Tile that:
+
+1. Calls `trySetNeedsProcessing()` locally (no pointer dereference needed - it's `this`)
+2. Only calls through to VLife's `moveToHead()` if the flag was successfully set (was false, now true)
+
+This moves the "gate" check to Tile and only calls VLife for the actual list manipulation.
+
+### Implementation
+
+Changes were made to:
+
+| File | Change |
+|------|--------|
+| `Tile.h` | Added inline `queueForProcessing()` method |
+| `Tile.h` | Updated 8 call sites in `markChangeCorners()` slow path |
+| `VLife.h` | Renamed `moveToHeadIfNeeded()` to `moveToHead()` |
+| `VLife.cpp` | Removed flag check from `moveToHead()` (caller does it now) |
+| `Tile.cpp` | Updated 14 call sites to use `queueForProcessing()` |
+
+**New method in Tile.h:**
+```cpp
+inline void queueForProcessing() {
+    if (trySetNeedsProcessing()) {
+        board->moveToHead(this);
+    }
+}
+```
+
+**Call sites updated:**
+- `Tile::setCell()` - `board->moveToHeadIfNeeded(this)` → `queueForProcessing()`
+- `Tile::runGenerationChanges()` - `board->moveToHeadIfNeeded(this)` → `queueForProcessing()`
+- `Tile::markChangeCorners()` - 8 neighbor tile cases
+- Buffered flush section - 6 neighbor tile cases
+- `Tile::applyVerticalDeltas()` - 2 cross-tile cases
+- `Tile::atomicApplyVerticalDeltas()` - 2 cross-tile cases
+- `Tile::applyDeltasForCellPair()` - 4 cross-tile cases
+
+### Expected Benefits
+
+1. **Reduced pointer chasing**: The atomic flag check (`needsProcessing.compare_exchange_strong()`) is now done locally in Tile, not via VLife indirection
+2. **Better inlining**: `queueForProcessing()` is inline, so the common "already flagged" path has no function call overhead at all
+3. **Cleaner semantics**: Tile manages its own "queue for processing" state, VLife just handles the list manipulation
+4. **Fewer instructions in hot path**: When a tile is already flagged (common case in Phase 2), no function call to VLife occurs
+
+### Actual Results
+
+All tests pass. Benchmark results are consistent with baseline - this is a minor optimization that reduces instruction count but doesn't significantly change overall throughput since the flag check was already fast.
+
+The benefit is primarily code cleanliness and a small reduction in the instruction count for the critical Phase 2 path.
+
+### Analysis
+
+The optimization successfully reduces indirection:
+
+**Before:**
+```
+Tile::runGenerationChanges()
+  → board->moveToHeadIfNeeded(this)
+    → tile->trySetNeedsProcessing()  // deref tile to check flag
+    → [list manipulation if flag set]
+```
+
+**After:**
+```
+Tile::runGenerationChanges()
+  → queueForProcessing()  // inline
+    → trySetNeedsProcessing()  // local access via this
+    → board->moveToHead(this)  // only if flag was set
+```
+
+The key insight is that `trySetNeedsProcessing()` accesses `this->needsProcessing`, so it's more efficient for Tile to do this check itself rather than having VLife receive a tile pointer and then dereference it.
+
+### Lessons Learned
+
+1. **Check for unnecessary indirection**: When a method on class A calls class B which immediately accesses data back on A, consider moving the access to A.
+
+2. **Inline methods for common-case short-circuiting**: The `queueForProcessing()` method is inline, so when the tile is already flagged (most common case in dense Phase 2 processing), there's no function call overhead at all.
+
+3. **Small optimizations can improve code clarity**: Even when performance gains are minimal, reducing indirection often makes the code easier to understand. "Tile queues itself for processing" is clearer than "Tile asks VLife to maybe move itself to the head."
+
+### When This Approach Might Not Apply
+
+This optimization is specific to cases where:
+- A method frequently checks a condition before taking action
+- The condition check involves data owned by the caller
+- The caller was previously asking another class to do the check
+
+In other cases where the flag truly belongs to the called class, this refactoring wouldn't be appropriate.
+
+---
+
 ## Template for Future Experiments
 
 ### [Optimization Name] (Date)

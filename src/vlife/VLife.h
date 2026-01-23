@@ -138,6 +138,13 @@ private:
     // Generation counter for metrics
     uint64_t generationNumber = 0;
 
+    // Intrusive linked list: head = most recently active, tail = eviction candidates
+    Tile* listHead{nullptr};
+    Tile* listTail{nullptr};
+
+    // Mutex for move-to-head operations (low contention due to flag guard)
+    std::mutex listMutex;
+
     // Queue of tiles that had changes in Phase 1, for efficient Phase 2 processing
     // Using persistent members to amortize allocation across generations
     tbb::concurrent_vector<Tile*> tilesWithChanges;  // For parallel path
@@ -152,6 +159,16 @@ private:
 
     // Evict tiles with no live cells
     void evictDeadTiles();
+
+    // List management for activity-based ordering
+    void addTileToListHead(Tile* tile);
+    void removeTileFromList(Tile* tile);
+
+public:
+    // Move tile to head of activity list (flag check done by caller via Tile::queueForProcessing)
+    void moveToHead(Tile* tile);
+
+private:
 
 public:
     std::byte ruleLUT[256];
