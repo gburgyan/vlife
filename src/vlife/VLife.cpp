@@ -267,12 +267,15 @@ void VLife::runGenerationSequential() {
 
     // Phase 1: Traverse linked list from head, process tiles with needsProcessing flag
     // Tiles are moved to head during Phase 2 when they receive neighbor updates
+    // Track count of tiles processed for bounded post-Phase-2 scan
+    size_t phase1TileCount = 0;
     Tile* tile = listHead;
     while (tile && tile->getNeedsProcessing()) {
         // Mark as active BEFORE clearing flag for next-gen transition detection
         tile->setWasActiveLastGeneration(true);
         tile->clearNeedsProcessing();
         Tile* next = tile->getListNext();  // Save before potential list modification
+        phase1TileCount++;  // Count ALL tiles that had needsProcessing
 
         if (tile->needsPhase1Processing()) {
             tile->runGenerationPrepare();
@@ -313,16 +316,22 @@ void VLife::runGenerationSequential() {
 
     // Move newly-inactive tiles to tail (active->inactive transitions)
     // These tiles had wasActiveLastGeneration=true but weren't re-queued in Phase 2
-    // Batch move with single lock acquisition to reduce contention
+    // OPTIMIZATION: Only scan tiles that were active in Phase 1 (not the entire list)
+    // All tiles with wasActiveLastGeneration=true are in the first N tiles from head
+    // where N = phase1TileCount. New tiles added during Phase 2 go to head but have
+    // wasActiveLastGeneration=false, so we can use the count as an upper bound.
     {
         std::vector<Tile*> tilesToMoveTail;
         Tile* tile = listHead;
-        while (tile) {
+        size_t scanned = 0;
+        while (tile && scanned < phase1TileCount) {
             Tile* next = tile->getListNext();
+            // Skip newly-added tiles (they have wasActiveLastGeneration=false)
             if (tile->getWasActiveLastGeneration() && !tile->getNeedsProcessing()) {
                 tile->setWasActiveLastGeneration(false);
                 tilesToMoveTail.push_back(tile);
             }
+            scanned++;
             tile = next;
         }
         // Batch move to reduce lock contention
@@ -391,14 +400,17 @@ void VLife::runGeneration() {
 
     // Build vector of tiles to process from linked list
     // Tiles are moved to head during Phase 2 when they receive neighbor updates
+    // Track count of tiles processed for bounded post-Phase-2 scan
     std::vector<Tile*> tilesToProcess;
     tilesToProcess.reserve(tiles.size());
+    size_t phase1TileCount = 0;
     {
         Tile* tile = listHead;
         while (tile && tile->getNeedsProcessing()) {
             // Mark as active BEFORE clearing flag for next-gen transition detection
             tile->setWasActiveLastGeneration(true);
             tile->clearNeedsProcessing();
+            phase1TileCount++;  // Count ALL tiles that had needsProcessing
             if (tile->needsPhase1Processing()) {
                 tilesToProcess.push_back(tile);
             }
@@ -451,16 +463,22 @@ void VLife::runGeneration() {
 
     // Move newly-inactive tiles to tail (active->inactive transitions)
     // These tiles had wasActiveLastGeneration=true but weren't re-queued in Phase 2
-    // Batch move with single lock acquisition to reduce contention
+    // OPTIMIZATION: Only scan tiles that were active in Phase 1 (not the entire list)
+    // All tiles with wasActiveLastGeneration=true are in the first N tiles from head
+    // where N = phase1TileCount. New tiles added during Phase 2 go to head but have
+    // wasActiveLastGeneration=false, so we can use the count as an upper bound.
     {
         std::vector<Tile*> tilesToMoveTail;
         Tile* tile = listHead;
-        while (tile) {
+        size_t scanned = 0;
+        while (tile && scanned < phase1TileCount) {
             Tile* next = tile->getListNext();
+            // Skip newly-added tiles (they have wasActiveLastGeneration=false)
             if (tile->getWasActiveLastGeneration() && !tile->getNeedsProcessing()) {
                 tile->setWasActiveLastGeneration(false);
                 tilesToMoveTail.push_back(tile);
             }
+            scanned++;
             tile = next;
         }
         // Batch move to reduce lock contention
