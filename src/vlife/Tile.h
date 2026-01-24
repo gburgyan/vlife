@@ -30,10 +30,6 @@ class alignas(64) Tile {
     Tile *right;
     Tile *up;
     Tile *down;
-    Tile *upLeft;
-    Tile *upRight;
-    Tile *downLeft;
-    Tile *downRight;
 
     uint64_t cells[TILE_64S]{};
     uint64_t changes[TILE_CHANGE_64S]{};
@@ -128,9 +124,41 @@ public:
     void atomicAddColumnDeltas(int x, const int8_t* deltaArray);
     void nonAtomicAddColumnDeltas(int x, const int8_t* deltaArray);
 
-    // Helper to ensure a neighbor tile exists, creating it on demand if needed
-    // Returns the neighbor tile pointer (never null after call)
-    Tile* ensureNeighborTile(int dx, int dy);
+    // Direction-specific inline helpers to ensure neighbor tiles exist
+    // These replace the generic ensureNeighborTile(dx, dy) to eliminate
+    // parameter encoding/decoding overhead at call sites
+    inline Tile* ensureLeftTile() {
+        if (left == nullptr) left = board->getTile(tileX - 1, tileY);
+        return left;
+    }
+    inline Tile* ensureRightTile() {
+        if (right == nullptr) right = board->getTile(tileX + 1, tileY);
+        return right;
+    }
+    inline Tile* ensureUpTile() {
+        if (up == nullptr) up = board->getTile(tileX, tileY - 1);
+        return up;
+    }
+    inline Tile* ensureDownTile() {
+        if (down == nullptr) down = board->getTile(tileX, tileY + 1);
+        return down;
+    }
+    inline Tile* ensureUpLeftTile() {
+        Tile* upTile = ensureUpTile();
+        return upTile ? upTile->ensureLeftTile() : nullptr;
+    }
+    inline Tile* ensureUpRightTile() {
+        Tile* upTile = ensureUpTile();
+        return upTile ? upTile->ensureRightTile() : nullptr;
+    }
+    inline Tile* ensureDownLeftTile() {
+        Tile* downTile = ensureDownTile();
+        return downTile ? downTile->ensureLeftTile() : nullptr;
+    }
+    inline Tile* ensureDownRightTile() {
+        Tile* downTile = ensureDownTile();
+        return downTile ? downTile->ensureRightTile() : nullptr;
+    }
 
     // Getters for tile coordinates
     int32_t getTileX() const { return tileX; }
@@ -141,10 +169,10 @@ public:
     Tile *getRightTile() const { return right; }
     Tile *getUpTile() const { return up; }
     Tile *getDownTile() const { return down; }
-    Tile *getUpLeftTile() const { return upLeft; }
-    Tile *getUpRightTile() const { return upRight; }
-    Tile *getDownLeftTile() const { return downLeft; }
-    Tile *getDownRightTile() const { return downRight; }
+    Tile *getUpLeftTile() const { return up ? up->left : nullptr; }
+    Tile *getUpRightTile() const { return up ? up->right : nullptr; }
+    Tile *getDownLeftTile() const { return down ? down->left : nullptr; }
+    Tile *getDownRightTile() const { return down ? down->right : nullptr; }
     
     // Getter for the number of live cells
     uint32_t getLiveCount() const { return liveCount; }
@@ -223,7 +251,7 @@ public:
 
         // Upper-left corner
         if (topOut && leftOut) {
-            if (upLeft) { upLeft->atomicMarkBlockModified(leftX, topY); }
+            if (up && up->left) { up->left->atomicMarkBlockModified(leftX, topY); }
         } else if (topOut) {
             if (up) { up->atomicMarkBlockModified(leftX, topY); }
         } else if (leftOut) {
@@ -234,7 +262,7 @@ public:
 
         // Upper-right corner
         if (topOut && rightOut) {
-            if (upRight) { upRight->atomicMarkBlockModified(rightX, topY); }
+            if (up && up->right) { up->right->atomicMarkBlockModified(rightX, topY); }
         } else if (topOut) {
             if (up) { up->atomicMarkBlockModified(rightX, topY); }
         } else if (rightOut) {
@@ -245,7 +273,7 @@ public:
 
         // Lower-left corner
         if (bottomOut && leftOut) {
-            if (downLeft) { downLeft->atomicMarkBlockModified(leftX, bottomY); }
+            if (down && down->left) { down->left->atomicMarkBlockModified(leftX, bottomY); }
         } else if (bottomOut) {
             if (down) { down->atomicMarkBlockModified(leftX, bottomY); }
         } else if (leftOut) {
@@ -256,7 +284,7 @@ public:
 
         // Lower-right corner
         if (bottomOut && rightOut) {
-            if (downRight) { downRight->atomicMarkBlockModified(rightX, bottomY); }
+            if (down && down->right) { down->right->atomicMarkBlockModified(rightX, bottomY); }
         } else if (bottomOut) {
             if (down) { down->atomicMarkBlockModified(rightX, bottomY); }
         } else if (rightOut) {

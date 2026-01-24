@@ -114,23 +114,8 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
         tilePtr->setNeighbor(downIt->second, 0, 1);
     }
 
-    // Check diagonal neighbors
-    auto upLeftIt = tiles.find(TileCoord{tileX - 1, tileY - 1});
-    if (upLeftIt != tiles.end()) {
-        tilePtr->setNeighbor(upLeftIt->second, -1, -1);
-    }
-    auto upRightIt = tiles.find(TileCoord{tileX + 1, tileY - 1});
-    if (upRightIt != tiles.end()) {
-        tilePtr->setNeighbor(upRightIt->second, 1, -1);
-    }
-    auto downLeftIt = tiles.find(TileCoord{tileX - 1, tileY + 1});
-    if (downLeftIt != tiles.end()) {
-        tilePtr->setNeighbor(downLeftIt->second, -1, 1);
-    }
-    auto downRightIt = tiles.find(TileCoord{tileX + 1, tileY + 1});
-    if (downRightIt != tiles.end()) {
-        tilePtr->setNeighbor(downRightIt->second, 1, 1);
-    }
+    // Note: Diagonal neighbors are no longer stored - they are accessed via
+    // cardinal neighbor navigation (e.g., up->left for upLeft)
 
     return tilePtr;
 }
@@ -392,7 +377,7 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
 
     Tile *tile = it->second;
 
-    // Unlink from neighbors
+    // Unlink from cardinal neighbors
     if (tile->left) {
         tile->left->right = nullptr;
     }
@@ -405,10 +390,6 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
     if (tile->down) {
         tile->down->up = nullptr;
     }
-    if (tile->upLeft) tile->upLeft->downRight = nullptr;
-    if (tile->upRight) tile->upRight->downLeft = nullptr;
-    if (tile->downLeft) tile->downLeft->upRight = nullptr;
-    if (tile->downRight) tile->downRight->upLeft = nullptr;
 
 #ifdef DEBUG_VLIFE
     // Verify all cells are dead
@@ -439,15 +420,11 @@ void VLife::evictDeadTiles() {
             // Use modular arithmetic for age calculation (handles wrap-around)
             uint8_t age = currentGen - tile->getLastModifiedGeneration();
             if (age >= EVICTION_AGE_THRESHOLD) {
-                // Unlink from neighbors (inline from removeTile)
+                // Unlink from cardinal neighbors
                 if (tile->left) tile->left->right = nullptr;
                 if (tile->right) tile->right->left = nullptr;
                 if (tile->up) tile->up->down = nullptr;
                 if (tile->down) tile->down->up = nullptr;
-                if (tile->upLeft) tile->upLeft->downRight = nullptr;
-                if (tile->upRight) tile->upRight->downLeft = nullptr;
-                if (tile->downLeft) tile->downLeft->upRight = nullptr;
-                if (tile->downRight) tile->downRight->upLeft = nullptr;
 
                 tilePool.deallocate(tile);
                 it = tiles.erase(it);
