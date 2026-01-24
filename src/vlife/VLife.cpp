@@ -33,38 +33,17 @@ void VLife::resetBoard() {
     tiles.clear();
     tilePool.recycle();
 
-    // Clear Phase 1 queues and reset bootstrap flag
+    // Clear Phase 1 queues
     phase1Queues[0].clear();
     phase1Queues[1].clear();
     phase1Queue = &phase1Queues[0];
     nextPhase1Queue = &phase1Queues[1];
-    phase1QueueNeedsBootstrap = true;
 }
 
 void VLife::addToNextPhase1Queue(Tile* tile) {
     // Called from Tile::runGenerationChanges() during Phase 2
     // Thread-safe: AtomicQueue uses atomic fetch_add for lock-free push
     nextPhase1Queue->push_back(tile);
-}
-
-void VLife::swapPhase1Queues() {
-    // Double-buffer swap: clear the old "current" queue, then flip the index
-    // This makes the "next" queue become the new "current" for processing
-    // Zero-copy swap: O(1) instead of O(n) copy
-    phase1Queue->clear();
-    std::swap(phase1Queue, nextPhase1Queue);
-
-    // Bootstrap only when explicitly flagged (first gen or after setCell)
-    // Without this flag, stable patterns would be re-processed every generation
-    // because an empty queue is the natural state when no cells change
-    if (phase1QueueNeedsBootstrap && !tiles.empty()) {
-        for (auto& [coord, tile] : tiles) {
-            // All tiles start with wasModified=~0ULL, so they'll all be processed
-            // on first generation. Subsequently, only queued tiles are processed.
-            phase1Queue->push_back(tile);
-        }
-        phase1QueueNeedsBootstrap = false;  // Clear flag after bootstrap
-    }
 }
 
 Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
@@ -175,8 +154,11 @@ void VLife::setCell(uint32_t x, uint32_t y, CellState state) {
     // Use Tile's setCell method to set the cell state
     tile->setCell(localX, localY, state == CellState::ALIVE);
 
-    // Mark that Phase 1 queue needs to be rebuilt on next generation
-    phase1QueueNeedsBootstrap = true;
+    // Add tile to next Phase 1 queue if not already queued
+    // Uses tile's atomic queue flag to avoid duplicates
+    if (tile->tryQueueForPhase1()) {
+        nextPhase1Queue->push_back(tile);
+    }
 }
 
 std::vector<GameOfLife::CellState> VLife::getCells(uint32_t startX, uint32_t startY, uint32_t width,
@@ -267,16 +249,76 @@ void VLife::runGeneration() {
     }
 #endif
 
-    // Fall back to sequential for small tile counts or when parallel is disabled
-    if (!parallelEnabled || tiles.size() < 10) {
-        runGenerationSequential();
+    // Swap Phase 1 queues first: previous generation's nextPhase1Queue becomes this generation's queue
+    swapPhase1Queues();
+
+    // Fast path: empty queue means nothing to do (still-life patterns)
+    if (phase1Queue->empty()) {
+        evictDeadTilesLazy();
+        generationNumber++;
 
 #ifdef VLIFE_METRICS_ENABLED
-        size_t tilesCreated = tiles.size() > initialTileCount ? tiles.size() - initialTileCount : 0;
-        size_t preEvictCount = tiles.size();
+        auto genEndTime = std::chrono::high_resolution_clock::now();
+        uint64_t totalTime = std::chrono::duration_cast<std::chrono::microseconds>(genEndTime - genStartTime).count();
+        if (metricsCollector) {
+            int32_t minX, maxX, minY, maxY;
+            getBoardExtent(minX, maxX, minY, maxY);
+            VLIFE_METRICS_END_GEN(*metricsCollector, getTotalLiveCells(), tiles.size(),
+                                   minX, maxX, minY, maxY, totalTime, 0, 0);
+        }
+#endif
+        return;
+    }
+
+    // Fall back to sequential for small tile counts, small queues, or when parallel is disabled
+    // Avoids TBB setup/teardown overhead for small workloads
+    if (!parallelEnabled || tiles.size() < 10 || phase1Queue->size() < 16) {
+#ifdef VLIFE_METRICS_ENABLED
+        auto metricsTimerStart = std::chrono::high_resolution_clock::now();
+        size_t activeTilesCount = 0;
 #endif
 
-        evictDeadTiles();
+        // Clear the Phase 2 queue from previous generation
+        changedTilesSequential.clear();
+
+        // First pass: iterate over Phase 1 queue
+        for (Tile* tile : *phase1Queue) {
+            tile->clearQueueFlag();
+            if (tile->runGenerationPrepare()) {
+                changedTilesSequential.push_back(tile);
+            }
+#ifdef VLIFE_METRICS_ENABLED
+            activeTilesCount++;
+#endif
+        }
+
+#ifdef VLIFE_METRICS_ENABLED
+        auto phase1End = std::chrono::high_resolution_clock::now();
+        uint64_t phase1Time = std::chrono::duration_cast<std::chrono::microseconds>(phase1End - metricsTimerStart).count();
+        if (metricsCollector) {
+            VLIFE_METRICS_MERGE_TL(*metricsCollector);
+            VLIFE_METRICS_END_PHASE1(*metricsCollector, activeTilesCount, phase1Time);
+        }
+        auto phase2Start = std::chrono::high_resolution_clock::now();
+#endif
+
+        // Second pass: apply changes
+        for (Tile* tile : changedTilesSequential) {
+            tile->runGenerationChanges<false>();
+        }
+
+#ifdef VLIFE_METRICS_ENABLED
+        auto phase2End = std::chrono::high_resolution_clock::now();
+        uint64_t phase2Time = std::chrono::duration_cast<std::chrono::microseconds>(phase2End - phase2Start).count();
+        size_t tilesCreated = tiles.size() > initialTileCount ? tiles.size() - initialTileCount : 0;
+        size_t preEvictCount = tiles.size();
+        if (metricsCollector) {
+            VLIFE_METRICS_MERGE_TL(*metricsCollector);
+            VLIFE_METRICS_END_PHASE2(*metricsCollector, tiles.size(), phase2Time);
+        }
+#endif
+
+        evictDeadTilesLazy();
         generationNumber++;
 
 #ifdef VLIFE_METRICS_ENABLED
@@ -297,9 +339,6 @@ void VLife::runGeneration() {
     auto phase1Start = std::chrono::high_resolution_clock::now();
     std::atomic<size_t> activeTileCount{0};
 #endif
-
-    // Swap Phase 1 queues: previous generation's nextPhase1Queue becomes this generation's queue
-    swapPhase1Queues();
 
     // Clear the Phase 2 queue from previous generation (keeps capacity for amortized allocation)
     tilesWithChanges.clear();
@@ -349,7 +388,7 @@ void VLife::runGeneration() {
 #endif
 
     // Evict dead tiles to prevent memory growth
-    evictDeadTiles();
+    evictDeadTilesLazy();
     generationNumber++;
 
 #ifdef VLIFE_METRICS_ENABLED
@@ -411,12 +450,8 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
     tiles.erase(it);
 }
 
-void VLife::evictDeadTiles() {
-    // Only check periodically (power of 2 interval for fast modulo via bitmask)
-    if ((generationNumber & (EVICTION_CHECK_INTERVAL - 1)) != 0) {
-        return;
-    }
-
+void VLife::evictDeadTilesActual() {
+    // Actual eviction logic - modulo check is handled by inline evictDeadTilesLazy()
     uint8_t currentGen = static_cast<uint8_t>(generationNumber);
 
     for (auto it = tiles.begin(); it != tiles.end(); ) {

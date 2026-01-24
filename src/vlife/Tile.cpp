@@ -202,6 +202,12 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
                 adjTile = board->getTile(tileX + 1, tileY + 1);
                 adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             }
+
+            // Queue the adjacent tile for Phase 1 processing (if not already queued)
+            // This ensures cells that might be born/die due to neighbor count changes are processed
+            if (adjTile && adjTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(adjTile);
+            }
         }
     }
 
@@ -229,6 +235,9 @@ void Tile::updateNeighborCount(int localX, int localY, bool increment) {
 
     // Mark this word as active (neighbor count change means potential birth)
     markWordActive(cellIdx);
+
+    // Mark this block as modified for Phase 1 processing
+    markBlockModified(localX, localY);
 }
 
 bool Tile::runGenerationPrepare() {

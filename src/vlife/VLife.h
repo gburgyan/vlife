@@ -142,7 +142,10 @@ public:
 
     // Swap Phase 1 queues between generations
     // Called at the start of Phase 1 to switch from building queue to processing queue
-    void swapPhase1Queues();
+    inline void swapPhase1Queues() {
+        phase1Queue->clear();
+        std::swap(phase1Queue, nextPhase1Queue);
+    }
 
 
 #ifdef VLIFE_METRICS_ENABLED
@@ -201,10 +204,6 @@ private:
     AtomicQueue<Tile*>* phase1Queue{&phase1Queues[0]};      // Pointer to current generation's queue
     AtomicQueue<Tile*>* nextPhase1Queue{&phase1Queues[1]};  // Pointer to next generation's queue
 
-    // Flag indicating Phase 1 queue needs bootstrap (first gen or after setCell)
-    // Without this flag, the queue bootstrap would run every generation when patterns stabilize
-    // (empty queue), causing static patterns to be re-processed unnecessarily
-    bool phase1QueueNeedsBootstrap{true};
 
 #ifdef VLIFE_METRICS_ENABLED
     MetricsCollector* metricsCollector = nullptr;
@@ -213,8 +212,19 @@ private:
     // Sequential implementation (fallback for small tile counts)
     void runGenerationSequential();
 
-    // Evict tiles with no live cells
-    void evictDeadTiles();
+    // Evict tiles with no live cells (actual implementation)
+    void evictDeadTilesActual();
+
+    // Eviction interval - power of 2 for fast modulo via bitmask
+    static constexpr uint64_t EVICTION_CHECK_INTERVAL = 256;
+    static constexpr uint8_t EVICTION_AGE_THRESHOLD = 128;
+
+    // Lazy eviction check - inline fast path, actual eviction is out-of-line
+    inline void evictDeadTilesLazy() {
+        if (__builtin_expect((generationNumber & (EVICTION_CHECK_INTERVAL - 1)) == 0, 0)) {
+            evictDeadTilesActual();
+        }
+    }
 
 public:
     std::byte ruleLUT[256];
