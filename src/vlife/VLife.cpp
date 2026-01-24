@@ -14,6 +14,7 @@ VLife::VLife() {
     resetBoard();
     populateRuleLUT();
     populateUpdateLUT();
+    populateCornerMaskLUT();
 }
 
 VLife::~VLife() {
@@ -593,5 +594,45 @@ void VLife::getBoardExtent(int32_t& minX, int32_t& maxX, int32_t& minY, int32_t&
         if (coord.x > maxX) maxX = coord.x;
         if (coord.y < minY) minY = coord.y;
         if (coord.y > maxY) maxY = coord.y;
+    }
+}
+
+void VLife::populateCornerMaskLUT() {
+    // Precompute corner block masks for markChangeCorners interior fast path
+    // For each cell pair at (baseX, localY) and (baseX+1, localY):
+    //   - rightMask: block indices for right cell's 4 corners
+    //   - leftMask: block indices for left cell's 4 corners
+    //
+    // Block index formula: ((y & 0x1C) << 1) | (x >> 2)
+    //   - y & 0x1C extracts bits 2-4 of y (row within 4x4 block group)
+    //   - x >> 2 gives x-block index (0-7 for 32-wide tile)
+    //
+    // This LUT trades 8KB memory for eliminating ~24 arithmetic ops per interior cell
+
+    for (int y = 0; y < TILE_HEIGHT; y++) {
+        for (int baseX = 0; baseX < TILE_WIDTH; baseX += 2) {
+            int cellPairIdx = y * 16 + (baseX >> 1);
+
+            // Right cell at (baseX, y) - compute 4 corner block indices
+            // Corners: (x-1, y-1), (x+1, y-1), (x-1, y+1), (x+1, y+1)
+            int rx = baseX;
+            int ul = (((y - 1) & 0x1C) << 1) | ((rx - 1) >> 2);
+            int ur = (((y - 1) & 0x1C) << 1) | ((rx + 1) >> 2);
+            int ll = (((y + 1) & 0x1C) << 1) | ((rx - 1) >> 2);
+            int lr = (((y + 1) & 0x1C) << 1) | ((rx + 1) >> 2);
+            cornerMaskLUT[cellPairIdx].rightMask =
+                (1ULL << (ul & 63)) | (1ULL << (ur & 63)) |
+                (1ULL << (ll & 63)) | (1ULL << (lr & 63));
+
+            // Left cell at (baseX+1, y) - compute 4 corner block indices
+            int lx = baseX + 1;
+            ul = (((y - 1) & 0x1C) << 1) | ((lx - 1) >> 2);
+            ur = (((y - 1) & 0x1C) << 1) | ((lx + 1) >> 2);
+            ll = (((y + 1) & 0x1C) << 1) | ((lx - 1) >> 2);
+            lr = (((y + 1) & 0x1C) << 1) | ((lx + 1) >> 2);
+            cornerMaskLUT[cellPairIdx].leftMask =
+                (1ULL << (ul & 63)) | (1ULL << (ur & 63)) |
+                (1ULL << (ll & 63)) | (1ULL << (lr & 63));
+        }
     }
 }

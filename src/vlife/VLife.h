@@ -26,6 +26,14 @@ struct PackedDeltas {
     int8_t verticalRow[4]; // [0]=x-1, [1]=x, [2]=x+1, [3]=x+2 (for rows above/below)
 };
 
+// Precomputed corner block masks for markChangeCorners interior fast path
+// Each cell pair has two masks: one for when the right cell changes, one for left
+// Index: cellPairIdx = localY * 16 + (baseX >> 1) where baseX is even (0,2,4,...,30)
+struct CornerMasks {
+    uint64_t rightMask;  // Mask when right cell (baseX) changes
+    uint64_t leftMask;   // Mask when left cell (baseX+1) changes
+};
+
 // Tile dimensions as compile-time constants
 // Using constexpr instead of macros for type safety and namespace hygiene
 namespace VLifeConstants {
@@ -107,6 +115,7 @@ public:
 private:
     void populateRuleLUT();
     void populateUpdateLUT();
+    void populateCornerMaskLUT();
 
     // Structure to represent tile coordinates as a key
     struct TileCoord {
@@ -169,4 +178,5 @@ private:
 public:
     std::byte ruleLUT[256];
     PackedDeltas deltaLUT[16];  // LUT for neighbor count updates indexed by change/alive flags
+    CornerMasks cornerMaskLUT[512];  // LUT for markChangeCorners interior fast path (32 rows × 16 pairs)
 };

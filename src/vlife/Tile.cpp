@@ -947,11 +947,27 @@ void Tile::runGenerationChanges() {
 
             // Mark 4x4 block corners for next generation's Phase 1 skipping
             // Left cell is at (baseX+1, localY), right cell is at (baseX, localY)
-            if (leftChanged) {
-                markChangeCorners(baseX + 1, localY);
-            }
-            if (rightChanged) {
-                markChangeCorners(baseX, localY);
+            // Interior fast path uses precomputed LUT to avoid function call overhead (97% of cells)
+            // Interior: all corner coordinates x-1, x+1, y-1, y+1 stay within [0, TILE_WIDTH-1/TILE_HEIGHT-1]
+            // For cell pair at baseX: right cell at baseX needs x in [1,30], left cell at baseX+1 needs x in [0,30]
+            // Combined: baseX >= 2 (so baseX-1 >= 1) and baseX <= 28 (so baseX+2 <= 30) and y in [1,30]
+            bool isInterior = (baseX >= 2 && baseX <= 28 && localY >= 1 && localY <= 30);
+            if (isInterior) {
+                // LUT-based fast path: single index calculation + 1-2 memory loads + 1-2 ORs
+                int cellPairIdx = localY * 16 + (baseX >> 1);
+                const CornerMasks& masks = board->cornerMaskLUT[cellPairIdx];
+
+                if (leftChanged && rightChanged) {
+                    wasModified |= masks.leftMask | masks.rightMask;
+                } else if (leftChanged) {
+                    wasModified |= masks.leftMask;
+                } else if (rightChanged) {
+                    wasModified |= masks.rightMask;
+                }
+            } else {
+                // Slow path for boundary cells (~3%) - call the function
+                if (leftChanged) markChangeCorners(baseX + 1, localY);
+                if (rightChanged) markChangeCorners(baseX, localY);
             }
 
             // Build LUT index and apply deltas
@@ -1209,35 +1225,37 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
 
         cells[cellIdx] = word;
     } else {
-        // Slow path: handle boundaries individually
-        // Uses applyDelta which routes boundary cells through atomicApplyDelta
-        for (int i = 0; i < 4; i++) {
-            int x = leftX + i;
-            int8_t delta = deltas[i];
+        // Slow path: handle boundaries with batched tile lookups
+        // Classify boundary crossings once
+        bool crossesLeft = (leftX < 0);
+        bool crossesRight = (rightX >= TILE_WIDTH);
 
-            if (delta == 0) continue;
+        // Handle left tile boundary first (single lookup, single queue check)
+        if (crossesLeft && deltas[0] != 0) {
+            Tile* leftTile = ensureLeftTile();
+            VLIFE_METRICS_INC_BOUNDARY();
+            leftTile->atomicApplyDelta(TILE_WIDTH - 1, y, deltas[0]);
+            if (!leftTile->willSelfQueueForPhase1() && leftTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(leftTile);
+            }
+        }
 
-            // Check bounds and handle accordingly
-            if (x >= 0 && x < TILE_WIDTH) {
-                applyDelta(x, y, delta);
-            } else if (x < 0) {
-                // Left tile boundary - create tile if needed, use atomic for safety
-                Tile* leftTile = ensureLeftTile();
-                VLIFE_METRICS_INC_BOUNDARY();
-                leftTile->atomicApplyDelta(TILE_WIDTH - 1, y, delta);
-                // Queue neighbor for next Phase 1 (skip if already in Phase 2)
-                if (!leftTile->willSelfQueueForPhase1() && leftTile->tryQueueForPhase1()) {
-                    board->addToNextPhase1Queue(leftTile);
-                }
-            } else {
-                // Right tile boundary - create tile if needed, use atomic for safety
-                Tile* rightTile = ensureRightTile();
-                VLIFE_METRICS_INC_BOUNDARY();
-                rightTile->atomicApplyDelta(0, y, delta);
-                // Queue neighbor for next Phase 1 (skip if already in Phase 2)
-                if (!rightTile->willSelfQueueForPhase1() && rightTile->tryQueueForPhase1()) {
-                    board->addToNextPhase1Queue(rightTile);
-                }
+        // Interior cells - use applyDelta for boundary row handling
+        int startIdx = crossesLeft ? 1 : 0;
+        int endIdx = crossesRight ? 3 : 4;
+        for (int i = startIdx; i < endIdx; i++) {
+            if (deltas[i] != 0) {
+                applyDelta(leftX + i, y, deltas[i]);
+            }
+        }
+
+        // Handle right tile boundary (single lookup, single queue check)
+        if (crossesRight && deltas[3] != 0) {
+            Tile* rightTile = ensureRightTile();
+            VLIFE_METRICS_INC_BOUNDARY();
+            rightTile->atomicApplyDelta(0, y, deltas[3]);
+            if (!rightTile->willSelfQueueForPhase1() && rightTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(rightTile);
             }
         }
     }
