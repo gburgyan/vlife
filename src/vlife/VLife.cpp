@@ -234,8 +234,7 @@ void VLife::runGenerationSequential() {
     // runGenerationPrepare() returns early if wasModified==0, so no explicit check needed
     for (Tile* tile : phase1Queue) {
         tile->clearQueueFlag();  // Reset for next generation's queuing
-        tile->runGenerationPrepare();
-        if (tile->hasChanges()) {
+        if (tile->runGenerationPrepare()) {
             changedTilesSequential.push_back(tile);
         }
 #ifdef VLIFE_METRICS_ENABLED
@@ -324,8 +323,7 @@ void VLife::runGeneration() {
 #endif
         ](Tile* tile) {
             tile->clearQueueFlag();  // Reset for next generation's queuing
-            tile->runGenerationPrepare();
-            if (tile->hasChanges()) {
+            if (tile->runGenerationPrepare()) {
                 tilesWithChanges.push_back(tile);
             }
 #ifdef VLIFE_METRICS_ENABLED

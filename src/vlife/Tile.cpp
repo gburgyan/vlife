@@ -253,12 +253,11 @@ void Tile::updateNeighborCount(int localX, int localY, bool increment) {
     markWordActive(cellIdx);
 }
 
-void Tile::runGenerationPrepare() {
+bool Tile::runGenerationPrepare() {
 #ifdef VLIFE_AVX512_ENABLED
     // Use AVX-512 optimized version if available
     if (CpuFeatures::hasAVX512Support()) {
-        runGenerationPrepare_AVX512();
-        return;
+        return runGenerationPrepare_AVX512();
     }
 #endif
 
@@ -272,7 +271,7 @@ void Tile::runGenerationPrepare() {
 
     // Nothing modified - nothing to scan
     if (modMask == 0) {
-        return;
+        return false;
     }
 
     // Note: activityRows is preserved for unscanned rows (rowMask == 0)
@@ -593,6 +592,8 @@ void Tile::runGenerationPrepare() {
         }  // end iter loop
     }  // end blockRow loop
 #endif
+
+    return changesAccumulator != 0;
 }
 
 #ifdef VLIFE_AVX512_ENABLED
@@ -607,7 +608,7 @@ void Tile::runGenerationPrepare() {
 // - Birth: NOT alive AND neighbors == 3
 //
 // The true neighbor count = stored count + paired cell's alive state
-void Tile::runGenerationPrepare_AVX512() {
+bool Tile::runGenerationPrepare_AVX512() {
     // Consume modification mask (no expansion needed - markChangeCorners already
     // marks all affected blocks during Phase 2)
     uint64_t modMask = wasModified;
@@ -621,7 +622,7 @@ void Tile::runGenerationPrepare_AVX512() {
 
     // Nothing modified - nothing to scan
     if (modMask == 0) {
-        return;
+        return false;
     }
 
     // Note: activityRows is preserved for unscanned rows (rowMask == 0)
@@ -796,6 +797,8 @@ void Tile::runGenerationPrepare_AVX512() {
             changes[changeWordBase + cw] = changeBuff;
         }
     }
+
+    return changesAccumulator != 0;
 }
 #endif // VLIFE_AVX512_ENABLED
 

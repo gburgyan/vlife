@@ -65,7 +65,7 @@ public:
 
     void setNeighbor(Tile *tile, int dx, int dy);
 
-    void runGenerationPrepare();
+    bool runGenerationPrepare();
 
     // Template parameter controls whether atomic operations are used for boundary cells:
     // - UseAtomics=true: Use CAS loops for boundary updates (required for parallel execution)
@@ -76,7 +76,7 @@ public:
 #ifdef VLIFE_AVX512_ENABLED
     // AVX-512 optimized version of runGenerationPrepare
     // Uses direct SIMD computation instead of LUT lookups
-    void runGenerationPrepare_AVX512();
+    bool runGenerationPrepare_AVX512();
 #endif
 
     void lockTile();
