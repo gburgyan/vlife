@@ -26,12 +26,16 @@ struct PackedDeltas {
     int8_t verticalRow[4]; // [0]=x-1, [1]=x, [2]=x+1, [3]=x+2 (for rows above/below)
 };
 
-// Precomputed corner block masks for markChangeCorners interior fast path
-// Each cell pair has two masks: one for when the right cell changes, one for left
-// Index: cellPairIdx = localY * 16 + (baseX >> 1) where baseX is even (0,2,4,...,30)
-struct CornerMasks {
-    uint64_t rightMask;  // Mask when right cell (baseX) changes
-    uint64_t leftMask;   // Mask when left cell (baseX+1) changes
+// Compact precomputed corner block masks for markChangeCorners interior fast path
+// Exploits y-symmetry and encodes change state directly in LUT index for 16x size reduction
+// Index: (yClass << 6) | (xPair << 2) | changeState
+//   yClass: localY & 3 (0-3) - position within 4-row block
+//   xPair: baseX >> 1 (0-15) - which cell pair in the row
+//   changeState: (leftChanged << 1) | rightChanged (0-3)
+// At runtime, x-block masks are shifted to the correct block-row position
+struct CompactCornerMask {
+    uint8_t upper;  // Combined x-block bits for upper corners (y-1)
+    uint8_t lower;  // Combined x-block bits for lower corners (y+1)
 };
 
 // Tile dimensions as compile-time constants
@@ -178,5 +182,5 @@ private:
 public:
     std::byte ruleLUT[256];
     PackedDeltas deltaLUT[16];  // LUT for neighbor count updates indexed by change/alive flags
-    CornerMasks cornerMaskLUT[512];  // LUT for markChangeCorners interior fast path (32 rows × 16 pairs)
+    CompactCornerMask compactCornerMaskLUT[256];  // LUT for markChangeCorners interior fast path (4 yClasses × 16 xPairs × 4 changeStates)
 };

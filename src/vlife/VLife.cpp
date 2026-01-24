@@ -598,41 +598,53 @@ void VLife::getBoardExtent(int32_t& minX, int32_t& maxX, int32_t& minY, int32_t&
 }
 
 void VLife::populateCornerMaskLUT() {
-    // Precompute corner block masks for markChangeCorners interior fast path
-    // For each cell pair at (baseX, localY) and (baseX+1, localY):
-    //   - rightMask: block indices for right cell's 4 corners
-    //   - leftMask: block indices for left cell's 4 corners
+    // Compact corner block masks exploiting y-symmetry and encoding change state in index
+    // For interior cells, corner y-positions only depend on yClass = localY & 3:
+    //   - yClass 0: upper corners in blockRow-1, lower in blockRow
+    //   - yClass 1,2: both upper and lower in same blockRow
+    //   - yClass 3: upper corners in blockRow, lower in blockRow+1
     //
-    // Block index formula: ((y & 0x1C) << 1) | (x >> 2)
-    //   - y & 0x1C extracts bits 2-4 of y (row within 4x4 block group)
-    //   - x >> 2 gives x-block index (0-7 for 32-wide tile)
+    // We store only the x-block masks (8 bits each for 8 x-blocks) and compute
+    // the full 64-bit mask at runtime by shifting to the correct block-row.
     //
-    // This LUT trades 8KB memory for eliminating ~24 arithmetic ops per interior cell
+    // Index encoding: (yClass << 6) | (xPair << 2) | changeState
+    // changeState: 0=none, 1=right, 2=left, 3=both
+    //
+    // This reduces LUT from 8KB (512 × 16 bytes) to 512 bytes (256 × 2 bytes)
 
-    for (int y = 0; y < TILE_HEIGHT; y++) {
+    for (int yClass = 0; yClass < 4; yClass++) {
         for (int baseX = 0; baseX < TILE_WIDTH; baseX += 2) {
-            int cellPairIdx = y * 16 + (baseX >> 1);
+            int xPair = baseX >> 1;
 
-            // Right cell at (baseX, y) - compute 4 corner block indices
-            // Corners: (x-1, y-1), (x+1, y-1), (x-1, y+1), (x+1, y+1)
-            int rx = baseX;
-            int ul = (((y - 1) & 0x1C) << 1) | ((rx - 1) >> 2);
-            int ur = (((y - 1) & 0x1C) << 1) | ((rx + 1) >> 2);
-            int ll = (((y + 1) & 0x1C) << 1) | ((rx - 1) >> 2);
-            int lr = (((y + 1) & 0x1C) << 1) | ((rx + 1) >> 2);
-            cornerMaskLUT[cellPairIdx].rightMask =
-                (1ULL << (ul & 63)) | (1ULL << (ur & 63)) |
-                (1ULL << (ll & 63)) | (1ULL << (lr & 63));
+            // Compute x-block masks for each cell
+            // Right cell at baseX, left cell at baseX+1
+            // Corner x-positions: x-1 and x+1
+            int rx = baseX;      // Right cell x
+            int lx = baseX + 1;  // Left cell x
 
-            // Left cell at (baseX+1, y) - compute 4 corner block indices
-            int lx = baseX + 1;
-            ul = (((y - 1) & 0x1C) << 1) | ((lx - 1) >> 2);
-            ur = (((y - 1) & 0x1C) << 1) | ((lx + 1) >> 2);
-            ll = (((y + 1) & 0x1C) << 1) | ((lx - 1) >> 2);
-            lr = (((y + 1) & 0x1C) << 1) | ((lx + 1) >> 2);
-            cornerMaskLUT[cellPairIdx].leftMask =
-                (1ULL << (ul & 63)) | (1ULL << (ur & 63)) |
-                (1ULL << (ll & 63)) | (1ULL << (lr & 63));
+            // X-block index is x >> 2 (0-7 for 32-wide tile)
+            // Each cell affects blocks at (x-1)>>2 and (x+1)>>2
+            // Mask with & 31 to handle wraparound for edge cases (though runtime check excludes them)
+            int rxLeftBlock = ((rx - 1) & 31) >> 2;
+            int rxRightBlock = ((rx + 1) & 31) >> 2;
+            uint8_t rightMask = static_cast<uint8_t>((1 << rxLeftBlock) | (1 << rxRightBlock));
+
+            int lxLeftBlock = ((lx - 1) & 31) >> 2;
+            int lxRightBlock = ((lx + 1) & 31) >> 2;
+            uint8_t leftMask = static_cast<uint8_t>((1 << lxLeftBlock) | (1 << lxRightBlock));
+
+            // Precompute all 4 change state combinations
+            for (int changeState = 0; changeState < 4; changeState++) {
+                int lutIdx = (yClass << 6) | (xPair << 2) | changeState;
+
+                uint8_t combined = 0;
+                if (changeState & 1) combined |= rightMask;  // Right changed
+                if (changeState & 2) combined |= leftMask;   // Left changed
+
+                // Upper and lower corners have the same x-block pattern
+                // (only the block-row differs, computed at runtime)
+                compactCornerMaskLUT[lutIdx] = {combined, combined};
+            }
         }
     }
 }

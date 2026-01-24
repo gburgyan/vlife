@@ -947,23 +947,31 @@ void Tile::runGenerationChanges() {
 
             // Mark 4x4 block corners for next generation's Phase 1 skipping
             // Left cell is at (baseX+1, localY), right cell is at (baseX, localY)
-            // Interior fast path uses precomputed LUT to avoid function call overhead (97% of cells)
+            // Interior fast path uses compact precomputed LUT (512 bytes vs 8KB)
             // Interior: all corner coordinates x-1, x+1, y-1, y+1 stay within [0, TILE_WIDTH-1/TILE_HEIGHT-1]
             // For cell pair at baseX: right cell at baseX needs x in [1,30], left cell at baseX+1 needs x in [0,30]
             // Combined: baseX >= 2 (so baseX-1 >= 1) and baseX <= 28 (so baseX+2 <= 30) and y in [1,30]
             bool isInterior = (baseX >= 2 && baseX <= 28 && localY >= 1 && localY <= 30);
             if (isInterior) {
-                // LUT-based fast path: single index calculation + 1-2 memory loads + 1-2 ORs
-                int cellPairIdx = localY * 16 + (baseX >> 1);
-                const CornerMasks& masks = board->cornerMaskLUT[cellPairIdx];
+                // Compact LUT fast path: encodes y-symmetry and change state in index
+                // Single indexed lookup with no conditionals, then shift to correct block-row
+                int yClass = localY & 3;
+                int blockRow = localY >> 2;
+                int changeState = (leftChanged << 1) | rightChanged;
 
-                if (leftChanged && rightChanged) {
-                    wasModified |= masks.leftMask | masks.rightMask;
-                } else if (leftChanged) {
-                    wasModified |= masks.leftMask;
-                } else if (rightChanged) {
-                    wasModified |= masks.rightMask;
-                }
+                int lutIdx = (yClass << 6) | ((baseX >> 1) << 2) | changeState;
+                const CompactCornerMask& mask = board->compactCornerMaskLUT[lutIdx];
+
+                // Compute block-row positions for upper (y-1) and lower (y+1) corners
+                // yClass 0: upper is in blockRow-1, lower in blockRow
+                // yClass 3: upper is in blockRow, lower in blockRow+1
+                // yClass 1,2: both in same blockRow
+                int upperRow = blockRow - (yClass == 0);
+                int lowerRow = blockRow + (yClass == 3);
+
+                // Build 64-bit mask by shifting x-block masks to correct block-row positions
+                wasModified |= (static_cast<uint64_t>(mask.upper) << (upperRow * 8))
+                             | (static_cast<uint64_t>(mask.lower) << (lowerRow * 8));
             } else {
                 // Slow path for boundary cells (~3%) - call the function
                 if (leftChanged) markChangeCorners(baseX + 1, localY);
