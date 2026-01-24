@@ -820,9 +820,7 @@ void Tile::runGenerationChanges() {
     }
 
     // Queue self for next generation's Phase 1 (this tile will have modified cells)
-    if (tryQueueForPhase1()) {
-        board->addToNextPhase1Queue(this);
-    }
+    board->addToNextPhase1Queue(this);
 
     // Update the last modified timestamp for eviction tracking
     lastModifiedGeneration = board->getCurrentGenerationMod256();
@@ -837,7 +835,6 @@ void Tile::runGenerationChanges() {
     //   4. Apply deltas to all affected neighbors
 
     const PackedDeltas* deltaLUT = board->deltaLUT;
-    const bool useBufferedBoundary = board->isBufferedBoundaryEnabled();
 
     // Stack-local buffers for neighbor boundary deltas (simple int8_t arrays)
     // Using int8_t avoids carry propagation issues that occur with packed nibbles
@@ -961,181 +958,174 @@ void Tile::runGenerationChanges() {
             int lutIndex = (leftState << 2) | rightState;
             const PackedDeltas& deltas = deltaLUT[lutIndex];
 
-            // Check if this cell pair is on a cross-tile boundary and we're using buffered mode
+            // Check if this cell pair is on a cross-tile boundary
             bool isTopRow = (localY == 0);
             bool isBottomRow = (localY == TILE_HEIGHT - 1);
             bool isLeftEdge = (baseX == 0);  // Cell pair at left edge (baseX=0 means x-1 is cross-tile)
             bool isRightEdge = (baseX == TILE_WIDTH - 2);  // Cell pair at right edge (baseX+2 is cross-tile)
 
-            if (useBufferedBoundary) {
-                // Buffered path: accumulate cross-tile deltas locally
-                // Buffer left/right same-row deltas for all rows
-                // Buffer up/down vertical deltas only for boundary rows
+            // Buffered path: accumulate cross-tile deltas locally
+            // Buffer left/right same-row deltas for all rows
+            // Buffer up/down vertical deltas only for boundary rows
 
-                // Apply same-row horizontal neighbors (x-1 and x+2)
-                int leftNeighborX = baseX - 1;
-                int rightNeighborX = baseX + 2;
+            // Apply same-row horizontal neighbors (x-1 and x+2)
+            int leftNeighborX = baseX - 1;
+            int rightNeighborX = baseX + 2;
 
-                if (deltas.sameRow[0] != 0) {
-                    if (leftNeighborX >= 0) {
-                        applyDelta(leftNeighborX, localY, deltas.sameRow[0]);
-                    } else {
-                        // Buffer for later flush to left tile's column 31
-                        leftNeighborDeltas[localY] += deltas.sameRow[0];
-                        hasLeftDeltas = true;
-                    }
-                }
-
-                if (deltas.sameRow[1] != 0) {
-                    if (rightNeighborX < TILE_WIDTH) {
-                        applyDelta(rightNeighborX, localY, deltas.sameRow[1]);
-                    } else {
-                        // Buffer for later flush to right tile's column 0
-                        rightNeighborDeltas[localY] += deltas.sameRow[1];
-                        hasRightDeltas = true;
-                    }
-                }
-
-                // Handle vertical deltas for row above (y-1)
-                if (isTopRow) {
-                    // Cross-tile to up neighbor's row 31: buffer it
-                    // Also handle corner cases for up-left and up-right tiles
-                    int8_t* leftCorner = isLeftEdge ? &upLeftCornerDelta : nullptr;
-                    int8_t* rightCorner = isRightEdge ? &upRightCornerDelta : nullptr;
-                    accumulateVerticalDeltasToArrays(upNeighborDeltas, baseX, deltas.verticalRow,
-                                                      leftCorner, rightCorner);
-                    hasUpDeltas = true;
+            if (deltas.sameRow[0] != 0) {
+                if (leftNeighborX >= 0) {
+                    applyDelta(leftNeighborX, localY, deltas.sameRow[0]);
                 } else {
-                    // Within-tile row above
-                    applyVerticalDeltas(baseX, localY - 1, deltas.verticalRow);
+                    // Buffer for later flush to left tile's column 31
+                    leftNeighborDeltas[localY] += deltas.sameRow[0];
+                    hasLeftDeltas = true;
                 }
+            }
 
-                // Handle vertical deltas for row below (y+1)
-                if (isBottomRow) {
-                    // Cross-tile to down neighbor's row 0: buffer it
-                    int8_t* leftCorner = isLeftEdge ? &downLeftCornerDelta : nullptr;
-                    int8_t* rightCorner = isRightEdge ? &downRightCornerDelta : nullptr;
-                    accumulateVerticalDeltasToArrays(downNeighborDeltas, baseX, deltas.verticalRow,
-                                                      leftCorner, rightCorner);
-                    hasDownDeltas = true;
+            if (deltas.sameRow[1] != 0) {
+                if (rightNeighborX < TILE_WIDTH) {
+                    applyDelta(rightNeighborX, localY, deltas.sameRow[1]);
                 } else {
-                    // Within-tile row below
-                    applyVerticalDeltas(baseX, localY + 1, deltas.verticalRow);
+                    // Buffer for later flush to right tile's column 0
+                    rightNeighborDeltas[localY] += deltas.sameRow[1];
+                    hasRightDeltas = true;
                 }
+            }
+
+            // Handle vertical deltas for row above (y-1)
+            if (isTopRow) {
+                // Cross-tile to up neighbor's row 31: buffer it
+                // Also handle corner cases for up-left and up-right tiles
+                int8_t* leftCorner = isLeftEdge ? &upLeftCornerDelta : nullptr;
+                int8_t* rightCorner = isRightEdge ? &upRightCornerDelta : nullptr;
+                accumulateVerticalDeltasToArrays(upNeighborDeltas, baseX, deltas.verticalRow,
+                                                  leftCorner, rightCorner);
+                hasUpDeltas = true;
             } else {
-                // Original path: apply all deltas immediately
-                applyDeltasForCellPair<UseAtomics>(baseX, localY, deltas);
+                // Within-tile row above
+                applyVerticalDeltas(baseX, localY - 1, deltas.verticalRow);
+            }
+
+            // Handle vertical deltas for row below (y+1)
+            if (isBottomRow) {
+                // Cross-tile to down neighbor's row 0: buffer it
+                int8_t* leftCorner = isLeftEdge ? &downLeftCornerDelta : nullptr;
+                int8_t* rightCorner = isRightEdge ? &downRightCornerDelta : nullptr;
+                accumulateVerticalDeltasToArrays(downNeighborDeltas, baseX, deltas.verticalRow,
+                                                  leftCorner, rightCorner);
+                hasDownDeltas = true;
+            } else {
+                // Within-tile row below
+                applyVerticalDeltas(baseX, localY + 1, deltas.verticalRow);
             }
         }
     }
 
     // Flush buffered deltas to neighbor tiles
-    if (useBufferedBoundary) {
-        if (hasUpDeltas) {
-            Tile* upTile = ensureUpTile();
-            VLIFE_METRICS_INC_BOUNDARY();
-            if constexpr (UseAtomics) {
-                upTile->atomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
-            } else {
-                upTile->nonAtomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
-            }
-            // Queue neighbor for next Phase 1 (skip if already in Phase 2)
-            if (!upTile->willSelfQueueForPhase1() && upTile->tryQueueForPhase1()) {
-                board->addToNextPhase1Queue(upTile);
-            }
+    if (hasUpDeltas) {
+        Tile* upTile = ensureUpTile();
+        VLIFE_METRICS_INC_BOUNDARY();
+        if constexpr (UseAtomics) {
+            upTile->atomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
+        } else {
+            upTile->nonAtomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
+        }
+        // Queue neighbor for next Phase 1 (skip if already in Phase 2)
+        if (!upTile->willSelfQueueForPhase1() && upTile->tryQueueForPhase1()) {
+            board->addToNextPhase1Queue(upTile);
+        }
 
-            // Handle up-left corner using the upTile we already have
-            if (upLeftCornerDelta != 0) {
-                Tile* upLeftTile = upTile->ensureLeftTile();
-                VLIFE_METRICS_INC_BOUNDARY();
-                if constexpr (UseAtomics) {
-                    upLeftTile->atomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
-                } else {
-                    upLeftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
-                }
-                if (!upLeftTile->willSelfQueueForPhase1() && upLeftTile->tryQueueForPhase1()) {
-                    board->addToNextPhase1Queue(upLeftTile);
-                }
-            }
-            // Handle up-right corner using the upTile we already have
-            if (upRightCornerDelta != 0) {
-                Tile* upRightTile = upTile->ensureRightTile();
-                VLIFE_METRICS_INC_BOUNDARY();
-                if constexpr (UseAtomics) {
-                    upRightTile->atomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
-                } else {
-                    upRightTile->nonAtomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
-                }
-                if (!upRightTile->willSelfQueueForPhase1() && upRightTile->tryQueueForPhase1()) {
-                    board->addToNextPhase1Queue(upRightTile);
-                }
-            }
-        }
-        if (hasDownDeltas) {
-            Tile* downTile = ensureDownTile();
+        // Handle up-left corner using the upTile we already have
+        if (upLeftCornerDelta != 0) {
+            Tile* upLeftTile = upTile->ensureLeftTile();
             VLIFE_METRICS_INC_BOUNDARY();
             if constexpr (UseAtomics) {
-                downTile->atomicAddBoundaryDeltas(0, downNeighborDeltas);
+                upLeftTile->atomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
             } else {
-                downTile->nonAtomicAddBoundaryDeltas(0, downNeighborDeltas);
+                upLeftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
             }
-            // Queue neighbor for next Phase 1 (skip if already in Phase 2)
-            if (!downTile->willSelfQueueForPhase1() && downTile->tryQueueForPhase1()) {
-                board->addToNextPhase1Queue(downTile);
+            if (!upLeftTile->willSelfQueueForPhase1() && upLeftTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(upLeftTile);
             }
+        }
+        // Handle up-right corner using the upTile we already have
+        if (upRightCornerDelta != 0) {
+            Tile* upRightTile = upTile->ensureRightTile();
+            VLIFE_METRICS_INC_BOUNDARY();
+            if constexpr (UseAtomics) {
+                upRightTile->atomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
+            } else {
+                upRightTile->nonAtomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
+            }
+            if (!upRightTile->willSelfQueueForPhase1() && upRightTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(upRightTile);
+            }
+        }
+    }
+    if (hasDownDeltas) {
+        Tile* downTile = ensureDownTile();
+        VLIFE_METRICS_INC_BOUNDARY();
+        if constexpr (UseAtomics) {
+            downTile->atomicAddBoundaryDeltas(0, downNeighborDeltas);
+        } else {
+            downTile->nonAtomicAddBoundaryDeltas(0, downNeighborDeltas);
+        }
+        // Queue neighbor for next Phase 1 (skip if already in Phase 2)
+        if (!downTile->willSelfQueueForPhase1() && downTile->tryQueueForPhase1()) {
+            board->addToNextPhase1Queue(downTile);
+        }
 
-            // Handle down-left corner using the downTile we already have
-            if (downLeftCornerDelta != 0) {
-                Tile* downLeftTile = downTile->ensureLeftTile();
-                VLIFE_METRICS_INC_BOUNDARY();
-                if constexpr (UseAtomics) {
-                    downLeftTile->atomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
-                } else {
-                    downLeftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
-                }
-                if (!downLeftTile->willSelfQueueForPhase1() && downLeftTile->tryQueueForPhase1()) {
-                    board->addToNextPhase1Queue(downLeftTile);
-                }
-            }
-            // Handle down-right corner using the downTile we already have
-            if (downRightCornerDelta != 0) {
-                Tile* downRightTile = downTile->ensureRightTile();
-                VLIFE_METRICS_INC_BOUNDARY();
-                if constexpr (UseAtomics) {
-                    downRightTile->atomicApplyDelta(0, 0, downRightCornerDelta);
-                } else {
-                    downRightTile->nonAtomicApplyDelta(0, 0, downRightCornerDelta);
-                }
-                if (!downRightTile->willSelfQueueForPhase1() && downRightTile->tryQueueForPhase1()) {
-                    board->addToNextPhase1Queue(downRightTile);
-                }
-            }
-        }
-        if (hasLeftDeltas) {
-            Tile* leftTile = ensureLeftTile();
+        // Handle down-left corner using the downTile we already have
+        if (downLeftCornerDelta != 0) {
+            Tile* downLeftTile = downTile->ensureLeftTile();
             VLIFE_METRICS_INC_BOUNDARY();
             if constexpr (UseAtomics) {
-                leftTile->atomicAddColumnDeltas(TILE_WIDTH - 1, leftNeighborDeltas);
+                downLeftTile->atomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
             } else {
-                leftTile->nonAtomicAddColumnDeltas(TILE_WIDTH - 1, leftNeighborDeltas);
+                downLeftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
             }
-            // Queue neighbor for next Phase 1 (skip if already in Phase 2)
-            if (!leftTile->willSelfQueueForPhase1() && leftTile->tryQueueForPhase1()) {
-                board->addToNextPhase1Queue(leftTile);
+            if (!downLeftTile->willSelfQueueForPhase1() && downLeftTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(downLeftTile);
             }
         }
-        if (hasRightDeltas) {
-            Tile* rightTile = ensureRightTile();
+        // Handle down-right corner using the downTile we already have
+        if (downRightCornerDelta != 0) {
+            Tile* downRightTile = downTile->ensureRightTile();
             VLIFE_METRICS_INC_BOUNDARY();
             if constexpr (UseAtomics) {
-                rightTile->atomicAddColumnDeltas(0, rightNeighborDeltas);
+                downRightTile->atomicApplyDelta(0, 0, downRightCornerDelta);
             } else {
-                rightTile->nonAtomicAddColumnDeltas(0, rightNeighborDeltas);
+                downRightTile->nonAtomicApplyDelta(0, 0, downRightCornerDelta);
             }
-            // Queue neighbor for next Phase 1 (skip if already in Phase 2)
-            if (!rightTile->willSelfQueueForPhase1() && rightTile->tryQueueForPhase1()) {
-                board->addToNextPhase1Queue(rightTile);
+            if (!downRightTile->willSelfQueueForPhase1() && downRightTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(downRightTile);
             }
+        }
+    }
+    if (hasLeftDeltas) {
+        Tile* leftTile = ensureLeftTile();
+        VLIFE_METRICS_INC_BOUNDARY();
+        if constexpr (UseAtomics) {
+            leftTile->atomicAddColumnDeltas(TILE_WIDTH - 1, leftNeighborDeltas);
+        } else {
+            leftTile->nonAtomicAddColumnDeltas(TILE_WIDTH - 1, leftNeighborDeltas);
+        }
+        // Queue neighbor for next Phase 1 (skip if already in Phase 2)
+        if (!leftTile->willSelfQueueForPhase1() && leftTile->tryQueueForPhase1()) {
+            board->addToNextPhase1Queue(leftTile);
+        }
+    }
+    if (hasRightDeltas) {
+        Tile* rightTile = ensureRightTile();
+        VLIFE_METRICS_INC_BOUNDARY();
+        if constexpr (UseAtomics) {
+            rightTile->atomicAddColumnDeltas(0, rightNeighborDeltas);
+        } else {
+            rightTile->nonAtomicAddColumnDeltas(0, rightNeighborDeltas);
+        }
+        // Queue neighbor for next Phase 1 (skip if already in Phase 2)
+        if (!rightTile->willSelfQueueForPhase1() && rightTile->tryQueueForPhase1()) {
+            board->addToNextPhase1Queue(rightTile);
         }
     }
 }
@@ -1378,108 +1368,3 @@ void Tile::nonAtomicAddColumnDeltas(int x, const int8_t* deltaArray) {
     }
 }
 
-// Apply deltas for a cell pair using LUT
-template<bool UseAtomics>
-void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& deltas) {
-    // baseX is the x coordinate of the right cell (even x)
-    // The left cell is at baseX+1 (odd x)
-
-    // Apply same-row horizontal neighbors: x-1 and x+2
-    // sameRow[0] is for x-1 (only affected by right cell)
-    // sameRow[1] is for x+2 (only affected by left cell)
-
-    int leftNeighborX = baseX - 1;
-    int rightNeighborX = baseX + 2;
-
-    // Handle x-1 neighbor (same row)
-    if (deltas.sameRow[0] != 0) {
-        if (leftNeighborX >= 0) {
-            applyDelta(leftNeighborX, localY, deltas.sameRow[0]);
-        } else {
-            // Cross-tile: create tile if needed
-            Tile* leftTile = ensureLeftTile();
-            VLIFE_METRICS_INC_BOUNDARY();
-            if constexpr (UseAtomics) {
-                leftTile->atomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
-            } else {
-                leftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
-            }
-            // Queue neighbor for next Phase 1 (skip if already in Phase 2)
-            if (!leftTile->willSelfQueueForPhase1() && leftTile->tryQueueForPhase1()) {
-                board->addToNextPhase1Queue(leftTile);
-            }
-        }
-    }
-
-    // Handle x+2 neighbor (same row)
-    if (deltas.sameRow[1] != 0) {
-        if (rightNeighborX < TILE_WIDTH) {
-            applyDelta(rightNeighborX, localY, deltas.sameRow[1]);
-        } else {
-            // Cross-tile: create tile if needed
-            Tile* rightTile = ensureRightTile();
-            VLIFE_METRICS_INC_BOUNDARY();
-            if constexpr (UseAtomics) {
-                rightTile->atomicApplyDelta(0, localY, deltas.sameRow[1]);
-            } else {
-                rightTile->nonAtomicApplyDelta(0, localY, deltas.sameRow[1]);
-            }
-            // Queue neighbor for next Phase 1 (skip if already in Phase 2)
-            if (!rightTile->willSelfQueueForPhase1() && rightTile->tryQueueForPhase1()) {
-                board->addToNextPhase1Queue(rightTile);
-            }
-        }
-    }
-
-    // Apply vertical deltas for row above (y-1)
-    if (localY > 0) {
-        applyVerticalDeltas(baseX, localY - 1, deltas.verticalRow);
-    } else {
-        // Cross-tile: create tile if needed
-        Tile* upTile = ensureUpTile();
-        VLIFE_METRICS_INC_BOUNDARY();
-        if constexpr (UseAtomics) {
-            upTile->atomicApplyVerticalDeltas(baseX, TILE_HEIGHT - 1, deltas.verticalRow);
-        } else {
-            // For non-atomic, apply deltas individually
-            for (int i = 0; i < 4; i++) {
-                int x = baseX - 1 + i;
-                if (x >= 0 && x < TILE_WIDTH && deltas.verticalRow[i] != 0) {
-                    upTile->nonAtomicApplyDelta(x, TILE_HEIGHT - 1, deltas.verticalRow[i]);
-                }
-            }
-        }
-        // Queue neighbor for next Phase 1 (skip if already in Phase 2)
-        if (!upTile->willSelfQueueForPhase1() && upTile->tryQueueForPhase1()) {
-            board->addToNextPhase1Queue(upTile);
-        }
-    }
-
-    // Apply vertical deltas for row below (y+1)
-    if (localY < TILE_HEIGHT - 1) {
-        applyVerticalDeltas(baseX, localY + 1, deltas.verticalRow);
-    } else {
-        // Cross-tile: create tile if needed
-        Tile* downTile = ensureDownTile();
-        VLIFE_METRICS_INC_BOUNDARY();
-        if constexpr (UseAtomics) {
-            downTile->atomicApplyVerticalDeltas(baseX, 0, deltas.verticalRow);
-        } else {
-            // For non-atomic, apply deltas individually
-            for (int i = 0; i < 4; i++) {
-                int x = baseX - 1 + i;
-                if (x >= 0 && x < TILE_WIDTH && deltas.verticalRow[i] != 0) {
-                    downTile->nonAtomicApplyDelta(x, 0, deltas.verticalRow[i]);
-                }
-            }
-        }
-        // Queue neighbor for next Phase 1 (skip if already in Phase 2)
-        if (!downTile->willSelfQueueForPhase1() && downTile->tryQueueForPhase1()) {
-            board->addToNextPhase1Queue(downTile);
-        }
-    }
-}
-
-// Explicit template instantiations for applyDeltasForCellPair
-template void Tile::applyDeltasForCellPair<true>(int, int, const PackedDeltas&);
-template void Tile::applyDeltasForCellPair<false>(int, int, const PackedDeltas&);

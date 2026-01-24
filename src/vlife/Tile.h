@@ -98,11 +98,6 @@ public:
     // baseX is the x coordinate of the right cell in the pair (even x)
     void applyVerticalDeltas(int baseX, int y, const int8_t* deltas);
 
-    // Apply deltas for a cell pair using LUT (optimized version)
-    // Template parameter controls atomic vs non-atomic for cross-tile updates
-    template<bool UseAtomics = true>
-    void applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& deltas);
-
     // Atomic versions for cross-tile updates (thread-safe for parallel processing)
     // These use compare-and-swap to safely update neighbor counts when
     // multiple tiles are processed in parallel
