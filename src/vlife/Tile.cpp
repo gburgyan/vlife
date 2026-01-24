@@ -244,8 +244,8 @@ bool Tile::runGenerationPrepare() {
     uint64_t modMask = wasModified;
     wasModified = 0;  // Clear for this generation's Phase 2
 
-    // Reset changes accumulator for Phase 2 short-circuit optimization
-    changesAccumulator = 0;
+    // Reset row change mask for Phase 2 short-circuit optimization
+    rowChangeMask = 0;
 
     // Nothing modified - nothing to scan
     if (modMask == 0) {
@@ -414,8 +414,18 @@ bool Tile::runGenerationPrepare() {
                 }
             }
 
-            changesAccumulator |= changeBuff;
-            changes[i >> 2] = changeBuff;
+            // Split 64-bit changeBuff into two 32-bit row values
+            // Upper 32 bits = row 0 (cells[i], cells[i+1])
+            // Lower 32 bits = row 1 (cells[i+2], cells[i+3])
+            int baseRow = i / 2;  // Each cell word pair covers one row
+            uint32_t row0Changes = static_cast<uint32_t>(changeBuff >> 32);
+            uint32_t row1Changes = static_cast<uint32_t>(changeBuff);
+
+            changes[baseRow] = row0Changes;
+            changes[baseRow + 1] = row1Changes;
+
+            if (row0Changes) rowChangeMask |= (1U << baseRow);
+            if (row1Changes) rowChangeMask |= (1U << (baseRow + 1));
         }  // end iter loop
     }  // end blockRow loop
 
@@ -565,13 +575,23 @@ bool Tile::runGenerationPrepare() {
                 }
             }
 
-            changesAccumulator |= changeBuff;
-            changes[i >> 2] = changeBuff;
+            // Split 64-bit changeBuff into two 32-bit row values
+            // Upper 32 bits = row 0 (cells[i], cells[i+1])
+            // Lower 32 bits = row 1 (cells[i+2], cells[i+3])
+            int baseRow = i / 2;  // Each cell word pair covers one row
+            uint32_t row0Changes = static_cast<uint32_t>(changeBuff >> 32);
+            uint32_t row1Changes = static_cast<uint32_t>(changeBuff);
+
+            changes[baseRow] = row0Changes;
+            changes[baseRow + 1] = row1Changes;
+
+            if (row0Changes) rowChangeMask |= (1U << baseRow);
+            if (row1Changes) rowChangeMask |= (1U << (baseRow + 1));
         }  // end iter loop
     }  // end blockRow loop
 #endif
 
-    return changesAccumulator != 0;
+    return rowChangeMask != 0;
 }
 
 #ifdef VLIFE_AVX512_ENABLED
@@ -595,8 +615,8 @@ bool Tile::runGenerationPrepare_AVX512() {
     // Clear changes array
     std::memset(changes, 0, sizeof(changes));
 
-    // Reset changes accumulator for Phase 2 short-circuit optimization
-    changesAccumulator = 0;
+    // Reset row change mask for Phase 2 short-circuit optimization
+    rowChangeMask = 0;
 
     // Nothing modified - nothing to scan
     if (modMask == 0) {
@@ -728,7 +748,7 @@ bool Tile::runGenerationPrepare_AVX512() {
 
         __mmask64 right_changes = (right_alive_mask & ~right_survive) | (~right_alive_mask & right_birth);
 
-        // Pack change bits into the changes array
+        // Pack change bits into the changes array (32-bit per row format)
         // Each byte becomes 2 bits: bit 1 = left changes, bit 0 = right changes
         //
         // IMPORTANT: The scalar code processes bytes in big-endian order within each
@@ -739,44 +759,49 @@ bool Tile::runGenerationPrepare_AVX512() {
         //   Scalar byte index: 0 (MSB) -> mask bit 7, 1 -> mask bit 6, ..., 7 (LSB) -> mask bit 0
         //   So for cells[i], scalar byte j (from >>56, >>48, etc.) = memory byte (7-j) = mask bit i*8 + (7-j)
         //
-        // Change word layout (from scalar code):
-        //   Word 0 (cells[changeIdx*4+0]): bytes 0-7 -> change bits 62-48
-        //   Word 1 (cells[changeIdx*4+1]): bytes 0-7 -> change bits 46-32
-        //   Word 2 (cells[changeIdx*4+2]): bytes 0-7 -> change bits 30-16
-        //   Word 3 (cells[changeIdx*4+3]): bytes 0-7 -> change bits 14-0
-        int changeWordBase = byteOffset / 32;
+        // New 32-bit per row layout:
+        //   Row N: bits 31-16 from left-half cell word, bits 15-0 from right-half cell word
+        //
+        // Each 64-byte AVX block covers 4 rows (64 bytes / 16 bytes per row)
+        int baseRow = byteOffset / 16;  // 16 bytes = 1 row (32 cells, 2 bytes per cell pair... wait no, 1 byte per cell pair)
 
-        for (int cw = 0; cw < 2; cw++) {
-            uint64_t changeBuff = 0;
-            // Each change word covers 4 cell words = 32 bytes
-            int baseByteInBlock = cw * 32;  // 0 or 32 within this 64-byte AVX block
+        // Actually: 64 bytes = 64 cell pairs = 4 rows (16 cell pairs per row)
+        // So byteOffset/64 = block row, and each block has 4 cell rows
+        // baseRow = (byteOffset / 64) * 4 = blockRow * 4
+        int baseRowCorrected = blockRow * 4;
 
-            // Process 4 cell words (32 bytes) for this change word
-            for (int word = 0; word < 4; word++) {
+        for (int rowInBlock = 0; rowInBlock < 4; rowInBlock++) {
+            uint32_t rowChanges = 0;
+            // Each row has 16 bytes (16 cell pairs)
+            int baseByteInBlock = rowInBlock * 16;
+
+            // Process 16 bytes (2 cell words) for this row
+            for (int cellWord = 0; cellWord < 2; cellWord++) {
                 // Process 8 bytes of this cell word
                 for (int byteInWord = 0; byteInWord < 8; byteInWord++) {
                     // Scalar code processes from MSB to LSB (byte 7 down to byte 0 in memory)
-                    // byteInWord 0 = scalar's >>56 = memory byte 7
-                    // byteInWord 7 = scalar's &0xFF = memory byte 0
                     int memByteInWord = 7 - byteInWord;
-                    int maskBit = baseByteInBlock + word * 8 + memByteInWord;
+                    int maskBit = baseByteInBlock + cellWord * 8 + memByteInWord;
 
                     int leftChange = (left_changes >> maskBit) & 1;
                     int rightChange = (right_changes >> maskBit) & 1;
                     int changePair = (leftChange << 1) | rightChange;
 
-                    // Position in change word: word 0 starts at bit 62, each byte takes 2 bits
-                    int shift = 62 - (word * 16) - (byteInWord * 2);
-                    changeBuff |= static_cast<uint64_t>(changePair) << shift;
+                    // Position in 32-bit row word:
+                    // cellWord 0 contributes to bits 31-16, cellWord 1 to bits 15-0
+                    // Within each half, byte 0 (MSB) is at highest position
+                    int shift = 30 - (cellWord * 16) - (byteInWord * 2);
+                    rowChanges |= static_cast<uint32_t>(changePair) << shift;
                 }
             }
 
-            changesAccumulator |= changeBuff;
-            changes[changeWordBase + cw] = changeBuff;
+            int row = baseRowCorrected + rowInBlock;
+            changes[row] = rowChanges;
+            if (rowChanges) rowChangeMask |= (1U << row);
         }
     }
 
-    return changesAccumulator != 0;
+    return rowChangeMask != 0;
 }
 #endif // VLIFE_AVX512_ENABLED
 
@@ -815,7 +840,7 @@ static inline void accumulateVerticalDeltasToArrays(int8_t* deltaArray, int base
 template<bool UseAtomics>
 void Tile::runGenerationChanges() {
     // Tile-level short-circuit: skip if Phase 1 detected no changes
-    if (changesAccumulator == 0) {
+    if (rowChangeMask == 0) {
         return;
     }
 
@@ -852,54 +877,56 @@ void Tile::runGenerationChanges() {
     bool hasLeftDeltas = false;
     bool hasRightDeltas = false;
 
-    for (int changeIdx = 0; changeIdx < TILE_CHANGE_64S; changeIdx++) {
-        // Prefetch upcoming change words
-        if (changeIdx + 2 < TILE_CHANGE_64S) {
-            PREFETCH(&changes[changeIdx + 2]);
-        }
+    // Use rowChangeMask to jump directly to rows with changes
+    uint32_t remainingRows = rowChangeMask;
+    while (remainingRows != 0) {
+        // Find lowest set bit (row with changes)
+        int localY = __builtin_ctz(remainingRows);
+        remainingRows &= remainingRows - 1;  // Clear the lowest set bit
 
-        uint64_t changeBits = changes[changeIdx];
+        uint32_t changeBits = changes[localY];
 
-        if (changeBits == 0) {
-            continue;
-        }
-
-        // Prefetch cell words for this change word's cells
-        int baseCellWordIdx = changeIdx * 4;
-        if (baseCellWordIdx + 8 < TILE_64S) {
-            PREFETCH(&cells[baseCellWordIdx + 4]);
-            PREFETCH(&cells[baseCellWordIdx + 5]);
-            PREFETCH(&cells[baseCellWordIdx + 6]);
-            PREFETCH(&cells[baseCellWordIdx + 7]);
+        // Prefetch cell words for this row's cells
+        // Each row has 2 cell words (cells 0-15 and 16-31)
+        int baseCellWordIdx = localY * 2;
+        if (baseCellWordIdx + 4 < TILE_64S) {
+            PREFETCH(&cells[baseCellWordIdx + 2]);
+            PREFETCH(&cells[baseCellWordIdx + 3]);
         }
 
         // Process only non-zero bit pairs using leading zero count to skip directly to them
         // This eliminates unpredictable branches from the inner loop
         while (changeBits != 0) {
-            // Find the position of the highest set bit
-            int leadingZeros = __builtin_clzll(changeBits);
-            // Convert to bit pair index (0-31, where 0 is bits 63:62)
+            // Find the position of the highest set bit in 32-bit word
+            int leadingZeros = __builtin_clz(changeBits);
+            // Convert to bit pair index (0-15, where 0 is bits 31:30)
             int bitPair = leadingZeros / 2;
-            int shiftAmount = 62 - (bitPair * 2);
+            int shiftAmount = 30 - (bitPair * 2);
 
             // Extract the 2-bit pair (guaranteed non-zero since we found a set bit)
             int pairChangeBits = (changeBits >> shiftAmount) & 0x3;
 
             // Clear this bit pair so we don't process it again
-            changeBits &= ~(0x3ULL << shiftAmount);
+            changeBits &= ~(0x3U << shiftAmount);
 
             // Calculate which cell word and bit position
-            int wordsFromStart = bitPair / 8;  // 8 cell pairs per 64-bit word
+            // bitPair 0-7 are in cell word 0 (left half), 8-15 are in cell word 1 (right half)
+            int cellWordInRow = bitPair / 8;  // 0 or 1
             int pairInWord = bitPair % 8;
 
-            int currentCellIdx = (changeIdx * 4) + wordsFromStart;
+            int currentCellIdx = localY * 2 + cellWordInRow;
             int leftCellBitPos = (7 - pairInWord) * 8 + 7;   // Left cell alive bit
             int rightCellBitPos = (7 - pairInWord) * 8 + 3;  // Right cell alive bit
 
-            // Calculate base cell index (right cell, even x)
-            int baseCellInTile = currentCellIdx * 16 + (7 - pairInWord) * 2;
-            int baseX = baseCellInTile % TILE_WIDTH;  // Right cell x (even)
-            int localY = baseCellInTile / TILE_WIDTH;
+            // Calculate base cell x coordinate (right cell, even x)
+            // Due to MSB-first byte processing in Phase 1, the bit layout is reversed:
+            // - bitPair 0 (bits 31-30) = x=14,15 (MSB byte of left half)
+            // - bitPair 7 (bits 17-16) = x=0,1 (LSB byte of left half)
+            // - bitPair 8 (bits 15-14) = x=30,31 (MSB byte of right half)
+            // - bitPair 15 (bits 1-0) = x=16,17 (LSB byte of right half)
+            // Branchless formula: baseX = 14 + (bitPair >> 3) * 32 - bitPair * 2
+            int correction = (bitPair >> 3) * 32;  // 0 for left half, 32 for right half
+            int baseX = 14 + correction - bitPair * 2;  // Right cell x (even)
 
             // Determine states for LUT index:
             // bits [3:2] = left cell: 00=unchanged, 01=became alive, 10=died

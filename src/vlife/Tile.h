@@ -10,7 +10,6 @@
 #define TILE_CELLS TILE_WIDTH *TILE_HEIGHT
 #define TILE_BYTES TILE_CELLS / 2
 #define TILE_64S TILE_BYTES / 8
-#define TILE_CHANGE_64S TILE_CELLS / 64
 #define TILE_64S_WIDTH TILE_WIDTH / 64
 #define TILE_64S_HEIGHT TILE_HEIGHT / 64
 
@@ -32,8 +31,8 @@ class alignas(64) Tile {
     Tile *down;
 
     uint64_t cells[TILE_64S]{};
-    uint64_t changes[TILE_CHANGE_64S]{};
-    uint64_t changesAccumulator{0};  // OR of all changeBuff values, for quick Phase 2 skip
+    uint32_t changes[TILE_HEIGHT]{};  // One word per row, 16 cell pairs × 2 bits = 32 bits
+    uint32_t rowChangeMask{0};  // Bit N set means row N has changes, for quick Phase 2 skip
     uint32_t liveCount; // Tracks the number of live cells in this tile
 
     // Per-row activity tracking for tile eviction (8 bits = 8 block rows)
@@ -184,14 +183,14 @@ public:
     // Check if the tile has changes to apply in Phase 2
     // Used for Phase 2 queue optimization to skip tiles with no changes
     inline bool hasChanges() const {
-        return changesAccumulator != 0;
+        return rowChangeMask != 0;
     }
 
     // Check if a neighbor tile is already in Phase 2 queue
     // If so, it will self-queue for Phase 1, so we don't need to queue it
-    // Safe to call from other tiles during Phase 2 (changesAccumulator is read-only)
+    // Safe to call from other tiles during Phase 2 (rowChangeMask is read-only)
     inline bool willSelfQueueForPhase1() const {
-        return changesAccumulator != 0;
+        return rowChangeMask != 0;
     }
 
     // Check if the tile is safe to evict
