@@ -31,6 +31,35 @@ void VLife::resetBoard() {
     }
     tiles.clear();
     tilePool.recycle();
+
+    // Clear Phase 1 queues and reset bootstrap flag
+    phase1Queue.clear();
+    nextPhase1Queue.clear();
+    phase1QueueNeedsBootstrap = true;
+}
+
+void VLife::addToNextPhase1Queue(Tile* tile) {
+    // Called from Tile::runGenerationChanges() during Phase 2
+    // Thread-safe: concurrent_vector handles synchronization for parallel execution
+    nextPhase1Queue.push_back(tile);
+}
+
+void VLife::swapPhase1Queues() {
+    // Swap current and next generation queues
+    phase1Queue.swap(nextPhase1Queue);
+    nextPhase1Queue.clear();
+
+    // Bootstrap only when explicitly flagged (first gen or after setCell)
+    // Without this flag, stable patterns would be re-processed every generation
+    // because an empty queue is the natural state when no cells change
+    if (phase1QueueNeedsBootstrap && !tiles.empty()) {
+        for (auto& [coord, tile] : tiles) {
+            if (tile->needsPhase1Processing()) {
+                phase1Queue.push_back(tile);
+            }
+        }
+        phase1QueueNeedsBootstrap = false;  // Clear flag after bootstrap
+    }
 }
 
 Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
@@ -155,6 +184,9 @@ void VLife::setCell(uint32_t x, uint32_t y, CellState state) {
 
     // Use Tile's setCell method to set the cell state
     tile->setCell(localX, localY, state == CellState::ALIVE);
+
+    // Mark that Phase 1 queue needs to be rebuilt on next generation
+    phase1QueueNeedsBootstrap = true;
 }
 
 std::vector<GameOfLife::CellState> VLife::getCells(uint32_t startX, uint32_t startY, uint32_t width,
@@ -192,11 +224,15 @@ void VLife::runGenerationSequential() {
     size_t activeTilesCount = 0;
 #endif
 
-    // Clear the queue from previous generation (keeps capacity for amortized allocation)
+    // Swap Phase 1 queues: previous generation's nextPhase1Queue becomes this generation's queue
+    swapPhase1Queues();
+
+    // Clear the Phase 2 queue from previous generation (keeps capacity for amortized allocation)
     changedTilesSequential.clear();
 
-    // First pass: iterate all tiles, check needsPhase1Processing(), prepare
-    for (const auto& [coord, tile] : tiles) {
+    // First pass: iterate over Phase 1 queue (tiles that need processing)
+    for (Tile* tile : phase1Queue) {
+        tile->clearQueueFlag();  // Reset for next generation's queuing
         if (tile->needsPhase1Processing()) {
             tile->runGenerationPrepare();
             if (tile->hasChanges()) {
@@ -274,17 +310,20 @@ void VLife::runGeneration() {
     std::atomic<size_t> activeTileCount{0};
 #endif
 
-    // Clear the queue from previous generation (keeps capacity for amortized allocation)
+    // Swap Phase 1 queues: previous generation's nextPhase1Queue becomes this generation's queue
+    swapPhase1Queues();
+
+    // Clear the Phase 2 queue from previous generation (keeps capacity for amortized allocation)
     tilesWithChanges.clear();
 
-    // PHASE 1: Parallel iteration over ALL tiles, check needsPhase1Processing(), collect tiles with changes
-    tbb::parallel_for_each(tiles.begin(), tiles.end(),
+    // PHASE 1: Parallel iteration over Phase 1 queue (tiles that need processing)
+    tbb::parallel_for_each(phase1Queue.begin(), phase1Queue.end(),
         [this
 #ifdef VLIFE_METRICS_ENABLED
             , &activeTileCount
 #endif
-        ](const auto& pair) {
-            Tile* tile = pair.second;
+        ](Tile* tile) {
+            tile->clearQueueFlag();  // Reset for next generation's queuing
             if (tile->needsPhase1Processing()) {
                 tile->runGenerationPrepare();
                 if (tile->hasChanges()) {

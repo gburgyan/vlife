@@ -94,6 +94,15 @@ public:
         return static_cast<uint8_t>(generationNumber);
     }
 
+    // Phase 1 queue optimization: add a tile to the next generation's Phase 1 queue
+    // Called from Tile::runGenerationChanges() when a tile modifies itself or neighbors
+    // Thread-safe for parallel Phase 2 execution
+    void addToNextPhase1Queue(Tile* tile);
+
+    // Swap Phase 1 queues between generations
+    // Called at the start of Phase 1 to switch from building queue to processing queue
+    void swapPhase1Queues();
+
 #ifdef VLIFE_METRICS_ENABLED
     // Metrics collection support
     void setMetricsCollector(MetricsCollector* collector) { metricsCollector = collector; }
@@ -142,6 +151,18 @@ private:
     // Using persistent members to amortize allocation across generations
     tbb::concurrent_vector<Tile*> tilesWithChanges;  // For parallel path
     std::vector<Tile*> changedTilesSequential;       // For sequential path
+
+    // Phase 1 queue optimization: instead of scanning all tiles, track which tiles
+    // need Phase 1 processing. Built during Phase 2 of previous generation.
+    // Double-buffered: current generation reads from phase1Queue, Phase 2 writes to nextPhase1Queue
+    // Using concurrent_vector for both sequential and parallel paths for simplicity
+    tbb::concurrent_vector<Tile*> phase1Queue;        // Current generation's tiles to process
+    tbb::concurrent_vector<Tile*> nextPhase1Queue;    // Building for next generation
+
+    // Flag indicating Phase 1 queue needs bootstrap (first gen or after setCell)
+    // Without this flag, the queue bootstrap would run every generation when patterns stabilize
+    // (empty queue), causing static patterns to be re-processed unnecessarily
+    bool phase1QueueNeedsBootstrap{true};
 
 #ifdef VLIFE_METRICS_ENABLED
     MetricsCollector* metricsCollector = nullptr;

@@ -54,6 +54,10 @@ class alignas(64) Tile {
     // Tracks when the tile was last modified (wraps at 256, uses modular arithmetic)
     uint8_t lastModifiedGeneration{0};
 
+    // Atomic flag to prevent duplicate Phase 1 queue entries
+    // Set by tryQueueForPhase1(), cleared by clearQueueFlag()
+    std::atomic<uint8_t> queuedForPhase1{0};
+
     std::mutex tileMutex;
 
 public:
@@ -267,6 +271,19 @@ public:
 
     // Update the last modified generation timestamp
     void updateLastModified(uint8_t currentGen) { lastModifiedGeneration = currentGen; }
+
+    // Phase 1 queue helpers - atomic to avoid duplicate queue entries in parallel Phase 2
+    // Returns true if this tile was successfully queued (first to claim), false if already queued
+    inline bool tryQueueForPhase1() {
+        uint8_t expected = 0;
+        return queuedForPhase1.compare_exchange_strong(expected, 1,
+            std::memory_order_relaxed, std::memory_order_relaxed);
+    }
+
+    // Clear the queue flag - called at start of Phase 1 when processing this tile
+    inline void clearQueueFlag() {
+        queuedForPhase1.store(0, std::memory_order_relaxed);
+    }
 
     // Friend declarations to allow access to private members
     friend class VLife;
