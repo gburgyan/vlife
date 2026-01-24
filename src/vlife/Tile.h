@@ -15,7 +15,7 @@
 
 // Eviction optimization: periodic scan with age threshold
 // EVICTION_CHECK_INTERVAL must be a power of 2 for fast modulo via bitmask
-static constexpr size_t EVICTION_CHECK_INTERVAL = 16;  // Check every N generations
+static constexpr size_t EVICTION_CHECK_INTERVAL = 128;  // Check every N generations
 static constexpr uint8_t EVICTION_AGE_THRESHOLD = 4;   // Evict if empty for N generations
 
 // Align Tile to 64-byte cache line boundaries to prevent false sharing

@@ -36,22 +36,23 @@ void VLife::resetBoard() {
     // Clear Phase 1 queues and reset bootstrap flag
     phase1Queues[0].clear();
     phase1Queues[1].clear();
-    currentPhase1Queue = 0;
+    phase1Queue = &phase1Queues[0];
+    nextPhase1Queue = &phase1Queues[1];
     phase1QueueNeedsBootstrap = true;
 }
 
 void VLife::addToNextPhase1Queue(Tile* tile) {
     // Called from Tile::runGenerationChanges() during Phase 2
     // Thread-safe: AtomicQueue uses atomic fetch_add for lock-free push
-    getNextPhase1Queue().push_back(tile);
+    nextPhase1Queue->push_back(tile);
 }
 
 void VLife::swapPhase1Queues() {
     // Double-buffer swap: clear the old "current" queue, then flip the index
     // This makes the "next" queue become the new "current" for processing
     // Zero-copy swap: O(1) instead of O(n) copy
-    phase1Queues[currentPhase1Queue].clear();
-    currentPhase1Queue = 1 - currentPhase1Queue;
+    phase1Queue->clear();
+    std::swap(phase1Queue, nextPhase1Queue);
 
     // Bootstrap only when explicitly flagged (first gen or after setCell)
     // Without this flag, stable patterns would be re-processed every generation
@@ -60,7 +61,7 @@ void VLife::swapPhase1Queues() {
         for (auto& [coord, tile] : tiles) {
             // All tiles start with wasModified=~0ULL, so they'll all be processed
             // on first generation. Subsequently, only queued tiles are processed.
-            getPhase1Queue().push_back(tile);
+            phase1Queue->push_back(tile);
         }
         phase1QueueNeedsBootstrap = false;  // Clear flag after bootstrap
     }
@@ -221,7 +222,7 @@ void VLife::runGenerationSequential() {
 
     // First pass: iterate over Phase 1 queue (tiles that need processing)
     // runGenerationPrepare() returns early if wasModified==0, so no explicit check needed
-    for (Tile* tile : getPhase1Queue()) {
+    for (Tile* tile : *phase1Queue) {
         tile->clearQueueFlag();  // Reset for next generation's queuing
         if (tile->runGenerationPrepare()) {
             changedTilesSequential.push_back(tile);
@@ -305,8 +306,7 @@ void VLife::runGeneration() {
 
     // PHASE 1: Parallel iteration over Phase 1 queue (tiles that need processing)
     // runGenerationPrepare() returns early if wasModified==0, so no explicit check needed
-    auto& phase1Q = getPhase1Queue();
-    tbb::parallel_for_each(phase1Q.begin(), phase1Q.end(),
+    tbb::parallel_for_each(phase1Queue->begin(), phase1Queue->end(),
         [this
 #ifdef VLIFE_METRICS_ENABLED
             , &activeTileCount

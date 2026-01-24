@@ -144,11 +144,6 @@ public:
     // Called at the start of Phase 1 to switch from building queue to processing queue
     void swapPhase1Queues();
 
-    // Access the current generation's Phase 1 queue (for reading/processing)
-    AtomicQueue<Tile*>& getPhase1Queue() { return phase1Queues[currentPhase1Queue]; }
-
-    // Access the next generation's Phase 1 queue (for writing during Phase 2)
-    AtomicQueue<Tile*>& getNextPhase1Queue() { return phase1Queues[1 - currentPhase1Queue]; }
 
 #ifdef VLIFE_METRICS_ENABLED
     // Metrics collection support
@@ -203,7 +198,8 @@ private:
     // - phase1Queues[currentPhase1Queue] is the current generation's queue to process
     // - phase1Queues[1 - currentPhase1Queue] is the next generation's queue being built
     AtomicQueue<Tile*> phase1Queues[2];
-    int currentPhase1Queue{0};  // Index into phase1Queues for current generation
+    AtomicQueue<Tile*>* phase1Queue{&phase1Queues[0]};      // Pointer to current generation's queue
+    AtomicQueue<Tile*>* nextPhase1Queue{&phase1Queues[1]};  // Pointer to next generation's queue
 
     // Flag indicating Phase 1 queue needs bootstrap (first gen or after setCell)
     // Without this flag, the queue bootstrap would run every generation when patterns stabilize
