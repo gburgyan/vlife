@@ -54,6 +54,42 @@ public:
         size_t finalTileCount;
     };
 
+    // Simple mode: time entire loop, minimal overhead
+    static Result runBenchmarkSimple(
+        VLife& board,
+        int warmupGenerations,
+        int measuredGenerations
+    ) {
+        // Warmup phase
+        for (int i = 0; i < warmupGenerations; i++) {
+            board.runGeneration();
+        }
+
+        size_t startTiles = countTiles(board);
+
+        // Measurement - single timing around entire loop
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < measuredGenerations; i++) {
+            board.runGeneration();
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+
+        double totalMicros = std::chrono::duration<double, std::micro>(end - start).count();
+
+        Result result{};
+        result.avgMicrosPerGeneration = totalMicros / measuredGenerations;
+        result.generationsPerSecond = 1000000.0 / result.avgMicrosPerGeneration;
+        result.finalTileCount = countTiles(board);
+        result.peakTileCount = std::max(startTiles, result.finalTileCount);
+        // min/max/stddev remain 0 (not available in simple mode)
+        result.minMicrosPerGeneration = 0;
+        result.maxMicrosPerGeneration = 0;
+        result.stdDevMicros = 0;
+
+        return result;
+    }
+
+    // Detailed mode: per-iteration timing for min/max/stddev analysis
     static Result runBenchmark(
         VLife& board,
         int warmupGenerations,
@@ -158,9 +194,11 @@ void printResult(const std::string& patternName, const VLifeBenchmark::Result& r
     std::cout << std::fixed << std::setprecision(1);
     std::cout << "  Result: " << result.generationsPerSecond << " gen/sec ("
               << result.avgMicrosPerGeneration << " us/gen)\n";
-    std::cout << "  Timing: min=" << result.minMicrosPerGeneration
-              << " us, max=" << result.maxMicrosPerGeneration
-              << " us, stddev=" << result.stdDevMicros << " us\n";
+    if (result.stdDevMicros > 0) {
+        std::cout << "  Timing: min=" << result.minMicrosPerGeneration
+                  << " us, max=" << result.maxMicrosPerGeneration
+                  << " us, stddev=" << result.stdDevMicros << " us\n";
+    }
     std::cout << "  Tiles: peak=" << result.peakTileCount
               << ", final=" << result.finalTileCount << "\n";
 }
@@ -230,6 +268,7 @@ int main(int argc, char* argv[]) {
     bool quickMode = false;
     bool skipPrime = false;
     bool profileMode = false;
+    bool stddevMode = false;
     int profileDuration = 30;
     std::string profilePattern = "glider";
 
@@ -239,6 +278,8 @@ int main(int argc, char* argv[]) {
             quickMode = true;
         } else if (arg == "--no-prime") {
             skipPrime = true;
+        } else if (arg == "--stddev") {
+            stddevMode = true;
         } else if (arg == "--profile") {
             profileMode = true;
         } else if (arg == "--duration" && i + 1 < argc) {
@@ -249,6 +290,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Usage: VLifeBenchmark [options]\n";
             std::cout << "Options:\n";
             std::cout << "  --quick, -q          Quick mode (reduced iterations)\n";
+            std::cout << "  --stddev             Enable per-iteration timing for min/max/stddev\n";
             std::cout << "  --no-prime           Skip CPU priming\n";
             std::cout << "  --profile            Enable profiling mode (runs for duration)\n";
             std::cout << "  --duration <sec>     Profiling duration in seconds (default: 30)\n";
@@ -299,7 +341,9 @@ int main(int argc, char* argv[]) {
         int warmup = quickMode ? 50 : 100;
         int measured = quickMode ? 500 : 1000;
 
-        auto result = VLifeBenchmark::runBenchmark(board, warmup, measured);
+        auto result = stddevMode
+            ? VLifeBenchmark::runBenchmark(board, warmup, measured)
+            : VLifeBenchmark::runBenchmarkSimple(board, warmup, measured);
         printResult("Glider Gun (" + std::to_string(gunCount) + " guns)", result, warmup, measured);
     }
 
@@ -312,7 +356,9 @@ int main(int argc, char* argv[]) {
         int warmup = quickMode ? 25 : 50;
         int measured = quickMode ? 250 : 500;
 
-        auto result = VLifeBenchmark::runBenchmark(board, warmup, measured);
+        auto result = stddevMode
+            ? VLifeBenchmark::runBenchmark(board, warmup, measured)
+            : VLifeBenchmark::runBenchmarkSimple(board, warmup, measured);
         printResult("Random Soup (" + std::to_string(size) + "x" + std::to_string(size) + ", 30% density)",
                     result, warmup, measured);
     }
@@ -326,7 +372,9 @@ int main(int argc, char* argv[]) {
         int warmup = quickMode ? 50 : 100;
         int measured = quickMode ? 500 : 1000;
 
-        auto result = VLifeBenchmark::runBenchmark(board, warmup, measured);
+        auto result = stddevMode
+            ? VLifeBenchmark::runBenchmark(board, warmup, measured)
+            : VLifeBenchmark::runBenchmarkSimple(board, warmup, measured);
         printResult("Spaceship Fleet (" + std::to_string(count) + " ships)", result, warmup, measured);
     }
 
@@ -336,10 +384,12 @@ int main(int argc, char* argv[]) {
         int gridSize = quickMode ? 32 : 64;
         BenchmarkPatterns::setupBlockGrid(board, gridSize);
 
-        int warmup = quickMode ? 10 : 20;
-        int measured = quickMode ? 100 : 200;
+        int warmup = quickMode ? 10 : 100;
+        int measured = quickMode ? 10000 : 1000000;  // 1M for full mode
 
-        auto result = VLifeBenchmark::runBenchmark(board, warmup, measured);
+        auto result = stddevMode
+            ? VLifeBenchmark::runBenchmark(board, warmup, measured)
+            : VLifeBenchmark::runBenchmarkSimple(board, warmup, measured);
         printResult("Block Grid (" + std::to_string(gridSize) + "x" + std::to_string(gridSize) + " blocks)",
                     result, warmup, measured);
     }
@@ -353,7 +403,9 @@ int main(int argc, char* argv[]) {
         int warmup = quickMode ? 100 : 200;
         int measured = quickMode ? 500 : 1000;
 
-        auto result = VLifeBenchmark::runBenchmark(board, warmup, measured);
+        auto result = stddevMode
+            ? VLifeBenchmark::runBenchmark(board, warmup, measured)
+            : VLifeBenchmark::runBenchmarkSimple(board, warmup, measured);
         printResult("Gliders (" + std::to_string(count) + " gliders)", result, warmup, measured);
     }
 
@@ -365,7 +417,9 @@ int main(int argc, char* argv[]) {
         int warmup = quickMode ? 500 : 1000;
         int measured = quickMode ? 10000 : 50000;
 
-        auto result = VLifeBenchmark::runBenchmark(board, warmup, measured);
+        auto result = stddevMode
+            ? VLifeBenchmark::runBenchmark(board, warmup, measured)
+            : VLifeBenchmark::runBenchmarkSimple(board, warmup, measured);
         printResult("Single Glider (50k gen)", result, warmup, measured);
     }
 
@@ -377,7 +431,9 @@ int main(int argc, char* argv[]) {
         int warmup = quickMode ? 1000 : 2000;
         int measured = quickMode ? 2000 : 5000;
 
-        auto result = VLifeBenchmark::runBenchmark(board, warmup, measured);
+        auto result = stddevMode
+            ? VLifeBenchmark::runBenchmark(board, warmup, measured)
+            : VLifeBenchmark::runBenchmarkSimple(board, warmup, measured);
         printResult("Acorn (methuselah)", result, warmup, measured);
     }
 
@@ -399,7 +455,9 @@ int main(int argc, char* argv[]) {
         BenchmarkPatterns::setupRandomSoup(seqBoard, size, size, 0.3);
         seqBoard.setParallelEnabled(false);
 
-        auto seqResult = VLifeBenchmark::runBenchmark(seqBoard, warmup, measured);
+        auto seqResult = stddevMode
+            ? VLifeBenchmark::runBenchmark(seqBoard, warmup, measured)
+            : VLifeBenchmark::runBenchmarkSimple(seqBoard, warmup, measured);
         std::cout << "\nSequential:\n";
         std::cout << std::fixed << std::setprecision(1);
         std::cout << "  Result: " << seqResult.generationsPerSecond << " gen/sec ("
@@ -411,7 +469,9 @@ int main(int argc, char* argv[]) {
         BenchmarkPatterns::setupRandomSoup(parBoard, size, size, 0.3);
         parBoard.setParallelEnabled(true);
 
-        auto parResult = VLifeBenchmark::runBenchmark(parBoard, warmup, measured);
+        auto parResult = stddevMode
+            ? VLifeBenchmark::runBenchmark(parBoard, warmup, measured)
+            : VLifeBenchmark::runBenchmarkSimple(parBoard, warmup, measured);
         std::cout << "\nParallel:\n";
         std::cout << "  Result: " << parResult.generationsPerSecond << " gen/sec ("
                   << parResult.avgMicrosPerGeneration << " us/gen)\n";

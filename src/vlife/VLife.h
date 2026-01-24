@@ -170,7 +170,15 @@ private:
     // Hash function for TileCoord
     struct TileCoordHash {
         std::size_t operator()(const TileCoord &coord) const {
-            return std::hash<int32_t>()(coord.x) ^ (std::hash<int32_t>()(coord.y) << 1);
+#if SIZE_MAX > 0xFFFFFFFFu
+            // 64-bit: pack both 32-bit values into 64-bit (perfect hash, no collisions)
+            return (static_cast<std::size_t>(static_cast<uint32_t>(coord.x)) << 32) |
+                   static_cast<std::size_t>(static_cast<uint32_t>(coord.y));
+#else
+            // 32-bit: use golden ratio mixing for better distribution
+            return static_cast<std::size_t>(static_cast<uint32_t>(coord.x)) ^
+                   (static_cast<std::size_t>(static_cast<uint32_t>(coord.y)) * 2654435761u);
+#endif
         }
     };
 
