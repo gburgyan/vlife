@@ -123,6 +123,11 @@ public:
     inline void nonAtomicApplyDelta(int x, int y, int8_t delta);
     void nonAtomicAddBoundaryDeltas(int y, const int8_t* deltaArray);
 
+    // Column delta methods: apply accumulated deltas to a vertical column
+    // Used for buffered left/right neighbor updates (one queue check per neighbor)
+    void atomicAddColumnDeltas(int x, const int8_t* deltaArray);
+    void nonAtomicAddColumnDeltas(int x, const int8_t* deltaArray);
+
     // Helper to ensure a neighbor tile exists, creating it on demand if needed
     // Returns the neighbor tile pointer (never null after call)
     Tile* ensureNeighborTile(int dx, int dy);
@@ -153,21 +158,16 @@ public:
         activityRows |= (1 << blockRow);
     }
 
-    // Check if the tile has any potential activity (live cells or neighbor counts)
-    // Used for tile-level skip optimization
-    inline bool hasActivity() const {
-        return activityRows != 0;
-    }
-
-    // Check if the tile needs Phase 1 processing
-    // A tile needs processing if it has activity OR was modified by Phase 2
-    inline bool needsPhase1Processing() const {
-        return activityRows != 0 || wasModified != 0;
-    }
-
     // Check if the tile has changes to apply in Phase 2
     // Used for Phase 2 queue optimization to skip tiles with no changes
     inline bool hasChanges() const {
+        return changesAccumulator != 0;
+    }
+
+    // Check if a neighbor tile is already in Phase 2 queue
+    // If so, it will self-queue for Phase 1, so we don't need to queue it
+    // Safe to call from other tiles during Phase 2 (changesAccumulator is read-only)
+    inline bool willSelfQueueForPhase1() const {
         return changesAccumulator != 0;
     }
 

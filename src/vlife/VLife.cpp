@@ -54,9 +54,9 @@ void VLife::swapPhase1Queues() {
     // because an empty queue is the natural state when no cells change
     if (phase1QueueNeedsBootstrap && !tiles.empty()) {
         for (auto& [coord, tile] : tiles) {
-            if (tile->needsPhase1Processing()) {
-                phase1Queue.push_back(tile);
-            }
+            // All tiles start with wasModified=~0ULL, so they'll all be processed
+            // on first generation. Subsequently, only queued tiles are processed.
+            phase1Queue.push_back(tile);
         }
         phase1QueueNeedsBootstrap = false;  // Clear flag after bootstrap
     }
@@ -231,17 +231,16 @@ void VLife::runGenerationSequential() {
     changedTilesSequential.clear();
 
     // First pass: iterate over Phase 1 queue (tiles that need processing)
+    // runGenerationPrepare() returns early if wasModified==0, so no explicit check needed
     for (Tile* tile : phase1Queue) {
         tile->clearQueueFlag();  // Reset for next generation's queuing
-        if (tile->needsPhase1Processing()) {
-            tile->runGenerationPrepare();
-            if (tile->hasChanges()) {
-                changedTilesSequential.push_back(tile);
-            }
-#ifdef VLIFE_METRICS_ENABLED
-            activeTilesCount++;
-#endif
+        tile->runGenerationPrepare();
+        if (tile->hasChanges()) {
+            changedTilesSequential.push_back(tile);
         }
+#ifdef VLIFE_METRICS_ENABLED
+        activeTilesCount++;
+#endif
     }
 
 #ifdef VLIFE_METRICS_ENABLED
@@ -317,6 +316,7 @@ void VLife::runGeneration() {
     tilesWithChanges.clear();
 
     // PHASE 1: Parallel iteration over Phase 1 queue (tiles that need processing)
+    // runGenerationPrepare() returns early if wasModified==0, so no explicit check needed
     tbb::parallel_for_each(phase1Queue.begin(), phase1Queue.end(),
         [this
 #ifdef VLIFE_METRICS_ENABLED
@@ -324,15 +324,13 @@ void VLife::runGeneration() {
 #endif
         ](Tile* tile) {
             tile->clearQueueFlag();  // Reset for next generation's queuing
-            if (tile->needsPhase1Processing()) {
-                tile->runGenerationPrepare();
-                if (tile->hasChanges()) {
-                    tilesWithChanges.push_back(tile);
-                }
-#ifdef VLIFE_METRICS_ENABLED
-                activeTileCount.fetch_add(1, std::memory_order_relaxed);
-#endif
+            tile->runGenerationPrepare();
+            if (tile->hasChanges()) {
+                tilesWithChanges.push_back(tile);
             }
+#ifdef VLIFE_METRICS_ENABLED
+            activeTileCount.fetch_add(1, std::memory_order_relaxed);
+#endif
         }
     );
 
