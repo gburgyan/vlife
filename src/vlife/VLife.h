@@ -6,11 +6,45 @@
 
 #include <unordered_map>
 #include <vector>
+#include <array>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
-#include <tbb/concurrent_vector.h>
+#include <cassert>
 #include "../GameOfLife.h"
 #include "TilePool.h"
+
+// Pre-allocated atomic queue for lock-free concurrent writes
+// Optimized for: multiple producers, single iteration pass, bulk clear between generations
+// Trade-off: Fixed max capacity for O(1) push and zero merge overhead
+template<typename T, size_t MaxSize = 65536>
+struct AtomicQueue {
+    std::array<T, MaxSize> data;
+    std::atomic<size_t> count{0};
+
+    void push_back(T item) {
+        size_t idx = count.fetch_add(1, std::memory_order_relaxed);
+        assert(idx < MaxSize && "AtomicQueue overflow - increase MaxSize");
+        data[idx] = item;
+    }
+
+    void clear() {
+        count.store(0, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] size_t size() const {
+        return count.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool empty() const {
+        return size() == 0;
+    }
+
+    T* begin() { return data.data(); }
+    T* end() { return data.data() + size(); }
+    [[nodiscard]] const T* begin() const { return data.data(); }
+    [[nodiscard]] const T* end() const { return data.data() + size(); }
+};
 
 // Forward declaration
 class Tile;
@@ -110,6 +144,12 @@ public:
     // Called at the start of Phase 1 to switch from building queue to processing queue
     void swapPhase1Queues();
 
+    // Access the current generation's Phase 1 queue (for reading/processing)
+    AtomicQueue<Tile*>& getPhase1Queue() { return phase1Queues[currentPhase1Queue]; }
+
+    // Access the next generation's Phase 1 queue (for writing during Phase 2)
+    AtomicQueue<Tile*>& getNextPhase1Queue() { return phase1Queues[1 - currentPhase1Queue]; }
+
 #ifdef VLIFE_METRICS_ENABLED
     // Metrics collection support
     void setMetricsCollector(MetricsCollector* collector) { metricsCollector = collector; }
@@ -153,16 +193,17 @@ private:
     uint64_t generationNumber = 0;
 
     // Queue of tiles that had changes in Phase 1, for efficient Phase 2 processing
-    // Using persistent members to amortize allocation across generations
-    tbb::concurrent_vector<Tile*> tilesWithChanges;  // For parallel path
+    // Using AtomicQueue for lock-free concurrent writes with zero merge overhead
+    AtomicQueue<Tile*> tilesWithChanges;  // For parallel path
     std::vector<Tile*> changedTilesSequential;       // For sequential path
 
     // Phase 1 queue optimization: instead of scanning all tiles, track which tiles
     // need Phase 1 processing. Built during Phase 2 of previous generation.
-    // Double-buffered: current generation reads from phase1Queue, Phase 2 writes to nextPhase1Queue
-    // Using concurrent_vector for both sequential and parallel paths for simplicity
-    tbb::concurrent_vector<Tile*> phase1Queue;        // Current generation's tiles to process
-    tbb::concurrent_vector<Tile*> nextPhase1Queue;    // Building for next generation
+    // Double-buffered with index swap for zero-copy queue rotation:
+    // - phase1Queues[currentPhase1Queue] is the current generation's queue to process
+    // - phase1Queues[1 - currentPhase1Queue] is the next generation's queue being built
+    AtomicQueue<Tile*> phase1Queues[2];
+    int currentPhase1Queue{0};  // Index into phase1Queues for current generation
 
     // Flag indicating Phase 1 queue needs bootstrap (first gen or after setCell)
     // Without this flag, the queue bootstrap would run every generation when patterns stabilize
