@@ -117,19 +117,19 @@ public:
     // These replace the generic ensureNeighborTile(dx, dy) to eliminate
     // parameter encoding/decoding overhead at call sites
     inline Tile* ensureLeftTile() {
-        if (left == nullptr) left = board->getTile(tileX - 1, tileY);
+        if (!left) board->getTile(tileX - 1, tileY);
         return left;
     }
     inline Tile* ensureRightTile() {
-        if (right == nullptr) right = board->getTile(tileX + 1, tileY);
+        if (!right) board->getTile(tileX + 1, tileY);
         return right;
     }
     inline Tile* ensureUpTile() {
-        if (up == nullptr) up = board->getTile(tileX, tileY - 1);
+        if (!up) board->getTile(tileX, tileY - 1);
         return up;
     }
     inline Tile* ensureDownTile() {
-        if (down == nullptr) down = board->getTile(tileX, tileY + 1);
+        if (!down) board->getTile(tileX, tileY + 1);
         return down;
     }
     inline Tile* ensureUpLeftTile() {
