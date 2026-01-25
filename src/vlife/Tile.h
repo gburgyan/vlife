@@ -4,7 +4,6 @@
 
 #pragma once
 
-#include <mutex>
 #include "VLife.h"
 
 #define TILE_CELLS TILE_WIDTH *TILE_HEIGHT
@@ -15,18 +14,19 @@
 
 // Align Tile to 64-byte cache line boundaries to prevent false sharing
 // when multiple threads update adjacent tiles in parallel
+//
+// Field layout optimized for cache efficiency:
+// - First cache line: hot-path metadata (wasModified, rowChangeMask, liveCount, etc.)
+// - Next 8 cache lines: cells[] array (512 bytes)
+// - Next 2 cache lines: changes[] array (128 bytes)
+// - Final cache line(s): cold metadata (board pointer, coordinates, neighbor pointers)
 class alignas(64) Tile {
-    VLife *board;
-    int32_t tileX;
-    int32_t tileY;
+    // === Hot path metadata (first cache line) ===
+    // Block-level modification tracking (64 bits = 8x8 blocks of 4x4 cells each)
+    // Bit index: ((y & 0x1C) << 1) | (x >> 2)
+    // Set in Phase 2 when neighbor counts updated; cleared at Phase 1 start
+    uint64_t wasModified{~0ULL};  // Initialize to all-modified for first gen
 
-    Tile *left;
-    Tile *right;
-    Tile *up;
-    Tile *down;
-
-    uint64_t cells[TILE_64S]{};
-    uint32_t changes[TILE_HEIGHT]{};  // One word per row, 16 cell pairs × 2 bits = 32 bits
     uint32_t rowChangeMask{0};  // Bit N set means row N has changes, for quick Phase 2 skip
     uint32_t liveCount; // Tracks the number of live cells in this tile
 
@@ -35,11 +35,6 @@ class alignas(64) Tile {
     // Rows with rowMask == 0 preserve their activity bit (content unchanged)
     uint8_t activityRows{0};
 
-    // Block-level modification tracking (64 bits = 8x8 blocks of 4x4 cells each)
-    // Bit index: ((y & 0x1C) << 1) | (x >> 2)
-    // Set in Phase 2 when neighbor counts updated; cleared at Phase 1 start
-    uint64_t wasModified{~0ULL};  // Initialize to all-modified for first gen
-
     // Generation timestamp for eviction optimization
     // Tracks when the tile was last modified (wraps at 256, uses modular arithmetic)
     uint8_t lastModifiedGeneration{0};
@@ -47,8 +42,23 @@ class alignas(64) Tile {
     // Atomic flag to prevent duplicate Phase 1 queue entries
     // Set by tryQueueForPhase1(), cleared by clearQueueFlag()
     std::atomic<uint8_t> queuedForPhase1{0};
+    // 5 bytes padding to align to 8 bytes (implicit)
 
-    std::mutex tileMutex;
+    // === Cell data (8 cache lines, 512 bytes) ===
+    uint64_t cells[TILE_64S]{};
+
+    // === Change tracking (2 cache lines, 128 bytes) ===
+    uint32_t changes[TILE_HEIGHT]{};  // One word per row, 16 cell pairs × 2 bits = 32 bits
+
+    // === Cold metadata (accessed less frequently) ===
+    VLife *board;
+    int32_t tileX;
+    int32_t tileY;
+
+    Tile *left;
+    Tile *right;
+    Tile *up;
+    Tile *down;
 
 public:
     Tile(VLife *board, int32_t tileX, int32_t tileY);
@@ -68,9 +78,6 @@ public:
     // Uses direct SIMD computation instead of LUT lookups
     bool runGenerationPrepare_AVX512();
 #endif
-
-    void lockTile();
-    void unlockTile();
 
     // Cell access methods
     bool getCell(uint32_t localX, uint32_t localY) const;

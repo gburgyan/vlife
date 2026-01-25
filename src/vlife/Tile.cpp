@@ -5,7 +5,6 @@
 #include "Tile.h"
 #include "VLifeMetrics.h"
 #include <cstring>
-#include <mutex>
 
 // Cross-platform prefetch and SIMD support
 #if defined(__x86_64__) || defined(_M_X64)
@@ -32,8 +31,9 @@
 #endif
 
 Tile::Tile(VLife *board, int32_t tileX, int32_t tileY) :
-    board(board), tileX(tileX), tileY(tileY), left(nullptr), right(nullptr), up(nullptr), down(nullptr),
-    liveCount(0), activityRows(0) {
+    liveCount(0),
+    board(board), tileX(tileX), tileY(tileY),
+    left(nullptr), right(nullptr), up(nullptr), down(nullptr) {
     // Initialize all cells to zero (dead)
     std::memset(cells, 0, sizeof(cells));
     std::memset(changes, 0, sizeof(changes));
@@ -64,10 +64,6 @@ void Tile::setNeighbor(Tile *tile, int dx, int dy) {
     // Note: Diagonal neighbors are no longer stored - they are accessed via
     // cardinal neighbor navigation (e.g., up->left for upLeft)
 }
-
-void Tile::lockTile() { tileMutex.lock(); }
-
-void Tile::unlockTile() { tileMutex.unlock(); }
 
 bool Tile::getCell(uint32_t localX, uint32_t localY) const {
     // Calculate cell index and bit position
