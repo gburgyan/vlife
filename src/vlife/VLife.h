@@ -72,6 +72,21 @@ struct CompactCornerMask {
     uint8_t lower;  // Combined x-block bits for lower corners (y+1)
 };
 
+// Precomputed XOR toggle mask for cell state updates
+// Indexed by (pairInWord << 2) | pairChangeBits to eliminate shift operations
+struct ToggleMaskEntry {
+    uint64_t mask;
+};
+
+// Precomputed state/delta values for cell pair updates
+// Indexed by (pairChangeBits << 2) | (leftWasAlive << 1) | rightWasAlive
+struct StateDeltaEntry {
+    uint8_t lutIndex;       // (leftState << 2) | rightState for deltaLUT lookup
+    int8_t combinedDelta;   // leftDelta + rightDelta for liveCount update
+    uint8_t changeState;    // (leftChanged << 1) | rightChanged for corner mask
+    uint8_t padding;        // Alignment to 4 bytes
+};
+
 // Tile dimensions as compile-time constants
 // Using constexpr instead of macros for type safety and namespace hygiene
 namespace VLifeConstants {
@@ -158,6 +173,8 @@ private:
     void populateRuleLUT();
     void populateUpdateLUT();
     void populateCornerMaskLUT();
+    void populateToggleMaskLUT();
+    void populateStateDeltaLUT();
 
     // Structure to represent tile coordinates as a key
     struct TileCoord {
@@ -238,4 +255,6 @@ public:
     std::byte ruleLUT[256];
     PackedDeltas deltaLUT[16];  // LUT for neighbor count updates indexed by change/alive flags
     CompactCornerMask compactCornerMaskLUT[256];  // LUT for markChangeCorners interior fast path (4 yClasses × 16 xPairs × 4 changeStates)
+    ToggleMaskEntry toggleMaskLUT[32];  // LUT for cell toggle masks (8 pairInWord × 4 changeStates)
+    StateDeltaEntry stateDeltaLUT[16];  // LUT for state/delta values (4 changeStates × 4 wasAlive combinations)
 };

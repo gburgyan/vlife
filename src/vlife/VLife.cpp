@@ -15,6 +15,8 @@ VLife::VLife() {
     populateRuleLUT();
     populateUpdateLUT();
     populateCornerMaskLUT();
+    populateToggleMaskLUT();
+    populateStateDeltaLUT();
 }
 
 VLife::~VLife() {
@@ -684,6 +686,74 @@ void VLife::populateCornerMaskLUT() {
                 // (only the block-row differs, computed at runtime)
                 compactCornerMaskLUT[lutIdx] = {combined, combined};
             }
+        }
+    }
+}
+
+void VLife::populateToggleMaskLUT() {
+    // Precompute XOR masks for cell state toggling
+    // Index: (pairInWord << 2) | pairChangeBits
+    //   pairInWord: 0-7 (position within 64-bit word)
+    //   pairChangeBits: (leftChanged << 1) | rightChanged (0-3)
+    //
+    // Bit positions:
+    //   leftCellBitPos = (7 - pairInWord) * 8 + 7
+    //   rightCellBitPos = (7 - pairInWord) * 8 + 3
+
+    for (int pairInWord = 0; pairInWord < 8; pairInWord++) {
+        int leftCellBitPos = (7 - pairInWord) * 8 + 7;
+        int rightCellBitPos = (7 - pairInWord) * 8 + 3;
+
+        for (int pairChangeBits = 0; pairChangeBits < 4; pairChangeBits++) {
+            int leftChanged = (pairChangeBits >> 1) & 1;
+            int rightChanged = pairChangeBits & 1;
+
+            uint64_t mask = (static_cast<uint64_t>(leftChanged) << leftCellBitPos) |
+                           (static_cast<uint64_t>(rightChanged) << rightCellBitPos);
+
+            int idx = (pairInWord << 2) | pairChangeBits;
+            toggleMaskLUT[idx].mask = mask;
+        }
+    }
+}
+
+void VLife::populateStateDeltaLUT() {
+    // Precompute state/delta values for cell pair updates
+    // Index: (pairChangeBits << 2) | (leftWasAlive << 1) | rightWasAlive
+    //   pairChangeBits: (leftChanged << 1) | rightChanged (0-3)
+    //   leftWasAlive: 0 or 1
+    //   rightWasAlive: 0 or 1
+    //
+    // Computes:
+    //   lutIndex = (leftState << 2) | rightState  (for deltaLUT lookup)
+    //   combinedDelta = leftDelta + rightDelta    (for liveCount update)
+    //   changeState = (leftChanged << 1) | rightChanged  (for corner mask)
+    //
+    // Where:
+    //   state = (1 + wasAlive) * changed  (0=unchanged, 1=born, 2=died)
+    //   delta = changed - 2 * wasAlive * changed  (+1 if born, -1 if died, 0 if unchanged)
+
+    for (int pairChangeBits = 0; pairChangeBits < 4; pairChangeBits++) {
+        int leftChanged = (pairChangeBits >> 1) & 1;
+        int rightChanged = pairChangeBits & 1;
+
+        for (int aliveState = 0; aliveState < 4; aliveState++) {
+            int leftWasAlive = (aliveState >> 1) & 1;
+            int rightWasAlive = aliveState & 1;
+
+            // Compute state values: 0=unchanged, 1=born, 2=died
+            int leftState = (1 + leftWasAlive) * leftChanged;
+            int rightState = (1 + rightWasAlive) * rightChanged;
+
+            // Compute delta values: +1=born, -1=died, 0=unchanged
+            int leftDelta = leftChanged - 2 * leftWasAlive * leftChanged;
+            int rightDelta = rightChanged - 2 * rightWasAlive * rightChanged;
+
+            int idx = (pairChangeBits << 2) | aliveState;
+            stateDeltaLUT[idx].lutIndex = static_cast<uint8_t>((leftState << 2) | rightState);
+            stateDeltaLUT[idx].combinedDelta = static_cast<int8_t>(leftDelta + rightDelta);
+            stateDeltaLUT[idx].changeState = static_cast<uint8_t>(pairChangeBits);
+            stateDeltaLUT[idx].padding = 0;
         }
     }
 }

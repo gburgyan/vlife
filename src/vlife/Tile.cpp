@@ -865,6 +865,8 @@ void Tile::runGenerationChanges() {
     //   4. Apply deltas to all affected neighbors
 
     const PackedDeltas* deltaLUT = board->deltaLUT;
+    const ToggleMaskEntry* toggleMaskLUT = board->toggleMaskLUT;
+    const StateDeltaEntry* stateDeltaLUT = board->stateDeltaLUT;
 
     // Stack-local buffers for neighbor boundary deltas (simple int8_t arrays)
     // Using int8_t avoids carry propagation issues that occur with packed nibbles
@@ -944,31 +946,31 @@ void Tile::runGenerationChanges() {
             // - delta = 1 - 2*wasAlive (+1 if born, -1 if died)
             // - Mask by change flag to zero out unchanged cells
 
-            int leftChanged = (pairChangeBits >> 1) & 1;
-            int rightChanged = pairChangeBits & 1;
+            // Extract the byte containing both cell states (one 64-bit shift instead of two)
+            // Cell byte layout: 0bLNNNRNNN where L=leftAlive(bit7), R=rightAlive(bit3), N=neighbor counts
+            int byteShift = (7 - pairInWord) * 8;
+            int cellByte = (cells[currentCellIdx] >> byteShift) & 0xFF;
 
-            // Read current alive states (0 or 1)
-            int leftWasAlive = (cells[currentCellIdx] >> leftCellBitPos) & 1;
-            int rightWasAlive = (cells[currentCellIdx] >> rightCellBitPos) & 1;
+            // Compute aliveState directly: (leftWasAlive << 1) | rightWasAlive
+            // Left is bit 7, right is bit 3 of the byte
+            int aliveState = ((cellByte >> 6) & 2) | ((cellByte >> 3) & 1);
 
-            // Toggle alive bits for changed cells using XOR mask
-            uint64_t toggleMask = (static_cast<uint64_t>(leftChanged) << leftCellBitPos) |
-                                  (static_cast<uint64_t>(rightChanged) << rightCellBitPos);
-            cells[currentCellIdx] ^= toggleMask;
+            // Toggle mask lookup: precomputed XOR mask based on pairInWord and change bits
+            int toggleIdx = (pairInWord << 2) | pairChangeBits;
+            cells[currentCellIdx] ^= toggleMaskLUT[toggleIdx].mask;
 
-            // Compute states branchlessly: state = (1 + wasAlive) if changed, 0 otherwise
-            int leftState = (1 + leftWasAlive) * leftChanged;
-            int rightState = (1 + rightWasAlive) * rightChanged;
-
-            // Compute liveCount deltas branchlessly: +1 if born, -1 if died, 0 if unchanged
-            // delta = (1 - 2*wasAlive) * changed = changed - 2*wasAlive*changed
-            int leftDelta = leftChanged - 2 * leftWasAlive * leftChanged;
-            int rightDelta = rightChanged - 2 * rightWasAlive * rightChanged;
-            liveCount += leftDelta + rightDelta;
+            // State/delta lookup: precomputed lutIndex, combinedDelta, and changeState
+            int stateIdx = (pairChangeBits << 2) | aliveState;
+            const StateDeltaEntry& sde = stateDeltaLUT[stateIdx];
+            liveCount += sde.combinedDelta;
 
 #ifdef VLIFE_METRICS_ENABLED
             // Track cells born (born = changed && !wasAlive => delta > 0)
             // Track cells died (died = changed && wasAlive => delta < 0)
+            int leftWasAlive = (aliveState >> 1) & 1;
+            int rightWasAlive = aliveState & 1;
+            int leftChanged = (pairChangeBits >> 1) & 1;
+            int rightChanged = pairChangeBits & 1;
             int leftBorn = leftChanged * (1 - leftWasAlive);   // 1 if born, 0 otherwise
             int leftDied = leftChanged * leftWasAlive;         // 1 if died, 0 otherwise
             int rightBorn = rightChanged * (1 - rightWasAlive);
@@ -989,9 +991,8 @@ void Tile::runGenerationChanges() {
                 // Single indexed lookup with no conditionals, then shift to correct block-row
                 int yClass = localY & 3;
                 int blockRow = localY >> 2;
-                int changeState = (leftChanged << 1) | rightChanged;
 
-                int lutIdx = (yClass << 6) | ((baseX >> 1) << 2) | changeState;
+                int lutIdx = (yClass << 6) | ((baseX >> 1) << 2) | sde.changeState;
                 const CompactCornerMask& mask = board->compactCornerMaskLUT[lutIdx];
 
                 // Compute block-row positions for upper (y-1) and lower (y+1) corners
@@ -1006,13 +1007,13 @@ void Tile::runGenerationChanges() {
                              | (static_cast<uint64_t>(mask.lower) << (lowerRow * 8));
             } else {
                 // Slow path for boundary cells (~3%) - call the function
-                if (leftChanged) markChangeCorners(baseX + 1, localY);
-                if (rightChanged) markChangeCorners(baseX, localY);
+                // Use sde.changeState bits: bit 1 = leftChanged, bit 0 = rightChanged
+                if (sde.changeState & 2) markChangeCorners(baseX + 1, localY);
+                if (sde.changeState & 1) markChangeCorners(baseX, localY);
             }
 
-            // Build LUT index and apply deltas
-            int lutIndex = (leftState << 2) | rightState;
-            const PackedDeltas& deltas = deltaLUT[lutIndex];
+            // Apply deltas using precomputed LUT index
+            const PackedDeltas& deltas = deltaLUT[sde.lutIndex];
 
             // Check if this cell pair is on a cross-tile boundary
             bool isTopRow = (localY == 0);
