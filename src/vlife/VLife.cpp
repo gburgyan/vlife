@@ -457,25 +457,18 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
 }
 
 void VLife::evictDeadTilesActual() {
-    // Actual eviction logic - modulo check is handled by inline evictDeadTilesLazy()
-    uint8_t currentGen = static_cast<uint8_t>(generationNumber);
-
     for (auto it = tiles.begin(); it != tiles.end(); ) {
         Tile* tile = it->second;
         if (tile->isSafeToEvict()) {
-            // Use modular arithmetic for age calculation (handles wrap-around)
-            uint8_t age = currentGen - tile->getLastModifiedGeneration();
-            if (age >= EVICTION_AGE_THRESHOLD) {
-                // Unlink from cardinal neighbors
-                if (tile->left) tile->left->right = nullptr;
-                if (tile->right) tile->right->left = nullptr;
-                if (tile->up) tile->up->down = nullptr;
-                if (tile->down) tile->down->up = nullptr;
+            // Unlink from cardinal neighbors
+            if (tile->left) tile->left->right = nullptr;
+            if (tile->right) tile->right->left = nullptr;
+            if (tile->up) tile->up->down = nullptr;
+            if (tile->down) tile->down->up = nullptr;
 
-                tilePool.deallocate(tile);
-                it = tiles.erase(it);
-                continue;
-            }
+            tilePool.deallocate(tile);
+            it = tiles.erase(it);
+            continue;
         }
         ++it;
     }

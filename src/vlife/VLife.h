@@ -241,8 +241,7 @@ private:
     void evictDeadTilesActual();
 
     // Eviction interval - power of 2 for fast modulo via bitmask
-    static constexpr uint64_t EVICTION_CHECK_INTERVAL = 256;
-    static constexpr uint8_t EVICTION_AGE_THRESHOLD = 128;
+    static constexpr uint64_t EVICTION_CHECK_INTERVAL = 128;
 
     // Lazy eviction check - inline fast path, actual eviction is out-of-line
     inline void evictDeadTilesLazy() {
