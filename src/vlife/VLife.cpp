@@ -74,34 +74,38 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
     tiles[coord] = tilePtr;
 
     // Connect to neighboring tiles if they exist (already under exclusive lock)
-    // We link all 8 neighbors (orthogonal and diagonal) here.
+    // Link cardinal neighbors bidirectionally
 
-    // Check left (-1, 0)
+    // Link left neighbor
     auto leftIt = tiles.find(TileCoord{tileX - 1, tileY});
     if (leftIt != tiles.end()) {
-        tilePtr->setNeighbor(leftIt->second, -1, 0);
+        tilePtr->left = leftIt->second;
+        leftIt->second->right = tilePtr;
     }
 
-    // Check right (1, 0)
+    // Link right neighbor
     auto rightIt = tiles.find(TileCoord{tileX + 1, tileY});
     if (rightIt != tiles.end()) {
-        tilePtr->setNeighbor(rightIt->second, 1, 0);
+        tilePtr->right = rightIt->second;
+        rightIt->second->left = tilePtr;
     }
 
-    // Check up (0, -1)
+    // Link up neighbor
     auto upIt = tiles.find(TileCoord{tileX, tileY - 1});
     if (upIt != tiles.end()) {
-        tilePtr->setNeighbor(upIt->second, 0, -1);
+        tilePtr->up = upIt->second;
+        upIt->second->down = tilePtr;
     }
 
-    // Check down (0, 1)
+    // Link down neighbor
     auto downIt = tiles.find(TileCoord{tileX, tileY + 1});
     if (downIt != tiles.end()) {
-        tilePtr->setNeighbor(downIt->second, 0, 1);
+        tilePtr->down = downIt->second;
+        downIt->second->up = tilePtr;
     }
 
-    // Note: Diagonal neighbors are no longer stored - they are accessed via
-    // cardinal neighbor navigation (e.g., up->left for upLeft)
+    // Note: Diagonal neighbors are accessed via cardinal neighbor navigation
+    // (e.g., up->left for upLeft)
 
     return tilePtr;
 }

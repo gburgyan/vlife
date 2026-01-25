@@ -63,8 +63,6 @@ class alignas(64) Tile {
 public:
     Tile(VLife *board, int32_t tileX, int32_t tileY);
 
-    void setNeighbor(Tile *tile, int dx, int dy);
-
     bool runGenerationPrepare();
 
     // Template parameter controls whether atomic operations are used for boundary cells:
@@ -185,13 +183,6 @@ public:
     // Check if the tile has changes to apply in Phase 2
     // Used for Phase 2 queue optimization to skip tiles with no changes
     inline bool hasChanges() const {
-        return rowChangeMask != 0;
-    }
-
-    // Check if a neighbor tile is already in Phase 2 queue
-    // If so, it will self-queue for Phase 1, so we don't need to queue it
-    // Safe to call from other tiles during Phase 2 (rowChangeMask is read-only)
-    inline bool willSelfQueueForPhase1() const {
         return rowChangeMask != 0;
     }
 
