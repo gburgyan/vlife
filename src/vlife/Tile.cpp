@@ -981,10 +981,9 @@ void Tile::runGenerationChanges() {
                 wasModified |= (static_cast<uint64_t>(mask.upper) << (upperRow * 8))
                              | (static_cast<uint64_t>(mask.lower) << (lowerRow * 8));
             } else {
-                // Slow path for boundary cells (~3%) - call the function
-                // Use sde.changeState bits: bit 1 = leftChanged, bit 0 = rightChanged
-                if (sde.changeState & 2) markChangeCorners(baseX + 1, localY);
-                if (sde.changeState & 1) markChangeCorners(baseX, localY);
+                // Slow path for boundary cells (~3%) - handle pair together
+                // Batches boundary checks and atomic operations for better performance
+                markChangeCornersForPair(baseX, localY, sde.changeState);
             }
 
             // Apply deltas using precomputed LUT index

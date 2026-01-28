@@ -281,6 +281,122 @@ public:
         }
     }
 
+    // Mark corner blocks for a cell pair at (baseX, baseX+1, localY)
+    // Optimized to handle both cells together with batched atomic operations
+    // changeState: bit 0 = right cell (baseX) changed, bit 1 = left cell (baseX+1) changed
+    inline void markChangeCornersForPair(int baseX, int localY, uint8_t changeState) {
+        if (changeState == 0) return;
+
+        // Boundary conditions for the pair's corner area:
+        // Right cell (baseX) corners at baseX-1, baseX+1
+        // Left cell (baseX+1) corners at baseX, baseX+2
+        bool leftOut = (baseX - 1) < 0;              // baseX == 0
+        bool rightOut = (baseX + 2) >= TILE_WIDTH;   // baseX == 30
+        bool topOut = (localY - 1) < 0;              // localY == 0
+        bool bottomOut = (localY + 1) >= TILE_HEIGHT; // localY == 31
+
+        // Fast path: all corners are interior
+        if (!leftOut && !rightOut && !topOut && !bottomOut) {
+            int y1 = localY - 1;
+            int y2 = localY + 1;
+            int yMask1 = (y1 & 0x1C) << 1;
+            int yMask2 = (y2 & 0x1C) << 1;
+
+            uint64_t mask = 0;
+            if (changeState & 1) {  // Right cell changed: corners at baseX-1, baseX+1
+                int bx0 = (baseX - 1) >> 2;
+                int bx1 = (baseX + 1) >> 2;
+                mask |= (1ULL << (yMask1 | bx0)) | (1ULL << (yMask1 | bx1));
+                mask |= (1ULL << (yMask2 | bx0)) | (1ULL << (yMask2 | bx1));
+            }
+            if (changeState & 2) {  // Left cell changed: corners at baseX, baseX+2
+                int bx0 = baseX >> 2;
+                int bx1 = (baseX + 2) >> 2;
+                mask |= (1ULL << (yMask1 | bx0)) | (1ULL << (yMask1 | bx1));
+                mask |= (1ULL << (yMask2 | bx0)) | (1ULL << (yMask2 | bx1));
+            }
+            wasModified |= mask;
+            return;
+        }
+
+        // Slow path: handle boundaries with batched atomics
+        // Accumulate masks per destination tile, then apply with single atomic per tile
+        uint64_t localMask = 0;
+        uint64_t upMask = 0, downMask = 0, leftMask = 0, rightMask = 0;
+        uint64_t upLeftMask = 0, upRightMask = 0, downLeftMask = 0, downRightMask = 0;
+
+        // Adjusted y-coordinates for cross-tile corners
+        int topY = topOut ? (TILE_HEIGHT - 1) : (localY - 1);
+        int bottomY = bottomOut ? 0 : (localY + 1);
+        int yMaskTop = (topY & 0x1C) << 1;
+        int yMaskBottom = (bottomY & 0x1C) << 1;
+
+        // x-positions affected by each cell:
+        // baseX-1: right cell (bit 0), baseX: left cell (bit 1)
+        // baseX+1: right cell (bit 0), baseX+2: left cell (bit 1)
+        const int xPositions[4] = {baseX - 1, baseX, baseX + 1, baseX + 2};
+        const uint8_t xAffected[4] = {1, 2, 1, 2};  // Which changeState bit affects each x
+
+        for (int i = 0; i < 4; i++) {
+            if (!(changeState & xAffected[i])) continue;
+
+            int cornerX = xPositions[i];
+            bool xLeft = cornerX < 0;
+            bool xRight = cornerX >= TILE_WIDTH;
+            int adjX = xLeft ? (TILE_WIDTH - 1) : (xRight ? 0 : cornerX);
+            int blockXBits = adjX >> 2;
+
+            // Top row corners (y - 1)
+            {
+                int blockIdx = yMaskTop | blockXBits;
+                uint64_t bit = 1ULL << blockIdx;
+                if (topOut && xLeft) {
+                    upLeftMask |= bit;
+                } else if (topOut && xRight) {
+                    upRightMask |= bit;
+                } else if (topOut) {
+                    upMask |= bit;
+                } else if (xLeft) {
+                    leftMask |= bit;
+                } else if (xRight) {
+                    rightMask |= bit;
+                } else {
+                    localMask |= bit;
+                }
+            }
+
+            // Bottom row corners (y + 1)
+            {
+                int blockIdx = yMaskBottom | blockXBits;
+                uint64_t bit = 1ULL << blockIdx;
+                if (bottomOut && xLeft) {
+                    downLeftMask |= bit;
+                } else if (bottomOut && xRight) {
+                    downRightMask |= bit;
+                } else if (bottomOut) {
+                    downMask |= bit;
+                } else if (xLeft) {
+                    leftMask |= bit;
+                } else if (xRight) {
+                    rightMask |= bit;
+                } else {
+                    localMask |= bit;
+                }
+            }
+        }
+
+        // Apply accumulated masks with single atomic operation per tile
+        if (localMask) wasModified |= localMask;
+        if (upMask && up) __atomic_fetch_or(&up->wasModified, upMask, __ATOMIC_RELAXED);
+        if (downMask && down) __atomic_fetch_or(&down->wasModified, downMask, __ATOMIC_RELAXED);
+        if (leftMask && left) __atomic_fetch_or(&left->wasModified, leftMask, __ATOMIC_RELAXED);
+        if (rightMask && right) __atomic_fetch_or(&right->wasModified, rightMask, __ATOMIC_RELAXED);
+        if (upLeftMask && up && up->left) __atomic_fetch_or(&up->left->wasModified, upLeftMask, __ATOMIC_RELAXED);
+        if (upRightMask && up && up->right) __atomic_fetch_or(&up->right->wasModified, upRightMask, __ATOMIC_RELAXED);
+        if (downLeftMask && down && down->left) __atomic_fetch_or(&down->left->wasModified, downLeftMask, __ATOMIC_RELAXED);
+        if (downRightMask && down && down->right) __atomic_fetch_or(&down->right->wasModified, downRightMask, __ATOMIC_RELAXED);
+    }
+
     // Getter for last modified generation (for eviction logic)
     uint8_t getLastModifiedGeneration() const { return lastModifiedGeneration; }
 
