@@ -135,13 +135,14 @@ Because only changed cells and their neighbors are ever touched, the work per ge
 
 ### Cell encoding
 
-```
-One byte = two horizontally-adjacent cells:
+One byte holds two horizontally-adjacent cells (a "cell pair"):
 
-  bit 7      bits 6-4         bit 3      bits 2-0
- [alive] [neighbor count] | [alive] [neighbor count]
-   Left cell                  Right cell
-```
+| Bits | Field | Meaning |
+|---|---|---|
+| `7` | Left — alive | 1 = live, 0 = dead |
+| `6–4` | Left — neighbor count | live neighbors (0–7), *excluding* the paired cell |
+| `3` | Right — alive | 1 = live, 0 = dead |
+| `2–0` | Right — neighbor count | live neighbors (0–7), *excluding* the paired cell |
 
 The 3-bit neighbor count omits the paired cell; its contribution is added back during the rule lookup. This lets one table lookup resolve both cells at once.
 
