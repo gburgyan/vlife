@@ -6,11 +6,45 @@
 
 #include <unordered_map>
 #include <vector>
+#include <array>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
-#include <tbb/concurrent_vector.h>
+#include <cassert>
 #include "../GameOfLife.h"
 #include "TilePool.h"
+
+// Pre-allocated atomic queue for lock-free concurrent writes
+// Optimized for: multiple producers, single iteration pass, bulk clear between generations
+// Trade-off: Fixed max capacity for O(1) push and zero merge overhead
+template<typename T, size_t MaxSize = 65536>
+struct AtomicQueue {
+    std::array<T, MaxSize> data;
+    std::atomic<size_t> count{0};
+
+    void push_back(T item) {
+        size_t idx = count.fetch_add(1, std::memory_order_relaxed);
+        assert(idx < MaxSize && "AtomicQueue overflow - increase MaxSize");
+        data[idx] = item;
+    }
+
+    void clear() {
+        count.store(0, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] size_t size() const {
+        return count.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] bool empty() const {
+        return size() == 0;
+    }
+
+    T* begin() { return data.data(); }
+    T* end() { return data.data() + size(); }
+    [[nodiscard]] const T* begin() const { return data.data(); }
+    [[nodiscard]] const T* end() const { return data.data() + size(); }
+};
 
 // Forward declaration
 class Tile;
@@ -24,6 +58,33 @@ class MetricsCollector;
 struct PackedDeltas {
     int8_t sameRow[2];     // [0]=x-1 neighbor, [1]=x+2 neighbor (horizontal, same row)
     int8_t verticalRow[4]; // [0]=x-1, [1]=x, [2]=x+1, [3]=x+2 (for rows above/below)
+};
+
+// Compact precomputed corner block masks for markChangeCorners interior fast path
+// Exploits y-symmetry and encodes change state directly in LUT index for 16x size reduction
+// Index: (yClass << 6) | (xPair << 2) | changeState
+//   yClass: localY & 3 (0-3) - position within 4-row block
+//   xPair: baseX >> 1 (0-15) - which cell pair in the row
+//   changeState: (leftChanged << 1) | rightChanged (0-3)
+// At runtime, x-block masks are shifted to the correct block-row position
+struct CompactCornerMask {
+    uint8_t upper;  // Combined x-block bits for upper corners (y-1)
+    uint8_t lower;  // Combined x-block bits for lower corners (y+1)
+};
+
+// Precomputed XOR toggle mask for cell state updates
+// Indexed by (pairInWord << 2) | pairChangeBits to eliminate shift operations
+struct ToggleMaskEntry {
+    uint64_t mask;
+};
+
+// Precomputed state/delta values for cell pair updates
+// Indexed by (pairChangeBits << 2) | (leftWasAlive << 1) | rightWasAlive
+struct StateDeltaEntry {
+    uint8_t lutIndex;       // (leftState << 2) | rightState for deltaLUT lookup
+    int8_t combinedDelta;   // leftDelta + rightDelta for liveCount update
+    uint8_t changeState;    // (leftChanged << 1) | rightChanged for corner mask
+    uint8_t padding;        // Alignment to 4 bytes
 };
 
 // Tile dimensions as compile-time constants
@@ -65,11 +126,6 @@ public:
     void setParallelEnabled(bool enabled) { parallelEnabled = enabled; }
     bool isParallelEnabled() const { return parallelEnabled; }
 
-    // Enable or disable buffered boundary optimization (for A/B comparison)
-    // When enabled, cross-tile boundary deltas are buffered locally and applied
-    // with a single atomic fetch_add per word instead of individual CAS operations
-    void setBufferedBoundaryEnabled(bool enabled) { bufferedBoundaryEnabled = enabled; }
-    bool isBufferedBoundaryEnabled() const { return bufferedBoundaryEnabled; }
 
     // Gets a tile at the specified coordinates. Creates it if it doesn't exist.
     Tile *getTile(int32_t tileX, int32_t tileY);
@@ -94,6 +150,19 @@ public:
         return static_cast<uint8_t>(generationNumber);
     }
 
+    // Phase 1 queue optimization: add a tile to the next generation's Phase 1 queue
+    // Called from Tile::runGenerationChanges() when a tile modifies itself or neighbors
+    // Thread-safe for parallel Phase 2 execution
+    void addToNextPhase1Queue(Tile* tile);
+
+    // Swap Phase 1 queues between generations
+    // Called at the start of Phase 1 to switch from building queue to processing queue
+    inline void swapPhase1Queues() {
+        phase1Queue->clear();
+        std::swap(phase1Queue, nextPhase1Queue);
+    }
+
+
 #ifdef VLIFE_METRICS_ENABLED
     // Metrics collection support
     void setMetricsCollector(MetricsCollector* collector) { metricsCollector = collector; }
@@ -103,6 +172,9 @@ public:
 private:
     void populateRuleLUT();
     void populateUpdateLUT();
+    void populateCornerMaskLUT();
+    void populateToggleMaskLUT();
+    void populateStateDeltaLUT();
 
     // Structure to represent tile coordinates as a key
     struct TileCoord {
@@ -115,7 +187,15 @@ private:
     // Hash function for TileCoord
     struct TileCoordHash {
         std::size_t operator()(const TileCoord &coord) const {
-            return std::hash<int32_t>()(coord.x) ^ (std::hash<int32_t>()(coord.y) << 1);
+#if SIZE_MAX > 0xFFFFFFFFu
+            // 64-bit: pack both 32-bit values into 64-bit (perfect hash, no collisions)
+            return (static_cast<std::size_t>(static_cast<uint32_t>(coord.x)) << 32) |
+                   static_cast<std::size_t>(static_cast<uint32_t>(coord.y));
+#else
+            // 32-bit: use golden ratio mixing for better distribution
+            return static_cast<std::size_t>(static_cast<uint32_t>(coord.x)) ^
+                   (static_cast<std::size_t>(static_cast<uint32_t>(coord.y)) * 2654435761u);
+#endif
         }
     };
 
@@ -131,17 +211,24 @@ private:
     mutable std::shared_mutex tilesMutex;
 
     bool parallelEnabled = true;
-    // Buffered boundary optimization - accumulates deltas locally then applies them
-    // in batch at the end of runGenerationChanges(). Reduces redundant tile lookups.
-    bool bufferedBoundaryEnabled = true;
 
     // Generation counter for metrics
     uint64_t generationNumber = 0;
 
     // Queue of tiles that had changes in Phase 1, for efficient Phase 2 processing
-    // Using persistent members to amortize allocation across generations
-    tbb::concurrent_vector<Tile*> tilesWithChanges;  // For parallel path
+    // Using AtomicQueue for lock-free concurrent writes with zero merge overhead
+    AtomicQueue<Tile*> tilesWithChanges;  // For parallel path
     std::vector<Tile*> changedTilesSequential;       // For sequential path
+
+    // Phase 1 queue optimization: instead of scanning all tiles, track which tiles
+    // need Phase 1 processing. Built during Phase 2 of previous generation.
+    // Double-buffered with index swap for zero-copy queue rotation:
+    // - phase1Queues[currentPhase1Queue] is the current generation's queue to process
+    // - phase1Queues[1 - currentPhase1Queue] is the next generation's queue being built
+    AtomicQueue<Tile*> phase1Queues[2];
+    AtomicQueue<Tile*>* phase1Queue{&phase1Queues[0]};      // Pointer to current generation's queue
+    AtomicQueue<Tile*>* nextPhase1Queue{&phase1Queues[1]};  // Pointer to next generation's queue
+
 
 #ifdef VLIFE_METRICS_ENABLED
     MetricsCollector* metricsCollector = nullptr;
@@ -150,10 +237,23 @@ private:
     // Sequential implementation (fallback for small tile counts)
     void runGenerationSequential();
 
-    // Evict tiles with no live cells
-    void evictDeadTiles();
+    // Evict tiles with no live cells (actual implementation)
+    void evictDeadTilesActual();
+
+    // Eviction interval - power of 2 for fast modulo via bitmask
+    static constexpr uint64_t EVICTION_CHECK_INTERVAL = 128;
+
+    // Lazy eviction check - inline fast path, actual eviction is out-of-line
+    inline void evictDeadTilesLazy() {
+        if (__builtin_expect((generationNumber & (EVICTION_CHECK_INTERVAL - 1)) == 0, 0)) {
+            evictDeadTilesActual();
+        }
+    }
 
 public:
     std::byte ruleLUT[256];
     PackedDeltas deltaLUT[16];  // LUT for neighbor count updates indexed by change/alive flags
+    CompactCornerMask compactCornerMaskLUT[256];  // LUT for markChangeCorners interior fast path (4 yClasses × 16 xPairs × 4 changeStates)
+    ToggleMaskEntry toggleMaskLUT[32];  // LUT for cell toggle masks (8 pairInWord × 4 changeStates)
+    StateDeltaEntry stateDeltaLUT[16];  // LUT for state/delta values (4 changeStates × 4 wasAlive combinations)
 };

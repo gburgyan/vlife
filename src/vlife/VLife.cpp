@@ -14,6 +14,9 @@ VLife::VLife() {
     resetBoard();
     populateRuleLUT();
     populateUpdateLUT();
+    populateCornerMaskLUT();
+    populateToggleMaskLUT();
+    populateStateDeltaLUT();
 }
 
 VLife::~VLife() {
@@ -31,6 +34,18 @@ void VLife::resetBoard() {
     }
     tiles.clear();
     tilePool.recycle();
+
+    // Clear Phase 1 queues
+    phase1Queues[0].clear();
+    phase1Queues[1].clear();
+    phase1Queue = &phase1Queues[0];
+    nextPhase1Queue = &phase1Queues[1];
+}
+
+void VLife::addToNextPhase1Queue(Tile* tile) {
+    // Called from Tile::runGenerationChanges() during Phase 2
+    // Thread-safe: AtomicQueue uses atomic fetch_add for lock-free push
+    nextPhase1Queue->push_back(tile);
 }
 
 Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
@@ -59,49 +74,38 @@ Tile *VLife::getTile(int32_t tileX, int32_t tileY) {
     tiles[coord] = tilePtr;
 
     // Connect to neighboring tiles if they exist (already under exclusive lock)
-    // We link all 8 neighbors (orthogonal and diagonal) here.
+    // Link cardinal neighbors bidirectionally
 
-    // Check left (-1, 0)
+    // Link left neighbor
     auto leftIt = tiles.find(TileCoord{tileX - 1, tileY});
     if (leftIt != tiles.end()) {
-        tilePtr->setNeighbor(leftIt->second, -1, 0);
+        tilePtr->left = leftIt->second;
+        leftIt->second->right = tilePtr;
     }
 
-    // Check right (1, 0)
+    // Link right neighbor
     auto rightIt = tiles.find(TileCoord{tileX + 1, tileY});
     if (rightIt != tiles.end()) {
-        tilePtr->setNeighbor(rightIt->second, 1, 0);
+        tilePtr->right = rightIt->second;
+        rightIt->second->left = tilePtr;
     }
 
-    // Check up (0, -1)
+    // Link up neighbor
     auto upIt = tiles.find(TileCoord{tileX, tileY - 1});
     if (upIt != tiles.end()) {
-        tilePtr->setNeighbor(upIt->second, 0, -1);
+        tilePtr->up = upIt->second;
+        upIt->second->down = tilePtr;
     }
 
-    // Check down (0, 1)
+    // Link down neighbor
     auto downIt = tiles.find(TileCoord{tileX, tileY + 1});
     if (downIt != tiles.end()) {
-        tilePtr->setNeighbor(downIt->second, 0, 1);
+        tilePtr->down = downIt->second;
+        downIt->second->up = tilePtr;
     }
 
-    // Check diagonal neighbors
-    auto upLeftIt = tiles.find(TileCoord{tileX - 1, tileY - 1});
-    if (upLeftIt != tiles.end()) {
-        tilePtr->setNeighbor(upLeftIt->second, -1, -1);
-    }
-    auto upRightIt = tiles.find(TileCoord{tileX + 1, tileY - 1});
-    if (upRightIt != tiles.end()) {
-        tilePtr->setNeighbor(upRightIt->second, 1, -1);
-    }
-    auto downLeftIt = tiles.find(TileCoord{tileX - 1, tileY + 1});
-    if (downLeftIt != tiles.end()) {
-        tilePtr->setNeighbor(downLeftIt->second, -1, 1);
-    }
-    auto downRightIt = tiles.find(TileCoord{tileX + 1, tileY + 1});
-    if (downRightIt != tiles.end()) {
-        tilePtr->setNeighbor(downRightIt->second, 1, 1);
-    }
+    // Note: Diagonal neighbors are accessed via cardinal neighbor navigation
+    // (e.g., up->left for upLeft)
 
     return tilePtr;
 }
@@ -155,6 +159,12 @@ void VLife::setCell(uint32_t x, uint32_t y, CellState state) {
 
     // Use Tile's setCell method to set the cell state
     tile->setCell(localX, localY, state == CellState::ALIVE);
+
+    // Add tile to next Phase 1 queue if not already queued
+    // Uses tile's atomic queue flag to avoid duplicates
+    if (tile->tryQueueForPhase1()) {
+        nextPhase1Queue->push_back(tile);
+    }
 }
 
 std::vector<GameOfLife::CellState> VLife::getCells(uint32_t startX, uint32_t startY, uint32_t width,
@@ -192,20 +202,22 @@ void VLife::runGenerationSequential() {
     size_t activeTilesCount = 0;
 #endif
 
-    // Clear the queue from previous generation (keeps capacity for amortized allocation)
+    // Swap Phase 1 queues: previous generation's nextPhase1Queue becomes this generation's queue
+    swapPhase1Queues();
+
+    // Clear the Phase 2 queue from previous generation (keeps capacity for amortized allocation)
     changedTilesSequential.clear();
 
-    // First pass: iterate all tiles, check needsPhase1Processing(), prepare
-    for (const auto& [coord, tile] : tiles) {
-        if (tile->needsPhase1Processing()) {
-            tile->runGenerationPrepare();
-            if (tile->hasChanges()) {
-                changedTilesSequential.push_back(tile);
-            }
-#ifdef VLIFE_METRICS_ENABLED
-            activeTilesCount++;
-#endif
+    // First pass: iterate over Phase 1 queue (tiles that need processing)
+    // runGenerationPrepare() returns early if wasModified==0, so no explicit check needed
+    for (Tile* tile : *phase1Queue) {
+        tile->clearQueueFlag();  // Reset for next generation's queuing
+        if (tile->runGenerationPrepare()) {
+            changedTilesSequential.push_back(tile);
         }
+#ifdef VLIFE_METRICS_ENABLED
+        activeTilesCount++;
+#endif
     }
 
 #ifdef VLIFE_METRICS_ENABLED
@@ -243,16 +255,76 @@ void VLife::runGeneration() {
     }
 #endif
 
-    // Fall back to sequential for small tile counts or when parallel is disabled
-    if (!parallelEnabled || tiles.size() < 10) {
-        runGenerationSequential();
+    // Swap Phase 1 queues first: previous generation's nextPhase1Queue becomes this generation's queue
+    swapPhase1Queues();
+
+    // Fast path: empty queue means nothing to do (still-life patterns)
+    if (phase1Queue->empty()) {
+        evictDeadTilesLazy();
+        generationNumber++;
 
 #ifdef VLIFE_METRICS_ENABLED
-        size_t tilesCreated = tiles.size() > initialTileCount ? tiles.size() - initialTileCount : 0;
-        size_t preEvictCount = tiles.size();
+        auto genEndTime = std::chrono::high_resolution_clock::now();
+        uint64_t totalTime = std::chrono::duration_cast<std::chrono::microseconds>(genEndTime - genStartTime).count();
+        if (metricsCollector) {
+            int32_t minX, maxX, minY, maxY;
+            getBoardExtent(minX, maxX, minY, maxY);
+            VLIFE_METRICS_END_GEN(*metricsCollector, getTotalLiveCells(), tiles.size(),
+                                   minX, maxX, minY, maxY, totalTime, 0, 0);
+        }
+#endif
+        return;
+    }
+
+    // Fall back to sequential for small tile counts, small queues, or when parallel is disabled
+    // Avoids TBB setup/teardown overhead for small workloads
+    if (!parallelEnabled || tiles.size() < 10 || phase1Queue->size() < 16) {
+#ifdef VLIFE_METRICS_ENABLED
+        auto metricsTimerStart = std::chrono::high_resolution_clock::now();
+        size_t activeTilesCount = 0;
 #endif
 
-        evictDeadTiles();
+        // Clear the Phase 2 queue from previous generation
+        changedTilesSequential.clear();
+
+        // First pass: iterate over Phase 1 queue
+        for (Tile* tile : *phase1Queue) {
+            tile->clearQueueFlag();
+            if (tile->runGenerationPrepare()) {
+                changedTilesSequential.push_back(tile);
+            }
+#ifdef VLIFE_METRICS_ENABLED
+            activeTilesCount++;
+#endif
+        }
+
+#ifdef VLIFE_METRICS_ENABLED
+        auto phase1End = std::chrono::high_resolution_clock::now();
+        uint64_t phase1Time = std::chrono::duration_cast<std::chrono::microseconds>(phase1End - metricsTimerStart).count();
+        if (metricsCollector) {
+            VLIFE_METRICS_MERGE_TL(*metricsCollector);
+            VLIFE_METRICS_END_PHASE1(*metricsCollector, activeTilesCount, phase1Time);
+        }
+        auto phase2Start = std::chrono::high_resolution_clock::now();
+#endif
+
+        // Second pass: apply changes
+        for (Tile* tile : changedTilesSequential) {
+            tile->runGenerationChanges<false>();
+        }
+
+#ifdef VLIFE_METRICS_ENABLED
+        auto phase2End = std::chrono::high_resolution_clock::now();
+        uint64_t phase2Time = std::chrono::duration_cast<std::chrono::microseconds>(phase2End - phase2Start).count();
+        size_t tilesCreated = tiles.size() > initialTileCount ? tiles.size() - initialTileCount : 0;
+        size_t preEvictCount = tiles.size();
+        if (metricsCollector) {
+            VLIFE_METRICS_MERGE_TL(*metricsCollector);
+            VLIFE_METRICS_END_PHASE2(*metricsCollector, tiles.size(), phase2Time);
+        }
+#endif
+
+        evictDeadTilesLazy();
         generationNumber++;
 
 #ifdef VLIFE_METRICS_ENABLED
@@ -274,26 +346,24 @@ void VLife::runGeneration() {
     std::atomic<size_t> activeTileCount{0};
 #endif
 
-    // Clear the queue from previous generation (keeps capacity for amortized allocation)
+    // Clear the Phase 2 queue from previous generation (keeps capacity for amortized allocation)
     tilesWithChanges.clear();
 
-    // PHASE 1: Parallel iteration over ALL tiles, check needsPhase1Processing(), collect tiles with changes
-    tbb::parallel_for_each(tiles.begin(), tiles.end(),
+    // PHASE 1: Parallel iteration over Phase 1 queue (tiles that need processing)
+    // runGenerationPrepare() returns early if wasModified==0, so no explicit check needed
+    tbb::parallel_for_each(phase1Queue->begin(), phase1Queue->end(),
         [this
 #ifdef VLIFE_METRICS_ENABLED
             , &activeTileCount
 #endif
-        ](const auto& pair) {
-            Tile* tile = pair.second;
-            if (tile->needsPhase1Processing()) {
-                tile->runGenerationPrepare();
-                if (tile->hasChanges()) {
-                    tilesWithChanges.push_back(tile);
-                }
-#ifdef VLIFE_METRICS_ENABLED
-                activeTileCount.fetch_add(1, std::memory_order_relaxed);
-#endif
+        ](Tile* tile) {
+            tile->clearQueueFlag();  // Reset for next generation's queuing
+            if (tile->runGenerationPrepare()) {
+                tilesWithChanges.push_back(tile);
             }
+#ifdef VLIFE_METRICS_ENABLED
+            activeTileCount.fetch_add(1, std::memory_order_relaxed);
+#endif
         }
     );
 
@@ -324,7 +394,7 @@ void VLife::runGeneration() {
 #endif
 
     // Evict dead tiles to prevent memory growth
-    evictDeadTiles();
+    evictDeadTilesLazy();
     generationNumber++;
 
 #ifdef VLIFE_METRICS_ENABLED
@@ -357,7 +427,7 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
 
     Tile *tile = it->second;
 
-    // Unlink from neighbors
+    // Unlink from cardinal neighbors
     if (tile->left) {
         tile->left->right = nullptr;
     }
@@ -370,10 +440,6 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
     if (tile->down) {
         tile->down->up = nullptr;
     }
-    if (tile->upLeft) tile->upLeft->downRight = nullptr;
-    if (tile->upRight) tile->upRight->downLeft = nullptr;
-    if (tile->downLeft) tile->downLeft->upRight = nullptr;
-    if (tile->downRight) tile->downRight->upLeft = nullptr;
 
 #ifdef DEBUG_VLIFE
     // Verify all cells are dead
@@ -390,34 +456,19 @@ void VLife::removeTile(int32_t tileX, int32_t tileY) {
     tiles.erase(it);
 }
 
-void VLife::evictDeadTiles() {
-    // Only check periodically (power of 2 interval for fast modulo via bitmask)
-    if ((generationNumber & (EVICTION_CHECK_INTERVAL - 1)) != 0) {
-        return;
-    }
-
-    uint8_t currentGen = static_cast<uint8_t>(generationNumber);
-
+void VLife::evictDeadTilesActual() {
     for (auto it = tiles.begin(); it != tiles.end(); ) {
         Tile* tile = it->second;
         if (tile->isSafeToEvict()) {
-            // Use modular arithmetic for age calculation (handles wrap-around)
-            uint8_t age = currentGen - tile->getLastModifiedGeneration();
-            if (age >= EVICTION_AGE_THRESHOLD) {
-                // Unlink from neighbors (inline from removeTile)
-                if (tile->left) tile->left->right = nullptr;
-                if (tile->right) tile->right->left = nullptr;
-                if (tile->up) tile->up->down = nullptr;
-                if (tile->down) tile->down->up = nullptr;
-                if (tile->upLeft) tile->upLeft->downRight = nullptr;
-                if (tile->upRight) tile->upRight->downLeft = nullptr;
-                if (tile->downLeft) tile->downLeft->upRight = nullptr;
-                if (tile->downRight) tile->downRight->upLeft = nullptr;
+            // Unlink from cardinal neighbors
+            if (tile->left) tile->left->right = nullptr;
+            if (tile->right) tile->right->left = nullptr;
+            if (tile->up) tile->up->down = nullptr;
+            if (tile->down) tile->down->up = nullptr;
 
-                tilePool.deallocate(tile);
-                it = tiles.erase(it);
-                continue;
-            }
+            tilePool.deallocate(tile);
+            it = tiles.erase(it);
+            continue;
         }
         ++it;
     }
@@ -581,5 +632,125 @@ void VLife::getBoardExtent(int32_t& minX, int32_t& maxX, int32_t& minY, int32_t&
         if (coord.x > maxX) maxX = coord.x;
         if (coord.y < minY) minY = coord.y;
         if (coord.y > maxY) maxY = coord.y;
+    }
+}
+
+void VLife::populateCornerMaskLUT() {
+    // Compact corner block masks exploiting y-symmetry and encoding change state in index
+    // For interior cells, corner y-positions only depend on yClass = localY & 3:
+    //   - yClass 0: upper corners in blockRow-1, lower in blockRow
+    //   - yClass 1,2: both upper and lower in same blockRow
+    //   - yClass 3: upper corners in blockRow, lower in blockRow+1
+    //
+    // We store only the x-block masks (8 bits each for 8 x-blocks) and compute
+    // the full 64-bit mask at runtime by shifting to the correct block-row.
+    //
+    // Index encoding: (yClass << 6) | (xPair << 2) | changeState
+    // changeState: 0=none, 1=right, 2=left, 3=both
+    //
+    // This reduces LUT from 8KB (512 × 16 bytes) to 512 bytes (256 × 2 bytes)
+
+    for (int yClass = 0; yClass < 4; yClass++) {
+        for (int baseX = 0; baseX < TILE_WIDTH; baseX += 2) {
+            int xPair = baseX >> 1;
+
+            // Compute x-block masks for each cell
+            // Right cell at baseX, left cell at baseX+1
+            // Corner x-positions: x-1 and x+1
+            int rx = baseX;      // Right cell x
+            int lx = baseX + 1;  // Left cell x
+
+            // X-block index is x >> 2 (0-7 for 32-wide tile)
+            // Each cell affects blocks at (x-1)>>2 and (x+1)>>2
+            // Mask with & 31 to handle wraparound for edge cases (though runtime check excludes them)
+            int rxLeftBlock = ((rx - 1) & 31) >> 2;
+            int rxRightBlock = ((rx + 1) & 31) >> 2;
+            uint8_t rightMask = static_cast<uint8_t>((1 << rxLeftBlock) | (1 << rxRightBlock));
+
+            int lxLeftBlock = ((lx - 1) & 31) >> 2;
+            int lxRightBlock = ((lx + 1) & 31) >> 2;
+            uint8_t leftMask = static_cast<uint8_t>((1 << lxLeftBlock) | (1 << lxRightBlock));
+
+            // Precompute all 4 change state combinations
+            for (int changeState = 0; changeState < 4; changeState++) {
+                int lutIdx = (yClass << 6) | (xPair << 2) | changeState;
+
+                uint8_t combined = 0;
+                if (changeState & 1) combined |= rightMask;  // Right changed
+                if (changeState & 2) combined |= leftMask;   // Left changed
+
+                // Upper and lower corners have the same x-block pattern
+                // (only the block-row differs, computed at runtime)
+                compactCornerMaskLUT[lutIdx] = {combined, combined};
+            }
+        }
+    }
+}
+
+void VLife::populateToggleMaskLUT() {
+    // Precompute XOR masks for cell state toggling
+    // Index: (pairInWord << 2) | pairChangeBits
+    //   pairInWord: 0-7 (position within 64-bit word)
+    //   pairChangeBits: (leftChanged << 1) | rightChanged (0-3)
+    //
+    // Bit positions:
+    //   leftCellBitPos = (7 - pairInWord) * 8 + 7
+    //   rightCellBitPos = (7 - pairInWord) * 8 + 3
+
+    for (int pairInWord = 0; pairInWord < 8; pairInWord++) {
+        int leftCellBitPos = (7 - pairInWord) * 8 + 7;
+        int rightCellBitPos = (7 - pairInWord) * 8 + 3;
+
+        for (int pairChangeBits = 0; pairChangeBits < 4; pairChangeBits++) {
+            int leftChanged = (pairChangeBits >> 1) & 1;
+            int rightChanged = pairChangeBits & 1;
+
+            uint64_t mask = (static_cast<uint64_t>(leftChanged) << leftCellBitPos) |
+                           (static_cast<uint64_t>(rightChanged) << rightCellBitPos);
+
+            int idx = (pairInWord << 2) | pairChangeBits;
+            toggleMaskLUT[idx].mask = mask;
+        }
+    }
+}
+
+void VLife::populateStateDeltaLUT() {
+    // Precompute state/delta values for cell pair updates
+    // Index: (pairChangeBits << 2) | (leftWasAlive << 1) | rightWasAlive
+    //   pairChangeBits: (leftChanged << 1) | rightChanged (0-3)
+    //   leftWasAlive: 0 or 1
+    //   rightWasAlive: 0 or 1
+    //
+    // Computes:
+    //   lutIndex = (leftState << 2) | rightState  (for deltaLUT lookup)
+    //   combinedDelta = leftDelta + rightDelta    (for liveCount update)
+    //   changeState = (leftChanged << 1) | rightChanged  (for corner mask)
+    //
+    // Where:
+    //   state = (1 + wasAlive) * changed  (0=unchanged, 1=born, 2=died)
+    //   delta = changed - 2 * wasAlive * changed  (+1 if born, -1 if died, 0 if unchanged)
+
+    for (int pairChangeBits = 0; pairChangeBits < 4; pairChangeBits++) {
+        int leftChanged = (pairChangeBits >> 1) & 1;
+        int rightChanged = pairChangeBits & 1;
+
+        for (int aliveState = 0; aliveState < 4; aliveState++) {
+            int leftWasAlive = (aliveState >> 1) & 1;
+            int rightWasAlive = aliveState & 1;
+
+            // Compute state values: 0=unchanged, 1=born, 2=died
+            int leftState = (1 + leftWasAlive) * leftChanged;
+            int rightState = (1 + rightWasAlive) * rightChanged;
+
+            // Compute delta values: +1=born, -1=died, 0=unchanged
+            int leftDelta = leftChanged - 2 * leftWasAlive * leftChanged;
+            int rightDelta = rightChanged - 2 * rightWasAlive * rightChanged;
+
+            int idx = (pairChangeBits << 2) | aliveState;
+            stateDeltaLUT[idx].lutIndex = static_cast<uint8_t>((leftState << 2) | rightState);
+            stateDeltaLUT[idx].combinedDelta = static_cast<int8_t>(leftDelta + rightDelta);
+            stateDeltaLUT[idx].changeState = static_cast<uint8_t>(pairChangeBits);
+            stateDeltaLUT[idx].padding = 0;
+        }
     }
 }

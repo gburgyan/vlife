@@ -197,3 +197,58 @@ When `ENABLE_METRICS` is not set, all metrics macros compile to `((void)0)`, ens
 - **JSON**: Structured data with metadata and summary statistics
 
 See `docs/METRICS.md` for complete documentation including file formats, analysis examples, and architecture details.
+
+## Apple Silicon Hardware Counter Profiling
+
+VLife includes an optional hardware performance counter profiling system for Apple Silicon (M1/M2/M3) that provides cycle-accurate measurements for closed-loop performance optimization.
+
+### Quick Start
+
+**Important:** `ENABLE_KPERF_COUNTERS` and `ENABLE_METRICS` are independent. For accurate CPU profiling, do NOT enable `ENABLE_METRICS` as it adds per-generation overhead.
+
+```bash
+# Build with hardware counter support (no metrics overhead)
+cmake -DENABLE_KPERF_COUNTERS=ON -DENABLE_METRICS=OFF ..
+make VLifeCpuBenchmark
+
+# Run with sudo for hardware counter access
+sudo ./VLifeCpuBenchmark --pattern acorn --generations 1000 --output acorn_cpu
+
+# Timing-only mode (no sudo required)
+./VLifeCpuBenchmark --pattern acorn --generations 1000 --timing-only
+```
+
+### Key Metrics
+
+- **Cycles / Instructions**: CPU utilization and IPC (instructions per cycle)
+- **L1D Cache Misses**: Data cache pressure (misses per 1000 instructions)
+- **Branch Mispredictions**: Control flow predictability (mispredictions per 1000 instructions)
+
+### Output Format
+
+CSV with one row per generation:
+```csv
+generation,cycles,instructions,l1d_misses,branch_mispred,ipc,miss_rate_per_1k,mispred_rate_per_1k,duration_ns,live_cells,tiles
+```
+
+### Requirements
+
+- macOS on Apple Silicon (M1/M2/M3)
+- sudo access for kperf framework
+- Build with `-DENABLE_KPERF_COUNTERS=ON`
+
+### Key Files
+
+- `src/vlife/AppleSiliconCounters.h`: Counter access wrapper
+- `src/vlife/AppleSiliconCounters.cpp`: kperf framework implementation
+- `tests/benchmark/CpuCounterBenchmark.cpp`: Benchmark tool
+- `docs/PERFORMANCE-OPTIMIZATIONS.md`: Section 11 - Complete documentation
+
+### Closed-Loop Workflow
+
+1. **Capture baseline**: `sudo ./VLifeCpuBenchmark --output /tmp/before`
+2. **Analyze**: Identify bottlenecks (low IPC, high cache misses, mispredictions)
+3. **Optimize**: Make targeted code changes
+4. **Validate**: `sudo ./VLifeCpuBenchmark --output /tmp/after`, compare results
+
+See `docs/PERFORMANCE-OPTIMIZATIONS.md` Section 11 for complete documentation including interpretation guide and troubleshooting.

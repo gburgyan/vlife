@@ -4,24 +4,53 @@
 
 #pragma once
 
-#include <mutex>
 #include "VLife.h"
 
 #define TILE_CELLS TILE_WIDTH *TILE_HEIGHT
 #define TILE_BYTES TILE_CELLS / 2
 #define TILE_64S TILE_BYTES / 8
-#define TILE_CHANGE_64S TILE_CELLS / 64
 #define TILE_64S_WIDTH TILE_WIDTH / 64
 #define TILE_64S_HEIGHT TILE_HEIGHT / 64
 
-// Eviction optimization: periodic scan with age threshold
-// EVICTION_CHECK_INTERVAL must be a power of 2 for fast modulo via bitmask
-static constexpr size_t EVICTION_CHECK_INTERVAL = 16;  // Check every N generations
-static constexpr uint8_t EVICTION_AGE_THRESHOLD = 4;   // Evict if empty for N generations
-
 // Align Tile to 64-byte cache line boundaries to prevent false sharing
 // when multiple threads update adjacent tiles in parallel
+//
+// Field layout optimized for cache efficiency:
+// - First cache line: hot-path metadata (wasModified, rowChangeMask, liveCount, etc.)
+// - Next 8 cache lines: cells[] array (512 bytes)
+// - Next 2 cache lines: changes[] array (128 bytes)
+// - Final cache line(s): cold metadata (board pointer, coordinates, neighbor pointers)
 class alignas(64) Tile {
+    // === Hot path metadata (first cache line) ===
+    // Block-level modification tracking (64 bits = 8x8 blocks of 4x4 cells each)
+    // Bit index: ((y & 0x1C) << 1) | (x >> 2)
+    // Set in Phase 2 when neighbor counts updated; cleared at Phase 1 start
+    uint64_t wasModified{~0ULL};  // Initialize to all-modified for first gen
+
+    uint32_t rowChangeMask{0};  // Bit N set means row N has changes, for quick Phase 2 skip
+    uint32_t liveCount; // Tracks the number of live cells in this tile
+
+    // Per-row activity tracking for tile eviction (8 bits = 8 block rows)
+    // Bit is set when content found during Phase 1 scan
+    // Rows with rowMask == 0 preserve their activity bit (content unchanged)
+    uint8_t activityRows{0};
+
+    // Generation timestamp for eviction optimization
+    // Tracks when the tile was last modified (wraps at 256, uses modular arithmetic)
+    uint8_t lastModifiedGeneration{0};
+
+    // Atomic flag to prevent duplicate Phase 1 queue entries
+    // Set by tryQueueForPhase1(), cleared by clearQueueFlag()
+    std::atomic<uint8_t> queuedForPhase1{0};
+    // 5 bytes padding to align to 8 bytes (implicit)
+
+    // === Cell data (8 cache lines, 512 bytes) ===
+    uint64_t cells[TILE_64S]{};
+
+    // === Change tracking (2 cache lines, 128 bytes) ===
+    uint32_t changes[TILE_HEIGHT]{};  // One word per row, 16 cell pairs × 2 bits = 32 bits
+
+    // === Cold metadata (accessed less frequently) ===
     VLife *board;
     int32_t tileX;
     int32_t tileY;
@@ -30,38 +59,11 @@ class alignas(64) Tile {
     Tile *right;
     Tile *up;
     Tile *down;
-    Tile *upLeft;
-    Tile *upRight;
-    Tile *downLeft;
-    Tile *downRight;
-
-    uint64_t cells[TILE_64S]{};
-    uint64_t changes[TILE_CHANGE_64S]{};
-    uint64_t changesAccumulator{0};  // OR of all changeBuff values, for quick Phase 2 skip
-    uint32_t liveCount; // Tracks the number of live cells in this tile
-
-    // Per-row activity tracking for tile eviction (8 bits = 8 block rows)
-    // Bit is set when content found during Phase 1 scan
-    // Rows with rowMask == 0 preserve their activity bit (content unchanged)
-    uint8_t activityRows{0};
-
-    // Block-level modification tracking (64 bits = 8x8 blocks of 4x4 cells each)
-    // Bit index: ((y & 0x1C) << 1) | (x >> 2)
-    // Set in Phase 2 when neighbor counts updated; cleared at Phase 1 start
-    uint64_t wasModified{~0ULL};  // Initialize to all-modified for first gen
-
-    // Generation timestamp for eviction optimization
-    // Tracks when the tile was last modified (wraps at 256, uses modular arithmetic)
-    uint8_t lastModifiedGeneration{0};
-
-    std::mutex tileMutex;
 
 public:
     Tile(VLife *board, int32_t tileX, int32_t tileY);
 
-    void setNeighbor(Tile *tile, int dx, int dy);
-
-    void runGenerationPrepare();
+    bool runGenerationPrepare();
 
     // Template parameter controls whether atomic operations are used for boundary cells:
     // - UseAtomics=true: Use CAS loops for boundary updates (required for parallel execution)
@@ -72,11 +74,8 @@ public:
 #ifdef VLIFE_AVX512_ENABLED
     // AVX-512 optimized version of runGenerationPrepare
     // Uses direct SIMD computation instead of LUT lookups
-    void runGenerationPrepare_AVX512();
+    bool runGenerationPrepare_AVX512();
 #endif
-
-    void lockTile();
-    void unlockTile();
 
     // Cell access methods
     bool getCell(uint32_t localX, uint32_t localY) const;
@@ -98,11 +97,6 @@ public:
     // baseX is the x coordinate of the right cell in the pair (even x)
     void applyVerticalDeltas(int baseX, int y, const int8_t* deltas);
 
-    // Apply deltas for a cell pair using LUT (optimized version)
-    // Template parameter controls atomic vs non-atomic for cross-tile updates
-    template<bool UseAtomics = true>
-    void applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& deltas);
-
     // Atomic versions for cross-tile updates (thread-safe for parallel processing)
     // These use compare-and-swap to safely update neighbor counts when
     // multiple tiles are processed in parallel
@@ -119,9 +113,46 @@ public:
     inline void nonAtomicApplyDelta(int x, int y, int8_t delta);
     void nonAtomicAddBoundaryDeltas(int y, const int8_t* deltaArray);
 
-    // Helper to ensure a neighbor tile exists, creating it on demand if needed
-    // Returns the neighbor tile pointer (never null after call)
-    Tile* ensureNeighborTile(int dx, int dy);
+    // Column delta methods: apply accumulated deltas to a vertical column
+    // Used for buffered left/right neighbor updates (one queue check per neighbor)
+    void atomicAddColumnDeltas(int x, const int8_t* deltaArray);
+    void nonAtomicAddColumnDeltas(int x, const int8_t* deltaArray);
+
+    // Direction-specific inline helpers to ensure neighbor tiles exist
+    // These replace the generic ensureNeighborTile(dx, dy) to eliminate
+    // parameter encoding/decoding overhead at call sites
+    inline Tile* ensureLeftTile() {
+        if (!left) board->getTile(tileX - 1, tileY);
+        return left;
+    }
+    inline Tile* ensureRightTile() {
+        if (!right) board->getTile(tileX + 1, tileY);
+        return right;
+    }
+    inline Tile* ensureUpTile() {
+        if (!up) board->getTile(tileX, tileY - 1);
+        return up;
+    }
+    inline Tile* ensureDownTile() {
+        if (!down) board->getTile(tileX, tileY + 1);
+        return down;
+    }
+    inline Tile* ensureUpLeftTile() {
+        Tile* upTile = ensureUpTile();
+        return upTile ? upTile->ensureLeftTile() : nullptr;
+    }
+    inline Tile* ensureUpRightTile() {
+        Tile* upTile = ensureUpTile();
+        return upTile ? upTile->ensureRightTile() : nullptr;
+    }
+    inline Tile* ensureDownLeftTile() {
+        Tile* downTile = ensureDownTile();
+        return downTile ? downTile->ensureLeftTile() : nullptr;
+    }
+    inline Tile* ensureDownRightTile() {
+        Tile* downTile = ensureDownTile();
+        return downTile ? downTile->ensureRightTile() : nullptr;
+    }
 
     // Getters for tile coordinates
     int32_t getTileX() const { return tileX; }
@@ -132,10 +163,10 @@ public:
     Tile *getRightTile() const { return right; }
     Tile *getUpTile() const { return up; }
     Tile *getDownTile() const { return down; }
-    Tile *getUpLeftTile() const { return upLeft; }
-    Tile *getUpRightTile() const { return upRight; }
-    Tile *getDownLeftTile() const { return downLeft; }
-    Tile *getDownRightTile() const { return downRight; }
+    Tile *getUpLeftTile() const { return up ? up->left : nullptr; }
+    Tile *getUpRightTile() const { return up ? up->right : nullptr; }
+    Tile *getDownLeftTile() const { return down ? down->left : nullptr; }
+    Tile *getDownRightTile() const { return down ? down->right : nullptr; }
     
     // Getter for the number of live cells
     uint32_t getLiveCount() const { return liveCount; }
@@ -149,22 +180,10 @@ public:
         activityRows |= (1 << blockRow);
     }
 
-    // Check if the tile has any potential activity (live cells or neighbor counts)
-    // Used for tile-level skip optimization
-    inline bool hasActivity() const {
-        return activityRows != 0;
-    }
-
-    // Check if the tile needs Phase 1 processing
-    // A tile needs processing if it has activity OR was modified by Phase 2
-    inline bool needsPhase1Processing() const {
-        return activityRows != 0 || wasModified != 0;
-    }
-
     // Check if the tile has changes to apply in Phase 2
     // Used for Phase 2 queue optimization to skip tiles with no changes
     inline bool hasChanges() const {
-        return changesAccumulator != 0;
+        return rowChangeMask != 0;
     }
 
     // Check if the tile is safe to evict
@@ -219,7 +238,7 @@ public:
 
         // Upper-left corner
         if (topOut && leftOut) {
-            if (upLeft) { upLeft->atomicMarkBlockModified(leftX, topY); }
+            if (up && up->left) { up->left->atomicMarkBlockModified(leftX, topY); }
         } else if (topOut) {
             if (up) { up->atomicMarkBlockModified(leftX, topY); }
         } else if (leftOut) {
@@ -230,7 +249,7 @@ public:
 
         // Upper-right corner
         if (topOut && rightOut) {
-            if (upRight) { upRight->atomicMarkBlockModified(rightX, topY); }
+            if (up && up->right) { up->right->atomicMarkBlockModified(rightX, topY); }
         } else if (topOut) {
             if (up) { up->atomicMarkBlockModified(rightX, topY); }
         } else if (rightOut) {
@@ -241,7 +260,7 @@ public:
 
         // Lower-left corner
         if (bottomOut && leftOut) {
-            if (downLeft) { downLeft->atomicMarkBlockModified(leftX, bottomY); }
+            if (down && down->left) { down->left->atomicMarkBlockModified(leftX, bottomY); }
         } else if (bottomOut) {
             if (down) { down->atomicMarkBlockModified(leftX, bottomY); }
         } else if (leftOut) {
@@ -252,7 +271,7 @@ public:
 
         // Lower-right corner
         if (bottomOut && rightOut) {
-            if (downRight) { downRight->atomicMarkBlockModified(rightX, bottomY); }
+            if (down && down->right) { down->right->atomicMarkBlockModified(rightX, bottomY); }
         } else if (bottomOut) {
             if (down) { down->atomicMarkBlockModified(rightX, bottomY); }
         } else if (rightOut) {
@@ -262,11 +281,140 @@ public:
         }
     }
 
+    // Mark corner blocks for a cell pair at (baseX, baseX+1, localY)
+    // Optimized to handle both cells together with batched atomic operations
+    // changeState: bit 0 = right cell (baseX) changed, bit 1 = left cell (baseX+1) changed
+    inline void markChangeCornersForPair(int baseX, int localY, uint8_t changeState) {
+        if (changeState == 0) return;
+
+        // Boundary conditions for the pair's corner area:
+        // Right cell (baseX) corners at baseX-1, baseX+1
+        // Left cell (baseX+1) corners at baseX, baseX+2
+        bool leftOut = (baseX - 1) < 0;              // baseX == 0
+        bool rightOut = (baseX + 2) >= TILE_WIDTH;   // baseX == 30
+        bool topOut = (localY - 1) < 0;              // localY == 0
+        bool bottomOut = (localY + 1) >= TILE_HEIGHT; // localY == 31
+
+        // Fast path: all corners are interior
+        if (!leftOut && !rightOut && !topOut && !bottomOut) {
+            int y1 = localY - 1;
+            int y2 = localY + 1;
+            int yMask1 = (y1 & 0x1C) << 1;
+            int yMask2 = (y2 & 0x1C) << 1;
+
+            uint64_t mask = 0;
+            if (changeState & 1) {  // Right cell changed: corners at baseX-1, baseX+1
+                int bx0 = (baseX - 1) >> 2;
+                int bx1 = (baseX + 1) >> 2;
+                mask |= (1ULL << (yMask1 | bx0)) | (1ULL << (yMask1 | bx1));
+                mask |= (1ULL << (yMask2 | bx0)) | (1ULL << (yMask2 | bx1));
+            }
+            if (changeState & 2) {  // Left cell changed: corners at baseX, baseX+2
+                int bx0 = baseX >> 2;
+                int bx1 = (baseX + 2) >> 2;
+                mask |= (1ULL << (yMask1 | bx0)) | (1ULL << (yMask1 | bx1));
+                mask |= (1ULL << (yMask2 | bx0)) | (1ULL << (yMask2 | bx1));
+            }
+            wasModified |= mask;
+            return;
+        }
+
+        // Slow path: handle boundaries with batched atomics
+        // Accumulate masks per destination tile, then apply with single atomic per tile
+        uint64_t localMask = 0;
+        uint64_t upMask = 0, downMask = 0, leftMask = 0, rightMask = 0;
+        uint64_t upLeftMask = 0, upRightMask = 0, downLeftMask = 0, downRightMask = 0;
+
+        // Adjusted y-coordinates for cross-tile corners
+        int topY = topOut ? (TILE_HEIGHT - 1) : (localY - 1);
+        int bottomY = bottomOut ? 0 : (localY + 1);
+        int yMaskTop = (topY & 0x1C) << 1;
+        int yMaskBottom = (bottomY & 0x1C) << 1;
+
+        // x-positions affected by each cell:
+        // baseX-1: right cell (bit 0), baseX: left cell (bit 1)
+        // baseX+1: right cell (bit 0), baseX+2: left cell (bit 1)
+        const int xPositions[4] = {baseX - 1, baseX, baseX + 1, baseX + 2};
+        const uint8_t xAffected[4] = {1, 2, 1, 2};  // Which changeState bit affects each x
+
+        for (int i = 0; i < 4; i++) {
+            if (!(changeState & xAffected[i])) continue;
+
+            int cornerX = xPositions[i];
+            bool xLeft = cornerX < 0;
+            bool xRight = cornerX >= TILE_WIDTH;
+            int adjX = xLeft ? (TILE_WIDTH - 1) : (xRight ? 0 : cornerX);
+            int blockXBits = adjX >> 2;
+
+            // Top row corners (y - 1)
+            {
+                int blockIdx = yMaskTop | blockXBits;
+                uint64_t bit = 1ULL << blockIdx;
+                if (topOut && xLeft) {
+                    upLeftMask |= bit;
+                } else if (topOut && xRight) {
+                    upRightMask |= bit;
+                } else if (topOut) {
+                    upMask |= bit;
+                } else if (xLeft) {
+                    leftMask |= bit;
+                } else if (xRight) {
+                    rightMask |= bit;
+                } else {
+                    localMask |= bit;
+                }
+            }
+
+            // Bottom row corners (y + 1)
+            {
+                int blockIdx = yMaskBottom | blockXBits;
+                uint64_t bit = 1ULL << blockIdx;
+                if (bottomOut && xLeft) {
+                    downLeftMask |= bit;
+                } else if (bottomOut && xRight) {
+                    downRightMask |= bit;
+                } else if (bottomOut) {
+                    downMask |= bit;
+                } else if (xLeft) {
+                    leftMask |= bit;
+                } else if (xRight) {
+                    rightMask |= bit;
+                } else {
+                    localMask |= bit;
+                }
+            }
+        }
+
+        // Apply accumulated masks with single atomic operation per tile
+        if (localMask) wasModified |= localMask;
+        if (upMask && up) __atomic_fetch_or(&up->wasModified, upMask, __ATOMIC_RELAXED);
+        if (downMask && down) __atomic_fetch_or(&down->wasModified, downMask, __ATOMIC_RELAXED);
+        if (leftMask && left) __atomic_fetch_or(&left->wasModified, leftMask, __ATOMIC_RELAXED);
+        if (rightMask && right) __atomic_fetch_or(&right->wasModified, rightMask, __ATOMIC_RELAXED);
+        if (upLeftMask && up && up->left) __atomic_fetch_or(&up->left->wasModified, upLeftMask, __ATOMIC_RELAXED);
+        if (upRightMask && up && up->right) __atomic_fetch_or(&up->right->wasModified, upRightMask, __ATOMIC_RELAXED);
+        if (downLeftMask && down && down->left) __atomic_fetch_or(&down->left->wasModified, downLeftMask, __ATOMIC_RELAXED);
+        if (downRightMask && down && down->right) __atomic_fetch_or(&down->right->wasModified, downRightMask, __ATOMIC_RELAXED);
+    }
+
     // Getter for last modified generation (for eviction logic)
     uint8_t getLastModifiedGeneration() const { return lastModifiedGeneration; }
 
     // Update the last modified generation timestamp
     void updateLastModified(uint8_t currentGen) { lastModifiedGeneration = currentGen; }
+
+    // Phase 1 queue helpers - atomic to avoid duplicate queue entries in parallel Phase 2
+    // Returns true if this tile was successfully queued (first to claim), false if already queued
+    inline bool tryQueueForPhase1() {
+        uint8_t expected = 0;
+        return queuedForPhase1.compare_exchange_strong(expected, 1,
+            std::memory_order_relaxed, std::memory_order_relaxed);
+    }
+
+    // Clear the queue flag - called at start of Phase 1 when processing this tile
+    inline void clearQueueFlag() {
+        queuedForPhase1.store(0, std::memory_order_relaxed);
+    }
 
     // Friend declarations to allow access to private members
     friend class VLife;

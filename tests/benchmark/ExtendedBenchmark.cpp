@@ -37,7 +37,60 @@ struct BenchmarkResult {
     double cellUpdatesPerSec;  // CUpS = population * gen/sec
 };
 
-BenchmarkResult runBenchmarkWithStats(
+// Global flag for stddev mode - set from main()
+static bool g_stddevMode = false;
+
+// Simple mode: time entire loop, minimal overhead
+BenchmarkResult runBenchmarkSimple(
+    VLife& board,
+    const std::string& name,
+    int warmupGens,
+    int measuredGens,
+    size_t estPopulation = 0,
+    size_t estChanges = 0
+) {
+    // Warmup phase
+    for (int i = 0; i < warmupGens; i++) {
+        board.runGeneration();
+    }
+
+    size_t startTiles = board.getTileCount();
+
+    // Measurement - single timing around entire loop
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < measuredGens; i++) {
+        board.runGeneration();
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+
+    double totalMicros = std::chrono::duration<double, std::micro>(end - start).count();
+
+    BenchmarkResult result;
+    result.name = name;
+    result.avgMicros = totalMicros / measuredGens;
+    result.genPerSec = 1000000.0 / result.avgMicros;
+    result.finalTiles = board.getTileCount();
+    result.peakTiles = std::max(startTiles, result.finalTiles);
+    result.estimatedPopulation = estPopulation;
+    result.estimatedChangesPerGen = estChanges;
+    // min/max/stddev/CV not available in simple mode
+    result.minMicros = 0;
+    result.maxMicros = 0;
+    result.stdDevMicros = 0;
+    result.coeffOfVariation = 0;
+
+    // Cell updates per second
+    if (estPopulation > 0) {
+        result.cellUpdatesPerSec = estPopulation * result.genPerSec;
+    } else {
+        result.cellUpdatesPerSec = 0;
+    }
+
+    return result;
+}
+
+// Detailed mode: per-iteration timing for min/max/stddev analysis
+BenchmarkResult runBenchmarkWithStatsDetailed(
     VLife& board,
     const std::string& name,
     int warmupGens,
@@ -103,16 +156,36 @@ BenchmarkResult runBenchmarkWithStats(
     return result;
 }
 
+// Dispatch to simple or detailed based on global flag
+BenchmarkResult runBenchmarkWithStats(
+    VLife& board,
+    const std::string& name,
+    int warmupGens,
+    int measuredGens,
+    size_t estPopulation = 0,
+    size_t estChanges = 0
+) {
+    if (g_stddevMode) {
+        return runBenchmarkWithStatsDetailed(board, name, warmupGens, measuredGens,
+                                             estPopulation, estChanges);
+    } else {
+        return runBenchmarkSimple(board, name, warmupGens, measuredGens,
+                                  estPopulation, estChanges);
+    }
+}
+
 void printResult(const BenchmarkResult& r) {
     std::cout << std::fixed;
     std::cout << "\n" << r.name << ":\n";
     std::cout << std::setprecision(1);
     std::cout << "  Performance: " << r.genPerSec << " gen/sec ("
               << r.avgMicros << " μs/gen)\n";
-    std::cout << "  Timing: min=" << r.minMicros << " μs, max=" << r.maxMicros
-              << " μs, stddev=" << r.stdDevMicros << " μs\n";
-    std::cout << std::setprecision(3);
-    std::cout << "  Variability: CV=" << r.coeffOfVariation << "\n";
+    if (r.stdDevMicros > 0) {
+        std::cout << "  Timing: min=" << r.minMicros << " μs, max=" << r.maxMicros
+                  << " μs, stddev=" << r.stdDevMicros << " μs\n";
+        std::cout << std::setprecision(3);
+        std::cout << "  Variability: CV=" << r.coeffOfVariation << "\n";
+    }
     std::cout << "  Tiles: peak=" << r.peakTiles << ", final=" << r.finalTiles << "\n";
     if (r.estimatedPopulation > 0) {
         std::cout << "  Est. population: ~" << r.estimatedPopulation << " cells\n";
@@ -458,7 +531,8 @@ int main(int argc, char* argv[]) {
     // Parse arguments
     for (int i = 1; i < argc; i++) {
         std::string arg(argv[i]);
-        if (arg == "--density") { runDensity = true; runAll = false; }
+        if (arg == "--stddev") { g_stddevMode = true; }
+        else if (arg == "--density") { runDensity = true; runAll = false; }
         else if (arg == "--activity") { runActivity = true; runAll = false; }
         else if (arg == "--parallel") { runParallel = true; runAll = false; }
         else if (arg == "--methuselah") { runMethuselah = true; runAll = false; }
@@ -467,6 +541,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--help" || arg == "-h") {
             std::cout << "\nUsage: " << argv[0] << " [options]\n";
             std::cout << "Options:\n";
+            std::cout << "  --stddev      Enable per-iteration timing for min/max/stddev\n";
             std::cout << "  --density     Run density sweep benchmark\n";
             std::cout << "  --activity    Run activity-proportionality test\n";
             std::cout << "  --parallel    Run parallel scaling test\n";

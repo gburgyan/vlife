@@ -5,7 +5,6 @@
 #include "Tile.h"
 #include "VLifeMetrics.h"
 #include <cstring>
-#include <mutex>
 
 // Cross-platform prefetch and SIMD support
 #if defined(__x86_64__) || defined(_M_X64)
@@ -32,52 +31,13 @@
 #endif
 
 Tile::Tile(VLife *board, int32_t tileX, int32_t tileY) :
-    board(board), tileX(tileX), tileY(tileY), left(nullptr), right(nullptr), up(nullptr), down(nullptr),
-    upLeft(nullptr), upRight(nullptr), downLeft(nullptr), downRight(nullptr), liveCount(0), activityRows(0) {
+    liveCount(0),
+    board(board), tileX(tileX), tileY(tileY),
+    left(nullptr), right(nullptr), up(nullptr), down(nullptr) {
     // Initialize all cells to zero (dead)
     std::memset(cells, 0, sizeof(cells));
     std::memset(changes, 0, sizeof(changes));
 }
-
-void Tile::setNeighbor(Tile *tile, int dx, int dy) {
-    if (dx == -1 && dy == 0) {
-        left = tile;
-        if (tile) {
-            tile->right = this;
-        }
-    } else if (dx == 1 && dy == 0) {
-        right = tile;
-        if (tile) {
-            tile->left = this;
-        }
-    } else if (dx == 0 && dy == -1) {
-        up = tile;
-        if (tile) {
-            tile->down = this;
-        }
-    } else if (dx == 0 && dy == 1) {
-        down = tile;
-        if (tile) {
-            tile->up = this;
-        }
-    } else if (dx == -1 && dy == -1) {
-        upLeft = tile;
-        if (tile) tile->downRight = this;
-    } else if (dx == 1 && dy == -1) {
-        upRight = tile;
-        if (tile) tile->downLeft = this;
-    } else if (dx == -1 && dy == 1) {
-        downLeft = tile;
-        if (tile) tile->upRight = this;
-    } else if (dx == 1 && dy == 1) {
-        downRight = tile;
-        if (tile) tile->upLeft = this;
-    }
-}
-
-void Tile::lockTile() { tileMutex.lock(); }
-
-void Tile::unlockTile() { tileMutex.unlock(); }
 
 bool Tile::getCell(uint32_t localX, uint32_t localY) const {
     // Calculate cell index and bit position
@@ -196,33 +156,27 @@ void Tile::setCell(uint32_t localX, uint32_t localY, bool alive) {
                 }
                 adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             } else if (tileOffsetX == -1 && tileOffsetY == -1) {
-                adjTile = upLeft;
-                if (!adjTile) {
-                    adjTile = board->getTile(tileX - 1, tileY - 1);
-                    upLeft = adjTile;
-                }
+                // Diagonal: up-left - fetch directly from board
+                adjTile = board->getTile(tileX - 1, tileY - 1);
                 adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             } else if (tileOffsetX == 1 && tileOffsetY == -1) {
-                adjTile = upRight;
-                if (!adjTile) {
-                    adjTile = board->getTile(tileX + 1, tileY - 1);
-                    upRight = adjTile;
-                }
+                // Diagonal: up-right - fetch directly from board
+                adjTile = board->getTile(tileX + 1, tileY - 1);
                 adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             } else if (tileOffsetX == -1 && tileOffsetY == 1) {
-                adjTile = downLeft;
-                if (!adjTile) {
-                    adjTile = board->getTile(tileX - 1, tileY + 1);
-                    downLeft = adjTile;
-                }
+                // Diagonal: down-left - fetch directly from board
+                adjTile = board->getTile(tileX - 1, tileY + 1);
                 adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
             } else if (tileOffsetX == 1 && tileOffsetY == 1) {
-                adjTile = downRight;
-                if (!adjTile) {
-                    adjTile = board->getTile(tileX + 1, tileY + 1);
-                    downRight = adjTile;
-                }
+                // Diagonal: down-right - fetch directly from board
+                adjTile = board->getTile(tileX + 1, tileY + 1);
                 adjTile->updateNeighborCount(adjLocalX, adjLocalY, alive);
+            }
+
+            // Queue the adjacent tile for Phase 1 processing (if not already queued)
+            // This ensures cells that might be born/die due to neighbor count changes are processed
+            if (adjTile && adjTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(adjTile);
             }
         }
     }
@@ -251,14 +205,16 @@ void Tile::updateNeighborCount(int localX, int localY, bool increment) {
 
     // Mark this word as active (neighbor count change means potential birth)
     markWordActive(cellIdx);
+
+    // Mark this block as modified for Phase 1 processing
+    markBlockModified(localX, localY);
 }
 
-void Tile::runGenerationPrepare() {
+bool Tile::runGenerationPrepare() {
 #ifdef VLIFE_AVX512_ENABLED
     // Use AVX-512 optimized version if available
     if (CpuFeatures::hasAVX512Support()) {
-        runGenerationPrepare_AVX512();
-        return;
+        return runGenerationPrepare_AVX512();
     }
 #endif
 
@@ -267,12 +223,12 @@ void Tile::runGenerationPrepare() {
     uint64_t modMask = wasModified;
     wasModified = 0;  // Clear for this generation's Phase 2
 
-    // Reset changes accumulator for Phase 2 short-circuit optimization
-    changesAccumulator = 0;
+    // Reset row change mask for Phase 2 short-circuit optimization
+    rowChangeMask = 0;
 
     // Nothing modified - nothing to scan
     if (modMask == 0) {
-        return;
+        return false;
     }
 
     // Note: activityRows is preserved for unscanned rows (rowMask == 0)
@@ -437,8 +393,18 @@ void Tile::runGenerationPrepare() {
                 }
             }
 
-            changesAccumulator |= changeBuff;
-            changes[i >> 2] = changeBuff;
+            // Split 64-bit changeBuff into two 32-bit row values
+            // Upper 32 bits = row 0 (cells[i], cells[i+1])
+            // Lower 32 bits = row 1 (cells[i+2], cells[i+3])
+            int baseRow = i / 2;  // Each cell word pair covers one row
+            uint32_t row0Changes = static_cast<uint32_t>(changeBuff >> 32);
+            uint32_t row1Changes = static_cast<uint32_t>(changeBuff);
+
+            changes[baseRow] = row0Changes;
+            changes[baseRow + 1] = row1Changes;
+
+            if (row0Changes) rowChangeMask |= (1U << baseRow);
+            if (row1Changes) rowChangeMask |= (1U << (baseRow + 1));
         }  // end iter loop
     }  // end blockRow loop
 
@@ -588,11 +554,23 @@ void Tile::runGenerationPrepare() {
                 }
             }
 
-            changesAccumulator |= changeBuff;
-            changes[i >> 2] = changeBuff;
+            // Split 64-bit changeBuff into two 32-bit row values
+            // Upper 32 bits = row 0 (cells[i], cells[i+1])
+            // Lower 32 bits = row 1 (cells[i+2], cells[i+3])
+            int baseRow = i / 2;  // Each cell word pair covers one row
+            uint32_t row0Changes = static_cast<uint32_t>(changeBuff >> 32);
+            uint32_t row1Changes = static_cast<uint32_t>(changeBuff);
+
+            changes[baseRow] = row0Changes;
+            changes[baseRow + 1] = row1Changes;
+
+            if (row0Changes) rowChangeMask |= (1U << baseRow);
+            if (row1Changes) rowChangeMask |= (1U << (baseRow + 1));
         }  // end iter loop
     }  // end blockRow loop
 #endif
+
+    return rowChangeMask != 0;
 }
 
 #ifdef VLIFE_AVX512_ENABLED
@@ -607,7 +585,7 @@ void Tile::runGenerationPrepare() {
 // - Birth: NOT alive AND neighbors == 3
 //
 // The true neighbor count = stored count + paired cell's alive state
-void Tile::runGenerationPrepare_AVX512() {
+bool Tile::runGenerationPrepare_AVX512() {
     // Consume modification mask (no expansion needed - markChangeCorners already
     // marks all affected blocks during Phase 2)
     uint64_t modMask = wasModified;
@@ -616,12 +594,12 @@ void Tile::runGenerationPrepare_AVX512() {
     // Clear changes array
     std::memset(changes, 0, sizeof(changes));
 
-    // Reset changes accumulator for Phase 2 short-circuit optimization
-    changesAccumulator = 0;
+    // Reset row change mask for Phase 2 short-circuit optimization
+    rowChangeMask = 0;
 
     // Nothing modified - nothing to scan
     if (modMask == 0) {
-        return;
+        return false;
     }
 
     // Note: activityRows is preserved for unscanned rows (rowMask == 0)
@@ -749,7 +727,7 @@ void Tile::runGenerationPrepare_AVX512() {
 
         __mmask64 right_changes = (right_alive_mask & ~right_survive) | (~right_alive_mask & right_birth);
 
-        // Pack change bits into the changes array
+        // Pack change bits into the changes array (32-bit per row format)
         // Each byte becomes 2 bits: bit 1 = left changes, bit 0 = right changes
         //
         // IMPORTANT: The scalar code processes bytes in big-endian order within each
@@ -760,42 +738,49 @@ void Tile::runGenerationPrepare_AVX512() {
         //   Scalar byte index: 0 (MSB) -> mask bit 7, 1 -> mask bit 6, ..., 7 (LSB) -> mask bit 0
         //   So for cells[i], scalar byte j (from >>56, >>48, etc.) = memory byte (7-j) = mask bit i*8 + (7-j)
         //
-        // Change word layout (from scalar code):
-        //   Word 0 (cells[changeIdx*4+0]): bytes 0-7 -> change bits 62-48
-        //   Word 1 (cells[changeIdx*4+1]): bytes 0-7 -> change bits 46-32
-        //   Word 2 (cells[changeIdx*4+2]): bytes 0-7 -> change bits 30-16
-        //   Word 3 (cells[changeIdx*4+3]): bytes 0-7 -> change bits 14-0
-        int changeWordBase = byteOffset / 32;
+        // New 32-bit per row layout:
+        //   Row N: bits 31-16 from left-half cell word, bits 15-0 from right-half cell word
+        //
+        // Each 64-byte AVX block covers 4 rows (64 bytes / 16 bytes per row)
+        int baseRow = byteOffset / 16;  // 16 bytes = 1 row (32 cells, 2 bytes per cell pair... wait no, 1 byte per cell pair)
 
-        for (int cw = 0; cw < 2; cw++) {
-            uint64_t changeBuff = 0;
-            // Each change word covers 4 cell words = 32 bytes
-            int baseByteInBlock = cw * 32;  // 0 or 32 within this 64-byte AVX block
+        // Actually: 64 bytes = 64 cell pairs = 4 rows (16 cell pairs per row)
+        // So byteOffset/64 = block row, and each block has 4 cell rows
+        // baseRow = (byteOffset / 64) * 4 = blockRow * 4
+        int baseRowCorrected = blockRow * 4;
 
-            // Process 4 cell words (32 bytes) for this change word
-            for (int word = 0; word < 4; word++) {
+        for (int rowInBlock = 0; rowInBlock < 4; rowInBlock++) {
+            uint32_t rowChanges = 0;
+            // Each row has 16 bytes (16 cell pairs)
+            int baseByteInBlock = rowInBlock * 16;
+
+            // Process 16 bytes (2 cell words) for this row
+            for (int cellWord = 0; cellWord < 2; cellWord++) {
                 // Process 8 bytes of this cell word
                 for (int byteInWord = 0; byteInWord < 8; byteInWord++) {
                     // Scalar code processes from MSB to LSB (byte 7 down to byte 0 in memory)
-                    // byteInWord 0 = scalar's >>56 = memory byte 7
-                    // byteInWord 7 = scalar's &0xFF = memory byte 0
                     int memByteInWord = 7 - byteInWord;
-                    int maskBit = baseByteInBlock + word * 8 + memByteInWord;
+                    int maskBit = baseByteInBlock + cellWord * 8 + memByteInWord;
 
                     int leftChange = (left_changes >> maskBit) & 1;
                     int rightChange = (right_changes >> maskBit) & 1;
                     int changePair = (leftChange << 1) | rightChange;
 
-                    // Position in change word: word 0 starts at bit 62, each byte takes 2 bits
-                    int shift = 62 - (word * 16) - (byteInWord * 2);
-                    changeBuff |= static_cast<uint64_t>(changePair) << shift;
+                    // Position in 32-bit row word:
+                    // cellWord 0 contributes to bits 31-16, cellWord 1 to bits 15-0
+                    // Within each half, byte 0 (MSB) is at highest position
+                    int shift = 30 - (cellWord * 16) - (byteInWord * 2);
+                    rowChanges |= static_cast<uint32_t>(changePair) << shift;
                 }
             }
 
-            changesAccumulator |= changeBuff;
-            changes[changeWordBase + cw] = changeBuff;
+            int row = baseRowCorrected + rowInBlock;
+            changes[row] = rowChanges;
+            if (rowChanges) rowChangeMask |= (1U << row);
         }
     }
+
+    return rowChangeMask != 0;
 }
 #endif // VLIFE_AVX512_ENABLED
 
@@ -834,8 +819,13 @@ static inline void accumulateVerticalDeltasToArrays(int8_t* deltaArray, int base
 template<bool UseAtomics>
 void Tile::runGenerationChanges() {
     // Tile-level short-circuit: skip if Phase 1 detected no changes
-    if (changesAccumulator == 0) {
+    if (rowChangeMask == 0) {
         return;
+    }
+
+    // Queue self for next generation's Phase 1 (this tile will have modified cells)
+    if (tryQueueForPhase1()) {
+        board->addToNextPhase1Queue(this);
     }
 
     // Update the last modified timestamp for eviction tracking
@@ -851,12 +841,16 @@ void Tile::runGenerationChanges() {
     //   4. Apply deltas to all affected neighbors
 
     const PackedDeltas* deltaLUT = board->deltaLUT;
-    const bool useBufferedBoundary = board->isBufferedBoundaryEnabled();
+    const ToggleMaskEntry* toggleMaskLUT = board->toggleMaskLUT;
+    const StateDeltaEntry* stateDeltaLUT = board->stateDeltaLUT;
 
     // Stack-local buffers for neighbor boundary deltas (simple int8_t arrays)
     // Using int8_t avoids carry propagation issues that occur with packed nibbles
     int8_t upNeighborDeltas[TILE_WIDTH] = {0};    // For up tile's row 31
     int8_t downNeighborDeltas[TILE_WIDTH] = {0};  // For down tile's row 0
+    // Track whether left/right tiles have been queued for Phase 1
+    bool leftTileQueued = false;
+    bool rightTileQueued = false;
     // Corner deltas for diagonal neighbors (single cell each)
     int8_t upLeftCornerDelta = 0;    // For up-left tile's cell (31, 31)
     int8_t upRightCornerDelta = 0;   // For up-right tile's cell (0, 31)
@@ -864,56 +858,57 @@ void Tile::runGenerationChanges() {
     int8_t downRightCornerDelta = 0; // For down-right tile's cell (0, 0)
     bool hasUpDeltas = false;
     bool hasDownDeltas = false;
-    bool hasCornerDeltas = false;
 
-    for (int changeIdx = 0; changeIdx < TILE_CHANGE_64S; changeIdx++) {
-        // Prefetch upcoming change words
-        if (changeIdx + 2 < TILE_CHANGE_64S) {
-            PREFETCH(&changes[changeIdx + 2]);
-        }
+    // Use rowChangeMask to jump directly to rows with changes
+    uint32_t remainingRows = rowChangeMask;
+    while (remainingRows != 0) {
+        // Find lowest set bit (row with changes)
+        int localY = __builtin_ctz(remainingRows);
+        remainingRows &= remainingRows - 1;  // Clear the lowest set bit
 
-        uint64_t changeBits = changes[changeIdx];
+        uint32_t changeBits = changes[localY];
 
-        if (changeBits == 0) {
-            continue;
-        }
-
-        // Prefetch cell words for this change word's cells
-        int baseCellWordIdx = changeIdx * 4;
-        if (baseCellWordIdx + 8 < TILE_64S) {
-            PREFETCH(&cells[baseCellWordIdx + 4]);
-            PREFETCH(&cells[baseCellWordIdx + 5]);
-            PREFETCH(&cells[baseCellWordIdx + 6]);
-            PREFETCH(&cells[baseCellWordIdx + 7]);
+        // Prefetch cell words for this row's cells
+        // Each row has 2 cell words (cells 0-15 and 16-31)
+        int baseCellWordIdx = localY * 2;
+        if (baseCellWordIdx + 4 < TILE_64S) {
+            PREFETCH(&cells[baseCellWordIdx + 2]);
+            PREFETCH(&cells[baseCellWordIdx + 3]);
         }
 
         // Process only non-zero bit pairs using leading zero count to skip directly to them
         // This eliminates unpredictable branches from the inner loop
         while (changeBits != 0) {
-            // Find the position of the highest set bit
-            int leadingZeros = __builtin_clzll(changeBits);
-            // Convert to bit pair index (0-31, where 0 is bits 63:62)
+            // Find the position of the highest set bit in 32-bit word
+            int leadingZeros = __builtin_clz(changeBits);
+            // Convert to bit pair index (0-15, where 0 is bits 31:30)
             int bitPair = leadingZeros / 2;
-            int shiftAmount = 62 - (bitPair * 2);
+            int shiftAmount = 30 - (bitPair * 2);
 
             // Extract the 2-bit pair (guaranteed non-zero since we found a set bit)
             int pairChangeBits = (changeBits >> shiftAmount) & 0x3;
 
             // Clear this bit pair so we don't process it again
-            changeBits &= ~(0x3ULL << shiftAmount);
+            changeBits &= ~(0x3U << shiftAmount);
 
             // Calculate which cell word and bit position
-            int wordsFromStart = bitPair / 8;  // 8 cell pairs per 64-bit word
+            // bitPair 0-7 are in cell word 0 (left half), 8-15 are in cell word 1 (right half)
+            int cellWordInRow = bitPair / 8;  // 0 or 1
             int pairInWord = bitPair % 8;
 
-            int currentCellIdx = (changeIdx * 4) + wordsFromStart;
+            int currentCellIdx = localY * 2 + cellWordInRow;
             int leftCellBitPos = (7 - pairInWord) * 8 + 7;   // Left cell alive bit
             int rightCellBitPos = (7 - pairInWord) * 8 + 3;  // Right cell alive bit
 
-            // Calculate base cell index (right cell, even x)
-            int baseCellInTile = currentCellIdx * 16 + (7 - pairInWord) * 2;
-            int baseX = baseCellInTile % TILE_WIDTH;  // Right cell x (even)
-            int localY = baseCellInTile / TILE_WIDTH;
+            // Calculate base cell x coordinate (right cell, even x)
+            // Due to MSB-first byte processing in Phase 1, the bit layout is reversed:
+            // - bitPair 0 (bits 31-30) = x=14,15 (MSB byte of left half)
+            // - bitPair 7 (bits 17-16) = x=0,1 (LSB byte of left half)
+            // - bitPair 8 (bits 15-14) = x=30,31 (MSB byte of right half)
+            // - bitPair 15 (bits 1-0) = x=16,17 (LSB byte of right half)
+            // Branchless formula: baseX = 14 + (bitPair >> 3) * 32 - bitPair * 2
+            int correction = (bitPair >> 3) * 32;  // 0 for left half, 32 for right half
+            int baseX = 14 + correction - bitPair * 2;  // Right cell x (even)
 
             // Determine states for LUT index:
             // bits [3:2] = left cell: 00=unchanged, 01=became alive, 10=died
@@ -926,31 +921,31 @@ void Tile::runGenerationChanges() {
             // - delta = 1 - 2*wasAlive (+1 if born, -1 if died)
             // - Mask by change flag to zero out unchanged cells
 
-            int leftChanged = (pairChangeBits >> 1) & 1;
-            int rightChanged = pairChangeBits & 1;
+            // Extract the byte containing both cell states (one 64-bit shift instead of two)
+            // Cell byte layout: 0bLNNNRNNN where L=leftAlive(bit7), R=rightAlive(bit3), N=neighbor counts
+            int byteShift = (7 - pairInWord) * 8;
+            int cellByte = (cells[currentCellIdx] >> byteShift) & 0xFF;
 
-            // Read current alive states (0 or 1)
-            int leftWasAlive = (cells[currentCellIdx] >> leftCellBitPos) & 1;
-            int rightWasAlive = (cells[currentCellIdx] >> rightCellBitPos) & 1;
+            // Compute aliveState directly: (leftWasAlive << 1) | rightWasAlive
+            // Left is bit 7, right is bit 3 of the byte
+            int aliveState = ((cellByte >> 6) & 2) | ((cellByte >> 3) & 1);
 
-            // Toggle alive bits for changed cells using XOR mask
-            uint64_t toggleMask = (static_cast<uint64_t>(leftChanged) << leftCellBitPos) |
-                                  (static_cast<uint64_t>(rightChanged) << rightCellBitPos);
-            cells[currentCellIdx] ^= toggleMask;
+            // Toggle mask lookup: precomputed XOR mask based on pairInWord and change bits
+            int toggleIdx = (pairInWord << 2) | pairChangeBits;
+            cells[currentCellIdx] ^= toggleMaskLUT[toggleIdx].mask;
 
-            // Compute states branchlessly: state = (1 + wasAlive) if changed, 0 otherwise
-            int leftState = (1 + leftWasAlive) * leftChanged;
-            int rightState = (1 + rightWasAlive) * rightChanged;
-
-            // Compute liveCount deltas branchlessly: +1 if born, -1 if died, 0 if unchanged
-            // delta = (1 - 2*wasAlive) * changed = changed - 2*wasAlive*changed
-            int leftDelta = leftChanged - 2 * leftWasAlive * leftChanged;
-            int rightDelta = rightChanged - 2 * rightWasAlive * rightChanged;
-            liveCount += leftDelta + rightDelta;
+            // State/delta lookup: precomputed lutIndex, combinedDelta, and changeState
+            int stateIdx = (pairChangeBits << 2) | aliveState;
+            const StateDeltaEntry& sde = stateDeltaLUT[stateIdx];
+            liveCount += sde.combinedDelta;
 
 #ifdef VLIFE_METRICS_ENABLED
             // Track cells born (born = changed && !wasAlive => delta > 0)
             // Track cells died (died = changed && wasAlive => delta < 0)
+            int leftWasAlive = (aliveState >> 1) & 1;
+            int rightWasAlive = aliveState & 1;
+            int leftChanged = (pairChangeBits >> 1) & 1;
+            int rightChanged = pairChangeBits & 1;
             int leftBorn = leftChanged * (1 - leftWasAlive);   // 1 if born, 0 otherwise
             int leftDied = leftChanged * leftWasAlive;         // 1 if died, 0 otherwise
             int rightBorn = rightChanged * (1 - rightWasAlive);
@@ -961,163 +956,202 @@ void Tile::runGenerationChanges() {
 
             // Mark 4x4 block corners for next generation's Phase 1 skipping
             // Left cell is at (baseX+1, localY), right cell is at (baseX, localY)
-            if (leftChanged) {
-                markChangeCorners(baseX + 1, localY);
-            }
-            if (rightChanged) {
-                markChangeCorners(baseX, localY);
+            // Interior fast path uses compact precomputed LUT (512 bytes vs 8KB)
+            // Interior: all corner coordinates x-1, x+1, y-1, y+1 stay within [0, TILE_WIDTH-1/TILE_HEIGHT-1]
+            // For cell pair at baseX: right cell at baseX needs x in [1,30], left cell at baseX+1 needs x in [0,30]
+            // Combined: baseX >= 2 (so baseX-1 >= 1) and baseX <= 28 (so baseX+2 <= 30) and y in [1,30]
+            bool isInterior = (baseX >= 2 && baseX <= 28 && localY >= 1 && localY <= 30);
+            if (isInterior) {
+                // Compact LUT fast path: encodes y-symmetry and change state in index
+                // Single indexed lookup with no conditionals, then shift to correct block-row
+                int yClass = localY & 3;
+                int blockRow = localY >> 2;
+
+                int lutIdx = (yClass << 6) | ((baseX >> 1) << 2) | sde.changeState;
+                const CompactCornerMask& mask = board->compactCornerMaskLUT[lutIdx];
+
+                // Compute block-row positions for upper (y-1) and lower (y+1) corners
+                // yClass 0: upper is in blockRow-1, lower in blockRow
+                // yClass 3: upper is in blockRow, lower in blockRow+1
+                // yClass 1,2: both in same blockRow
+                int upperRow = blockRow - (yClass == 0);
+                int lowerRow = blockRow + (yClass == 3);
+
+                // Build 64-bit mask by shifting x-block masks to correct block-row positions
+                wasModified |= (static_cast<uint64_t>(mask.upper) << (upperRow * 8))
+                             | (static_cast<uint64_t>(mask.lower) << (lowerRow * 8));
+            } else {
+                // Slow path for boundary cells (~3%) - handle pair together
+                // Batches boundary checks and atomic operations for better performance
+                markChangeCornersForPair(baseX, localY, sde.changeState);
             }
 
-            // Build LUT index and apply deltas
-            int lutIndex = (leftState << 2) | rightState;
-            const PackedDeltas& deltas = deltaLUT[lutIndex];
+            // Apply deltas using precomputed LUT index
+            const PackedDeltas& deltas = deltaLUT[sde.lutIndex];
 
-            // Check if this cell pair is on a cross-tile boundary row and we're using buffered mode
+            // Check if this cell pair is on a cross-tile boundary
             bool isTopRow = (localY == 0);
             bool isBottomRow = (localY == TILE_HEIGHT - 1);
+            bool isLeftEdge = (baseX == 0);  // Cell pair at left edge (baseX=0 means x-1 is cross-tile)
+            bool isRightEdge = (baseX == TILE_WIDTH - 2);  // Cell pair at right edge (baseX+2 is cross-tile)
 
-            if (useBufferedBoundary && (isTopRow || isBottomRow)) {
-                // Buffered path: accumulate cross-tile vertical deltas locally
-                // Still apply same-row and within-tile vertical deltas immediately
+            // Buffered path: accumulate cross-tile deltas locally
+            // Buffer left/right same-row deltas for all rows
+            // Buffer up/down vertical deltas only for boundary rows
 
-                // Apply same-row horizontal neighbors (x-1 and x+2) - same logic as before
-                int leftNeighborX = baseX - 1;
-                int rightNeighborX = baseX + 2;
+            // Apply same-row horizontal neighbors (x-1 and x+2)
+            int leftNeighborX = baseX - 1;
+            int rightNeighborX = baseX + 2;
 
-                if (deltas.sameRow[0] != 0) {
-                    if (leftNeighborX >= 0) {
-                        applyDelta(leftNeighborX, localY, deltas.sameRow[0]);
-                    } else {
-                        Tile* leftTile = ensureNeighborTile(-1, 0);
-                        if (leftTile) {
-                            if constexpr (UseAtomics) {
-                                leftTile->atomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
-                            } else {
-                                leftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
-                            }
+            if (deltas.sameRow[0] != 0) {
+                if (leftNeighborX >= 0) {
+                    applyDelta(leftNeighborX, localY, deltas.sameRow[0]);
+                } else {
+                    // Apply directly to left tile's column 31
+                    Tile* leftTile = ensureLeftTile();
+                    if (!leftTileQueued) {
+                        VLIFE_METRICS_INC_BOUNDARY();
+                        if (leftTile->tryQueueForPhase1()) {
+                            board->addToNextPhase1Queue(leftTile);
                         }
+                        leftTileQueued = true;
+                    }
+                    if constexpr (UseAtomics) {
+                        leftTile->atomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
+                    } else {
+                        leftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
                     }
                 }
+            }
 
-                if (deltas.sameRow[1] != 0) {
-                    if (rightNeighborX < TILE_WIDTH) {
-                        applyDelta(rightNeighborX, localY, deltas.sameRow[1]);
-                    } else {
-                        Tile* rightTile = ensureNeighborTile(1, 0);
-                        if (rightTile) {
-                            if constexpr (UseAtomics) {
-                                rightTile->atomicApplyDelta(0, localY, deltas.sameRow[1]);
-                            } else {
-                                rightTile->nonAtomicApplyDelta(0, localY, deltas.sameRow[1]);
-                            }
+            if (deltas.sameRow[1] != 0) {
+                if (rightNeighborX < TILE_WIDTH) {
+                    applyDelta(rightNeighborX, localY, deltas.sameRow[1]);
+                } else {
+                    // Apply directly to right tile's column 0
+                    Tile* rightTile = ensureRightTile();
+                    if (!rightTileQueued) {
+                        VLIFE_METRICS_INC_BOUNDARY();
+                        if (rightTile->tryQueueForPhase1()) {
+                            board->addToNextPhase1Queue(rightTile);
                         }
+                        rightTileQueued = true;
+                    }
+                    if constexpr (UseAtomics) {
+                        rightTile->atomicApplyDelta(0, localY, deltas.sameRow[1]);
+                    } else {
+                        rightTile->nonAtomicApplyDelta(0, localY, deltas.sameRow[1]);
                     }
                 }
+            }
 
-                // Handle vertical deltas for row above (y-1)
-                if (isTopRow) {
-                    // Cross-tile to up neighbor's row 31: buffer it
-                    // Also handle corner cases for up-left and up-right tiles
-                    int8_t* leftCorner = (baseX == 0) ? &upLeftCornerDelta : nullptr;
-                    int8_t* rightCorner = (baseX == TILE_WIDTH - 2) ? &upRightCornerDelta : nullptr;
-                    accumulateVerticalDeltasToArrays(upNeighborDeltas, baseX, deltas.verticalRow,
-                                                      leftCorner, rightCorner);
-                    hasUpDeltas = true;
-                    if (leftCorner || rightCorner) hasCornerDeltas = true;
-                } else {
-                    // Within-tile row above
-                    applyVerticalDeltas(baseX, localY - 1, deltas.verticalRow);
-                }
-
-                // Handle vertical deltas for row below (y+1)
-                if (isBottomRow) {
-                    // Cross-tile to down neighbor's row 0: buffer it
-                    int8_t* leftCorner = (baseX == 0) ? &downLeftCornerDelta : nullptr;
-                    int8_t* rightCorner = (baseX == TILE_WIDTH - 2) ? &downRightCornerDelta : nullptr;
-                    accumulateVerticalDeltasToArrays(downNeighborDeltas, baseX, deltas.verticalRow,
-                                                      leftCorner, rightCorner);
-                    hasDownDeltas = true;
-                    if (leftCorner || rightCorner) hasCornerDeltas = true;
-                } else {
-                    // Within-tile row below
-                    applyVerticalDeltas(baseX, localY + 1, deltas.verticalRow);
-                }
+            // Handle vertical deltas for row above (y-1)
+            if (isTopRow) {
+                // Cross-tile to up neighbor's row 31: buffer it
+                // Also handle corner cases for up-left and up-right tiles
+                int8_t* leftCorner = isLeftEdge ? &upLeftCornerDelta : nullptr;
+                int8_t* rightCorner = isRightEdge ? &upRightCornerDelta : nullptr;
+                accumulateVerticalDeltasToArrays(upNeighborDeltas, baseX, deltas.verticalRow,
+                                                  leftCorner, rightCorner);
+                hasUpDeltas = true;
             } else {
-                // Original path: apply all deltas immediately
-                applyDeltasForCellPair<UseAtomics>(baseX, localY, deltas);
+                // Within-tile row above
+                applyVerticalDeltas(baseX, localY - 1, deltas.verticalRow);
+            }
+
+            // Handle vertical deltas for row below (y+1)
+            if (isBottomRow) {
+                // Cross-tile to down neighbor's row 0: buffer it
+                int8_t* leftCorner = isLeftEdge ? &downLeftCornerDelta : nullptr;
+                int8_t* rightCorner = isRightEdge ? &downRightCornerDelta : nullptr;
+                accumulateVerticalDeltasToArrays(downNeighborDeltas, baseX, deltas.verticalRow,
+                                                  leftCorner, rightCorner);
+                hasDownDeltas = true;
+            } else {
+                // Within-tile row below
+                applyVerticalDeltas(baseX, localY + 1, deltas.verticalRow);
             }
         }
     }
 
     // Flush buffered deltas to neighbor tiles
-    if (useBufferedBoundary) {
-        if (hasUpDeltas) {
-            Tile* upTile = ensureNeighborTile(0, -1);
-            if (upTile) {
-                VLIFE_METRICS_INC_BOUNDARY();
-                if constexpr (UseAtomics) {
-                    upTile->atomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
-                } else {
-                    upTile->nonAtomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
-                }
+    if (hasUpDeltas) {
+        Tile* upTile = ensureUpTile();
+        VLIFE_METRICS_INC_BOUNDARY();
+        if constexpr (UseAtomics) {
+            upTile->atomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
+        } else {
+            upTile->nonAtomicAddBoundaryDeltas(TILE_HEIGHT - 1, upNeighborDeltas);
+        }
+        // Queue neighbor for next Phase 1
+        if (upTile->tryQueueForPhase1()) {
+            board->addToNextPhase1Queue(upTile);
+        }
+
+        // Handle up-left corner using the upTile we already have
+        if (upLeftCornerDelta != 0) {
+            Tile* upLeftTile = upTile->ensureLeftTile();
+            VLIFE_METRICS_INC_BOUNDARY();
+            if constexpr (UseAtomics) {
+                upLeftTile->atomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
+            } else {
+                upLeftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
+            }
+            if (upLeftTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(upLeftTile);
             }
         }
-        if (hasDownDeltas) {
-            Tile* downTile = ensureNeighborTile(0, 1);
-            if (downTile) {
-                VLIFE_METRICS_INC_BOUNDARY();
-                if constexpr (UseAtomics) {
-                    downTile->atomicAddBoundaryDeltas(0, downNeighborDeltas);
-                } else {
-                    downTile->nonAtomicAddBoundaryDeltas(0, downNeighborDeltas);
-                }
+        // Handle up-right corner using the upTile we already have
+        if (upRightCornerDelta != 0) {
+            Tile* upRightTile = upTile->ensureRightTile();
+            VLIFE_METRICS_INC_BOUNDARY();
+            if constexpr (UseAtomics) {
+                upRightTile->atomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
+            } else {
+                upRightTile->nonAtomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
+            }
+            if (upRightTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(upRightTile);
             }
         }
-        // Handle corner deltas (diagonal neighbors)
-        if (hasCornerDeltas) {
-            if (upLeftCornerDelta != 0) {
-                Tile* upLeftTile = ensureNeighborTile(-1, -1);
-                if (upLeftTile) {
-                    VLIFE_METRICS_INC_BOUNDARY();
-                    if constexpr (UseAtomics) {
-                        upLeftTile->atomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
-                    } else {
-                        upLeftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, TILE_HEIGHT - 1, upLeftCornerDelta);
-                    }
-                }
+    }
+    if (hasDownDeltas) {
+        Tile* downTile = ensureDownTile();
+        VLIFE_METRICS_INC_BOUNDARY();
+        if constexpr (UseAtomics) {
+            downTile->atomicAddBoundaryDeltas(0, downNeighborDeltas);
+        } else {
+            downTile->nonAtomicAddBoundaryDeltas(0, downNeighborDeltas);
+        }
+        // Queue neighbor for next Phase 1
+        if (downTile->tryQueueForPhase1()) {
+            board->addToNextPhase1Queue(downTile);
+        }
+
+        // Handle down-left corner using the downTile we already have
+        if (downLeftCornerDelta != 0) {
+            Tile* downLeftTile = downTile->ensureLeftTile();
+            VLIFE_METRICS_INC_BOUNDARY();
+            if constexpr (UseAtomics) {
+                downLeftTile->atomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
+            } else {
+                downLeftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
             }
-            if (upRightCornerDelta != 0) {
-                Tile* upRightTile = ensureNeighborTile(1, -1);
-                if (upRightTile) {
-                    VLIFE_METRICS_INC_BOUNDARY();
-                    if constexpr (UseAtomics) {
-                        upRightTile->atomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
-                    } else {
-                        upRightTile->nonAtomicApplyDelta(0, TILE_HEIGHT - 1, upRightCornerDelta);
-                    }
-                }
+            if (downLeftTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(downLeftTile);
             }
-            if (downLeftCornerDelta != 0) {
-                Tile* downLeftTile = ensureNeighborTile(-1, 1);
-                if (downLeftTile) {
-                    VLIFE_METRICS_INC_BOUNDARY();
-                    if constexpr (UseAtomics) {
-                        downLeftTile->atomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
-                    } else {
-                        downLeftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, 0, downLeftCornerDelta);
-                    }
-                }
+        }
+        // Handle down-right corner using the downTile we already have
+        if (downRightCornerDelta != 0) {
+            Tile* downRightTile = downTile->ensureRightTile();
+            VLIFE_METRICS_INC_BOUNDARY();
+            if constexpr (UseAtomics) {
+                downRightTile->atomicApplyDelta(0, 0, downRightCornerDelta);
+            } else {
+                downRightTile->nonAtomicApplyDelta(0, 0, downRightCornerDelta);
             }
-            if (downRightCornerDelta != 0) {
-                Tile* downRightTile = ensureNeighborTile(1, 1);
-                if (downRightTile) {
-                    VLIFE_METRICS_INC_BOUNDARY();
-                    if constexpr (UseAtomics) {
-                        downRightTile->atomicApplyDelta(0, 0, downRightCornerDelta);
-                    } else {
-                        downRightTile->nonAtomicApplyDelta(0, 0, downRightCornerDelta);
-                    }
-                }
+            if (downRightTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(downRightTile);
             }
         }
     }
@@ -1202,31 +1236,37 @@ void Tile::applyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
 
         cells[cellIdx] = word;
     } else {
-        // Slow path: handle boundaries individually
-        // Uses applyDelta which routes boundary cells through atomicApplyDelta
-        for (int i = 0; i < 4; i++) {
-            int x = leftX + i;
-            int8_t delta = deltas[i];
+        // Slow path: handle boundaries with batched tile lookups
+        // Classify boundary crossings once
+        bool crossesLeft = (leftX < 0);
+        bool crossesRight = (rightX >= TILE_WIDTH);
 
-            if (delta == 0) continue;
+        // Handle left tile boundary first (single lookup, single queue check)
+        if (crossesLeft && deltas[0] != 0) {
+            Tile* leftTile = ensureLeftTile();
+            VLIFE_METRICS_INC_BOUNDARY();
+            leftTile->atomicApplyDelta(TILE_WIDTH - 1, y, deltas[0]);
+            if (leftTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(leftTile);
+            }
+        }
 
-            // Check bounds and handle accordingly
-            if (x >= 0 && x < TILE_WIDTH) {
-                applyDelta(x, y, delta);
-            } else if (x < 0) {
-                // Left tile boundary - create tile if needed, use atomic for safety
-                Tile* leftTile = ensureNeighborTile(-1, 0);
-                if (leftTile) {
-                    VLIFE_METRICS_INC_BOUNDARY();
-                    leftTile->atomicApplyDelta(TILE_WIDTH - 1, y, delta);
-                }
-            } else {
-                // Right tile boundary - create tile if needed, use atomic for safety
-                Tile* rightTile = ensureNeighborTile(1, 0);
-                if (rightTile) {
-                    VLIFE_METRICS_INC_BOUNDARY();
-                    rightTile->atomicApplyDelta(0, y, delta);
-                }
+        // Interior cells - use applyDelta for boundary row handling
+        int startIdx = crossesLeft ? 1 : 0;
+        int endIdx = crossesRight ? 3 : 4;
+        for (int i = startIdx; i < endIdx; i++) {
+            if (deltas[i] != 0) {
+                applyDelta(leftX + i, y, deltas[i]);
+            }
+        }
+
+        // Handle right tile boundary (single lookup, single queue check)
+        if (crossesRight && deltas[3] != 0) {
+            Tile* rightTile = ensureRightTile();
+            VLIFE_METRICS_INC_BOUNDARY();
+            rightTile->atomicApplyDelta(0, y, deltas[3]);
+            if (rightTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(rightTile);
             }
         }
     }
@@ -1280,15 +1320,19 @@ void Tile::atomicApplyVerticalDeltas(int baseX, int y, const int8_t* deltas) {
             atomicApplyDelta(x, y, delta);
         } else if (x < 0) {
             // Left tile boundary - create tile if needed
-            Tile* leftTile = ensureNeighborTile(-1, 0);
-            if (leftTile) {
-                leftTile->atomicApplyDelta(TILE_WIDTH - 1, y, delta);
+            Tile* leftTile = ensureLeftTile();
+            leftTile->atomicApplyDelta(TILE_WIDTH - 1, y, delta);
+            // Queue neighbor for next Phase 1
+            if (leftTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(leftTile);
             }
         } else {
             // Right tile boundary - create tile if needed
-            Tile* rightTile = ensureNeighborTile(1, 0);
-            if (rightTile) {
-                rightTile->atomicApplyDelta(0, y, delta);
+            Tile* rightTile = ensureRightTile();
+            rightTile->atomicApplyDelta(0, y, delta);
+            // Queue neighbor for next Phase 1
+            if (rightTile->tryQueueForPhase1()) {
+                board->addToNextPhase1Queue(rightTile);
             }
         }
     }
@@ -1332,120 +1376,24 @@ void Tile::nonAtomicAddBoundaryDeltas(int y, const int8_t* deltaArray) {
     }
 }
 
-// Helper to ensure a neighbor tile exists and return it
-// Creates the tile on demand if it doesn't exist
-Tile* Tile::ensureNeighborTile(int dx, int dy) {
-    Tile** neighbor;
-    if (dx == -1 && dy == 0) neighbor = &left;
-    else if (dx == 1 && dy == 0) neighbor = &right;
-    else if (dx == 0 && dy == -1) neighbor = &up;
-    else if (dx == 0 && dy == 1) neighbor = &down;
-    else if (dx == -1 && dy == -1) neighbor = &upLeft;
-    else if (dx == 1 && dy == -1) neighbor = &upRight;
-    else if (dx == -1 && dy == 1) neighbor = &downLeft;
-    else if (dx == 1 && dy == 1) neighbor = &downRight;
-    else return nullptr;
-
-    if (*neighbor == nullptr) {
-        *neighbor = board->getTile(tileX + dx, tileY + dy);
-    }
-    return *neighbor;
-}
-
-// Apply deltas for a cell pair using LUT
-template<bool UseAtomics>
-void Tile::applyDeltasForCellPair(int baseX, int localY, const PackedDeltas& deltas) {
-    // baseX is the x coordinate of the right cell (even x)
-    // The left cell is at baseX+1 (odd x)
-
-    // Apply same-row horizontal neighbors: x-1 and x+2
-    // sameRow[0] is for x-1 (only affected by right cell)
-    // sameRow[1] is for x+2 (only affected by left cell)
-
-    int leftNeighborX = baseX - 1;
-    int rightNeighborX = baseX + 2;
-
-    // Handle x-1 neighbor (same row)
-    if (deltas.sameRow[0] != 0) {
-        if (leftNeighborX >= 0) {
-            applyDelta(leftNeighborX, localY, deltas.sameRow[0]);
-        } else {
-            // Cross-tile: create tile if needed
-            Tile* leftTile = ensureNeighborTile(-1, 0);
-            if (leftTile) {
-                VLIFE_METRICS_INC_BOUNDARY();
-                if constexpr (UseAtomics) {
-                    leftTile->atomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
-                } else {
-                    leftTile->nonAtomicApplyDelta(TILE_WIDTH - 1, localY, deltas.sameRow[0]);
-                }
-            }
-        }
-    }
-
-    // Handle x+2 neighbor (same row)
-    if (deltas.sameRow[1] != 0) {
-        if (rightNeighborX < TILE_WIDTH) {
-            applyDelta(rightNeighborX, localY, deltas.sameRow[1]);
-        } else {
-            // Cross-tile: create tile if needed
-            Tile* rightTile = ensureNeighborTile(1, 0);
-            if (rightTile) {
-                VLIFE_METRICS_INC_BOUNDARY();
-                if constexpr (UseAtomics) {
-                    rightTile->atomicApplyDelta(0, localY, deltas.sameRow[1]);
-                } else {
-                    rightTile->nonAtomicApplyDelta(0, localY, deltas.sameRow[1]);
-                }
-            }
-        }
-    }
-
-    // Apply vertical deltas for row above (y-1)
-    if (localY > 0) {
-        applyVerticalDeltas(baseX, localY - 1, deltas.verticalRow);
-    } else {
-        // Cross-tile: create tile if needed
-        Tile* upTile = ensureNeighborTile(0, -1);
-        if (upTile) {
-            VLIFE_METRICS_INC_BOUNDARY();
-            if constexpr (UseAtomics) {
-                upTile->atomicApplyVerticalDeltas(baseX, TILE_HEIGHT - 1, deltas.verticalRow);
-            } else {
-                // For non-atomic, apply deltas individually
-                for (int i = 0; i < 4; i++) {
-                    int x = baseX - 1 + i;
-                    if (x >= 0 && x < TILE_WIDTH && deltas.verticalRow[i] != 0) {
-                        upTile->nonAtomicApplyDelta(x, TILE_HEIGHT - 1, deltas.verticalRow[i]);
-                    }
-                }
-            }
-        }
-    }
-
-    // Apply vertical deltas for row below (y+1)
-    if (localY < TILE_HEIGHT - 1) {
-        applyVerticalDeltas(baseX, localY + 1, deltas.verticalRow);
-    } else {
-        // Cross-tile: create tile if needed
-        Tile* downTile = ensureNeighborTile(0, 1);
-        if (downTile) {
-            VLIFE_METRICS_INC_BOUNDARY();
-            if constexpr (UseAtomics) {
-                downTile->atomicApplyVerticalDeltas(baseX, 0, deltas.verticalRow);
-            } else {
-                // For non-atomic, apply deltas individually
-                for (int i = 0; i < 4; i++) {
-                    int x = baseX - 1 + i;
-                    if (x >= 0 && x < TILE_WIDTH && deltas.verticalRow[i] != 0) {
-                        downTile->nonAtomicApplyDelta(x, 0, deltas.verticalRow[i]);
-                    }
-                }
-            }
+// Apply buffered column deltas from an int8_t array (atomic version)
+// This applies each non-zero delta with atomicApplyDelta
+void Tile::atomicAddColumnDeltas(int x, const int8_t* deltaArray) {
+    for (int y = 0; y < TILE_HEIGHT; y++) {
+        int8_t delta = deltaArray[y];
+        if (delta != 0) {
+            atomicApplyDelta(x, y, delta);
         }
     }
 }
 
-// Explicit template instantiations for applyDeltasForCellPair
-template void Tile::applyDeltasForCellPair<true>(int, int, const PackedDeltas&);
-template void Tile::applyDeltasForCellPair<false>(int, int, const PackedDeltas&);
+// Non-atomic version of atomicAddColumnDeltas for sequential execution
+void Tile::nonAtomicAddColumnDeltas(int x, const int8_t* deltaArray) {
+    for (int y = 0; y < TILE_HEIGHT; y++) {
+        int8_t delta = deltaArray[y];
+        if (delta != 0) {
+            nonAtomicApplyDelta(x, y, delta);
+        }
+    }
+}
+
