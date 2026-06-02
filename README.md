@@ -36,6 +36,8 @@ Most fast Life engines pick one trick and live with its trade-off. VLife layers 
 
 VLife's sweet spot is real-time visualization and chaotic-pattern exploration, where *consistent low latency* matters more than peak throughput on a packed grid.
 
+And the one weak spot — very dense grids — is largely self-correcting in practice. High density is unstable under Conway's rules: a cell with too many live neighbors dies of overcrowding, so a packed region thins out within a few generations toward the ~15–40% densities where Life actually lives. The worst case for VLife is therefore mostly transient; patterns naturally drift *toward* the activity-proportional regime where it excels.
+
 ---
 
 ## Quick start
