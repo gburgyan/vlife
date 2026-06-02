@@ -3,9 +3,15 @@ project(ConwayGameOfLife)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-set(CMAKE_AUTOUIC ON)
+
+# UI option — set to OFF to skip Qt5 dependency (benchmarks/tests still build)
+option(BUILD_UI "Build the Qt5 GUI application" ON)
+
+if(BUILD_UI)
+    set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTORCC ON)
+    set(CMAKE_AUTOUIC ON)
+endif()
 
 # Enable testing
 enable_testing()
@@ -16,6 +22,9 @@ option(AVX512_NATIVE "Use native AVX-512 intrinsics (requires CPU with AVX-512 s
 
 # Metrics collection option
 option(ENABLE_METRICS "Enable optional metrics collection for research/analysis" OFF)
+
+# Apple Silicon hardware counter profiling option
+option(ENABLE_KPERF_COUNTERS "Enable Apple Silicon hardware counter measurement (requires sudo)" OFF)
 
 if(ENABLE_AVX512)
     message(STATUS "AVX-512 optimizations enabled")
@@ -41,33 +50,35 @@ if(ENABLE_AVX512)
     endif()
 endif()
 
-# Try to find Qt via Homebrew
-execute_process(
-        COMMAND brew --prefix qt@5
-        RESULT_VARIABLE BREW_QT_RESULT
-        OUTPUT_VARIABLE BREW_QT_PREFIX
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-)
+if(BUILD_UI)
+    # Try to find Qt via Homebrew
+    execute_process(
+            COMMAND brew --prefix qt@5
+            RESULT_VARIABLE BREW_QT_RESULT
+            OUTPUT_VARIABLE BREW_QT_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
 
-if(BREW_QT_RESULT EQUAL 0)
-    list(APPEND CMAKE_PREFIX_PATH "${BREW_QT_PREFIX}")
-    message(STATUS "Found Qt5 via Homebrew at: ${BREW_QT_PREFIX}")
-else()
-    message(STATUS "Qt5 not found via Homebrew, checking system paths...")
+    if(BREW_QT_RESULT EQUAL 0)
+        list(APPEND CMAKE_PREFIX_PATH "${BREW_QT_PREFIX}")
+        message(STATUS "Found Qt5 via Homebrew at: ${BREW_QT_PREFIX}")
+    else()
+        message(STATUS "Qt5 not found via Homebrew, checking system paths...")
+    endif()
+
+    # Try common macOS Qt installation locations
+    list(APPEND CMAKE_PREFIX_PATH
+            "/usr/local/opt/qt@5"
+            "/opt/homebrew/opt/qt@5"
+            "/Users/${USER}/Qt/5.15.2/clang_64"
+            "/Users/${USER}/Qt/5.15.2/macos"
+            "/Users/${USER}/Qt/5.15/clang_64"
+            "/Users/${USER}/Qt/5.15/macos"
+    )
+
+    # Find Qt packages
+    find_package(Qt5 COMPONENTS Core Widgets REQUIRED)
 endif()
-
-# Try common macOS Qt installation locations
-list(APPEND CMAKE_PREFIX_PATH
-        "/usr/local/opt/qt@5"
-        "/opt/homebrew/opt/qt@5"
-        "/Users/${USER}/Qt/5.15.2/clang_64"
-        "/Users/${USER}/Qt/5.15.2/macos"
-        "/Users/${USER}/Qt/5.15/clang_64"
-        "/Users/${USER}/Qt/5.15/macos"
-)
-
-# Find Qt packages
-find_package(Qt5 COMPONENTS Core Widgets REQUIRED)
 
 # Find threading library
 find_package(Threads REQUIRED)
@@ -102,6 +113,8 @@ add_library(
         src/vlife/TilePool.h
         src/vlife/VLifeMetrics.cpp
         src/vlife/VLifeMetrics.h
+        src/vlife/AppleSiliconCounters.cpp
+        src/vlife/AppleSiliconCounters.h
 )
 
 # Link threading library and TBB (with malloc for memory_pool) to GameOfLifeLib
@@ -130,28 +143,40 @@ if(ENABLE_METRICS)
     target_compile_definitions(GameOfLifeLib PUBLIC VLIFE_METRICS_ENABLED)
 endif()
 
-# Frontend application
-add_executable(
-        GameOfLifeApp
-        src/main.cpp
-        src/GameOfLifeView.cpp
-        src/GameOfLifeView.h
-)
+# Apple Silicon hardware counter configuration
+if(ENABLE_KPERF_COUNTERS)
+    if(APPLE)
+        message(STATUS "Apple Silicon hardware counter profiling enabled")
+        target_compile_definitions(GameOfLifeLib PUBLIC ENABLE_KPERF_COUNTERS)
+    else()
+        message(WARNING "ENABLE_KPERF_COUNTERS only supported on Apple platforms - ignoring")
+    endif()
+endif()
 
-# Link libraries
-target_link_libraries(GameOfLifeApp PRIVATE
-        GameOfLifeLib
-        Qt5::Core
-        Qt5::Widgets
-)
+if(BUILD_UI)
+    # Frontend application
+    add_executable(
+            GameOfLifeApp
+            src/main.cpp
+            src/GameOfLifeView.cpp
+            src/GameOfLifeView.h
+    )
 
-# Include directories
-target_include_directories(GameOfLifeApp PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
+    # Link libraries
+    target_link_libraries(GameOfLifeApp PRIVATE
+            GameOfLifeLib
+            Qt5::Core
+            Qt5::Widgets
+    )
 
-# Installation
-install(TARGETS GameOfLifeApp DESTINATION bin)
+    # Include directories
+    target_include_directories(GameOfLifeApp PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+
+    # Installation
+    install(TARGETS GameOfLifeApp DESTINATION bin)
+endif()
 
 # Tests
 add_executable(
@@ -259,6 +284,33 @@ if(ENABLE_METRICS)
     )
 
     message(STATUS "Metrics benchmark: 'run_metrics_benchmark' target available.")
+endif()
+
+# CPU counter benchmark executable (always built, but hardware counters require ENABLE_KPERF_COUNTERS=ON)
+add_executable(
+        VLifeCpuBenchmark
+        tests/benchmark/CpuCounterBenchmark.cpp
+)
+
+target_link_libraries(
+        VLifeCpuBenchmark
+        PRIVATE
+        GameOfLifeLib
+)
+
+target_include_directories(VLifeCpuBenchmark PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+add_custom_target(run_cpu_benchmark
+    COMMAND VLifeCpuBenchmark
+    DEPENDS VLifeCpuBenchmark
+)
+
+if(ENABLE_KPERF_COUNTERS)
+    message(STATUS "CPU counter benchmark: Hardware counters enabled (requires sudo)")
+else()
+    message(STATUS "CPU counter benchmark: Timing-only mode (enable hardware counters with -DENABLE_KPERF_COUNTERS=ON)")
 endif()
 
 # Add test-related messages

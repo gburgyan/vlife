@@ -2,6 +2,10 @@
 
 This document describes the optional metrics collection system for VLife, designed to support research paper claims about activity-proportional complexity.
 
+**Related Documentation:**
+- [PROFILING.md](PROFILING.md) - General profiling guide with Instruments and sample
+- [PERFORMANCE-OPTIMIZATIONS.md](PERFORMANCE-OPTIMIZATIONS.md) - Optimization techniques and CPU counter profiling
+
 ## Overview
 
 The metrics system collects detailed per-generation data including:
@@ -411,3 +415,42 @@ Compare benchmark results with and without metrics:
 ```
 
 The non-metrics build should show identical performance to baseline since all instrumentation compiles away.
+
+## Combining with Hardware Counter Profiling
+
+For comprehensive analysis, use VLife metrics and hardware counter profiling in **separate runs**:
+
+**Important:** `ENABLE_METRICS` adds per-generation overhead (thread-local counter updates, timing calls) that will affect CPU counter measurements. For accurate profiling, run these separately:
+
+```bash
+# Step 1: Collect activity metrics (with ENABLE_METRICS)
+cmake -DENABLE_METRICS=ON -DENABLE_KPERF_COUNTERS=OFF ..
+make VLifeMetricsBenchmark
+./VLifeMetricsBenchmark --pattern acorn --generations 5000 --output acorn_activity
+
+# Step 2: Collect CPU counter metrics (without ENABLE_METRICS overhead)
+cmake -DENABLE_METRICS=OFF -DENABLE_KPERF_COUNTERS=ON ..
+make VLifeCpuBenchmark
+sudo ./VLifeCpuBenchmark --pattern acorn --generations 5000 --output acorn_cpu
+```
+
+Then cross-reference the two CSV files by generation number.
+
+### Cross-Referencing Metrics
+
+| VLife Metric | CPU Counter | Correlation |
+|--------------|-------------|-------------|
+| `phase1_time_us` | `duration_ns` (phase 1) | Direct timing |
+| `phase2_time_us` | `l1d_misses` | High misses → slow phase 2 |
+| `boundary_crossings` | `l1d_misses` | Boundary ops cause cache misses |
+| `atomic_operations` | `cycles` | CAS contention increases cycles |
+| High `k` (state changes) | High `instructions` | More work per generation |
+
+### Example: Identifying Cache Bottlenecks
+
+1. Find generations with slow `phase2_time_us` in VLife metrics
+2. Check corresponding `l1d_misses` in CPU counter data
+3. If correlated: optimize memory access patterns
+4. If not correlated: look at branch mispredictions or instruction throughput
+
+See [PERFORMANCE-OPTIMIZATIONS.md](PERFORMANCE-OPTIMIZATIONS.md) Section 11 for complete CPU counter documentation.

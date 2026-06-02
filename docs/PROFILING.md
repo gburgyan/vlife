@@ -2,6 +2,10 @@
 
 This guide covers how to profile VLife performance using the built-in benchmark profiling mode and macOS Instruments.
 
+**Related Documentation:**
+- [METRICS.md](METRICS.md) - High-level activity metrics (k, N, timing breakdown)
+- [PERFORMANCE-OPTIMIZATIONS.md](PERFORMANCE-OPTIMIZATIONS.md) - Optimization techniques and CPU counter profiling
+
 ## Build Configurations
 
 ### Optimal Release Build (Recommended for Profiling)
@@ -146,3 +150,58 @@ If `mach_continuous_time` or `clock_gettime` appears high (>30%), the actual sim
 ```bash
 ./VLifeBenchmark --profile --profile-pattern soup
 ```
+
+## Apple Silicon Hardware Counter Profiling
+
+For low-level CPU microarchitecture analysis on Apple Silicon (M1/M2/M3), VLife includes a hardware counter profiling tool that measures:
+
+- **CPU Cycles** and **Instructions** (IPC)
+- **L1D Cache Misses** (memory bottlenecks)
+- **Branch Mispredictions** (control flow bottlenecks)
+
+### Building with Hardware Counters
+
+```bash
+cd build
+cmake -DENABLE_KPERF_COUNTERS=ON -DCMAKE_BUILD_TYPE=Release ..
+make VLifeCpuBenchmark
+```
+
+### Running the CPU Counter Benchmark
+
+```bash
+# Run with sudo for hardware counter access
+sudo ./VLifeCpuBenchmark --pattern acorn --generations 1000 --output acorn_cpu
+
+# Timing-only mode (no sudo required)
+./VLifeCpuBenchmark --pattern acorn --generations 1000 --timing-only
+```
+
+### Output
+
+Produces a CSV with per-generation metrics:
+
+```csv
+generation,cycles,instructions,l1d_misses,branch_mispred,ipc,miss_rate_per_1k,mispred_rate_per_1k,duration_ns,live_cells,tiles
+```
+
+### Interpreting Results
+
+| Metric | Good | Indicates Problem |
+|--------|------|-------------------|
+| IPC | > 2.5 | < 1.5 (memory or branch bound) |
+| L1D miss/1k inst | < 5 | > 20 (cache pressure) |
+| Branch mispred/1k inst | < 2 | > 10 (unpredictable branches) |
+
+### Combining Profiling Approaches
+
+For comprehensive analysis, combine multiple profiling tools:
+
+| Tool | What it shows | When to use |
+|------|---------------|-------------|
+| `VLifeBenchmark --profile` | Hot functions, call stacks | Initial performance survey |
+| `VLifeMetricsBenchmark` | Activity metrics (k, N, timing) | Algorithm-level analysis |
+| `VLifeCpuBenchmark` | CPU counters (IPC, cache, branches) | Microarchitecture bottlenecks |
+| Instruments Time Profiler | Detailed call graphs | Deep-dive into specific functions |
+
+See [PERFORMANCE-OPTIMIZATIONS.md](PERFORMANCE-OPTIMIZATIONS.md) Section 11 for detailed documentation on hardware counter profiling.
